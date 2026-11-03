@@ -1,0 +1,324 @@
+--- /dev/null
++++ b/docs/src/content/docs/cli/factory.md
+@@ -0,0 +1,301 @@
++---
++title: Software factory (experimental)
++description: Set up a local Pluto factory that turns scoped GitHub issues into validated pull requests.
++sidebar:
++  order: 2
++---
++
++The factory runs implementation, checks, independent review and QA around a
++durable work queue. Use GitHub integration to watch ready-labeled issues and
++publish pull requests, or managed integration for local examples.
++
++This is an **unreleased local prototype**. Use matching factory-engine and Pluto
++[factory](https://github.com/plutoframework/pluto-factory) and CLI
++development checkouts. The published CLI reference describes a different,
++released revision and does not establish factory support.
++
++## Install
++
++Required tools are Python 3.12+, uv, Git, Go 1.25.5+, Herdr Core (`hc`), Pi and
++fnox. GitHub integration also needs `gh` with access to the target repository.
++Generating an age identity needs `age-keygen`; a 1Password backend needs `op`.
++
++Set these paths to the development checkouts that contain the factory engine
++and CLI integration:
++
++```sh
++PLUTO_FACTORY_SOURCE=/absolute/path/to/pluto-factory
++PLUTO_CLI_SOURCE=/absolute/path/to/pluto-cli
++uv tool install --editable "$PLUTO_FACTORY_SOURCE"
++mkdir -p "$HOME/.local/bin"
++go -C "$PLUTO_CLI_SOURCE" build -o "$HOME/.local/bin/pluto" ./cmd/pluto
++pluto factory --help
++```
++
++Ensure the uv tool directory and `~/.local/bin` are on `PATH`. For development,
++`PLUTO_FACTORY_ENGINE` can instead name the factory virtual environment's
++`pluto-factory` executable. It accepts an executable path, not a shell command.
++
++The native command passes arguments and streams to the Python engine. It does
++not download or install that engine implicitly.
++
++## Configure
++
++The factory uses separate master, application and factory configuration:
++
++| File | Purpose |
++| --- | --- |
++| `~/.config/pluto/pluto.toml` | Secret-free master defaults |
++| `<repository>/pluto.toml` | Application generator manifest |
++| `~/.config/pluto/factories/<name>/factory.toml` | Resolved factory settings |
++
++`XDG_CONFIG_HOME` changes the base configuration directory. A repository's
++manifest is never discovered as master defaults.
++
++Example master defaults:
++
++```toml
++[factory]
++coordinator = "model"
++coordinator_model = "openai-codex:gpt-6.1-terra"
++auth_mode = "existing"
++integration = "github"
++github_issue_label = "factory:ready"
++github_poll_seconds = 30
++github_auto_merge = false
++close_source_issues = true
++
++[factory.worker]
++provider = "openai"
++model = "gpt-6.1-sol"
++reasoning = "high"
++
++[factory.reviewer]
++provider = "openai"
++model = "gpt-6.1-sol"
++reasoning = "high"
++
++[factory.qa_model]
++provider = "openai"
++model = "gpt-6.1-terra"
++reasoning = "medium"
++
++[factory.secrets]
++provider = "age"
++generate_age_key = false
++```
++
++Age is the default fnox backend. Master settings may contain provider choices,
++public recipients and credential references, never secret values. Factory names
++and repository registrations belong to individual setup operations.
++
++Explicit setup flags override `setup --config` fields, which override master
++defaults and built-ins. Setup freezes the resolved settings; changing the master
++file does not change an existing factory. Inspect defaults with:
++
++```sh
++pluto factory defaults show
++```
++
++### Secrets and authentication
++
++Each factory gets its own `fnox.toml`. Age stores encrypted values; 1Password
++stores references to existing vault items. The engine isolates fnox's global
++configuration layer and resolves only the credential selected for its API
++connection. There is no providerless plaintext storage fallback.
++
++Choose `--secrets-provider age --generate-age-key` to generate an owner-only
++identity, or select an existing private identity with `--age-key-file` and its
++public recipient with `--age-recipient`. Keep identity backups separate from
++factory-state exports.
++
++For 1Password, choose `--secrets-provider 1password --op-vault <vault>` and
++reference an item with `--op-item op://vault/item/field`. This does not create or
++change vault items.
++
++API keys can be entered through the wizard or `--api-key-stdin`, or referenced
++through an explicitly named environment variable. Secret values do not belong
++in the master file, factory TOML, task packets or command arguments.
++
++Native Pi and the Pydantic AI coordinator have separate provider settings. This
++Pi version uses `provider = "openai"` for native OAuth access. The coordinator's
++`openai-codex:` namespace belongs to Pydantic AI. Setup reuses existing logins by
++default; an explicit Codex-login choice can run the native login flow.
++
++Readiness metadata is not proof of inference. Verify worker execution and the
++default coordinator's subscription authentication with a live work item before
++relying on them. A deterministic fixture run does not establish either.
++
++### Host execution
++
++The prototype runs on the host in explicitly selected cooperative mode. A
++repository registry scopes task assignments and factory Git operations; it does
++not sandbox an unrestricted worker shell. The default `isolation = "required"`
++refuses dispatch because an enforced isolation adapter is not implemented yet.
++Select `--isolation cooperative` only for a trusted local prototype.
++
++Container packaging and portable export/import are follow-up work.
++
++## Set up a factory
++
++Create and push the target repository first. For the Snake example, prepare the
++repository yourself, then decompose the game into scoped issues with the
++assistant. Setup does not create the game or implement the whole project.
++
++Open the guided setup:
++
++```sh
++pluto factory setup
++```
++
++`init` is an alias. `pluto --interactive factory setup` also opens the guided
++flow with supplied arguments prefilled. The wizard previews the plan before
++creating files. Piped input and CI do not silently open it.
++
++For a pushed local checkout, the equivalent headless shape is:
++
++```sh
++pluto factory setup --no-input \
++  --name snake --repo game=/absolute/path/to/snake \
++  --integration github --github-repo game=OWNER/REPOSITORY \
++  --issue-label factory:ready --poll-seconds 30 \
++  --check '["npm","test","--","--run"]' \
++  --qa '["npm","run","test:e2e"]' \
++  --harness pi --coordinator model --isolation cooperative
++```
++
++The check commands are examples: replace them with executable checks supplied
++by the actual repository. They are argument arrays, not shell strings. Missing
++checks and QA commands are reported as not ready rather than successful.
++
++Repeated `--repo NAME=PATH` entries register multiple writable repositories;
++`--read-repo` registers reference repositories. The simple flags share check
++commands across repositories. Use a full config for per-repository checks and
++flag matrices. Each repository maps independently to a GitHub slug.
++
++Without `--github-repo`, GitHub setup can infer standard GitHub HTTPS or SSH
++origins locally. Unresolved writable repositories and mappings for unregistered
++names fail before factory files are created. Setup does not query GitHub.
++
++Setup creates the factory TOML, SQLite schema, editable role prompts, QA
++guidance/rules, resource directories and fnox configuration. Existing authored
++configuration is preserved. Its response distinguishes file creation from
++runtime readiness.
++
++```sh
++pluto factory doctor --factory snake --verify-auth
++```
++
++Doctor reports native Pi no-refresh readiness without printing credentials.
++`--verify-auth` additionally runs a captured GitHub authentication check; it does
++not print the backend's output or ask GitHub to create anything.
++
++Use `--herdr-space <id>` to associate workers with an existing Herdr app space.
++Without that mapping, workers remain available through Core while running
++headlessly. Automatic space creation is not implemented.
++
++## Queue work
++
++Create the configured ready label once if the repository does not already have
++it:
++
++```sh
++gh label create factory:ready --repo OWNER/REPOSITORY \
++  --description "Ready for the Pluto factory" --color 0366d6
++```
++
++Write an issue with explicit scope and acceptance checkboxes. The adapter treats
++issue checkbox items as acceptance criteria:
++
++```markdown
++## Scope
++Describe one implementable increment and its constraints.
++
++## Acceptance
++- [ ] Describe the expected observable behavior.
++- [ ] Describe the regression or integration check that proves it.
++```
++
++Apply the ready label after the issue is ready for autonomous work:
++
++```sh
++gh issue edit ISSUE_NUMBER --repo OWNER/REPOSITORY --add-label factory:ready
++```
++
++For a cross-repository issue, an optional declaration can name registered
++repository aliases and explicit criteria:
++
++```markdown
++<!-- pluto-factory:
++{"repositories":["core","cli"],
++ "acceptance":["State the combined observable result"]}
++-->
++```
++
++The declaration cannot add repository authority. Each requested alias must be
++registered in the factory. Without a declaration, the source repository is the
++default target.
++
++Direct callers can use `pluto factory submit` or `submit --file request.json`;
++GitHub intake uses the same durable queue and duplicate-delivery protection.
++
++## Run and inspect
++
++```sh
++pluto factory start --factory snake --watch
++pluto factory inspect --factory snake
++```
++
++GitHub factories watch by default and remain alive while the queue is empty.
++`--no-watch` drains current work; `--once` performs one intake/tick cycle.
++Managed examples exit when drained unless watch is explicitly requested.
++
++The factory implements a candidate, runs configured checks, collects independent
++review and QA reports, and publishes validated changes to pull requests. Inspect
++shows durable progress, evidence and PR references. Automatic merging is off by
++default. Explicit `--auto-merge` remains subject to repository checks and review
++policy. Issue closure follows completed integration across required repositories,
++not merely a worker's coding-complete report.
++
++Recoverable errors trigger bounded autonomous recovery. Notifications report
++what happened and what the coordinator is doing without blocking unrelated
++work. Missing authority or exhausted recovery options defer only affected work.
++Slack delivery is outbound-only in this prototype.
++
++Pause before taking over a worker:
++
++```sh
++pluto factory pause --factory snake
++pluto factory resume --factory snake
++```
++
++Opening a terminal alone does not establish exclusive human control. Failed
++worktrees and useful evidence remain available for recovery.
++
++## Testing examples
++
++For a disposable transport and recovery demonstration:
++
++```sh
++pluto factory demo --directory /tmp/pluto-factory-demo
++pluto factory demo --directory /tmp/pluto-factory-recovery \
++  --scenario crash_once
++```
++
++These examples use deterministic fixture workers, real SQLite state, managed
++Git worktrees and executable flag-off/flag-on checks. They preserve source
++repositories and do not call a model or publish GitHub PRs. Run them in empty
++directories. Their success does not prove live model judgment or GitHub access.
++
++## Limits
++
++Managed integration advances only a factory-owned local clone. GitHub mode is a
++separate intake and publication adapter; real remote publication and merging
++need provider-backed validation. There is no atomic merge across repositories,
++so every intermediate repository state must remain compatible and deployable.
++
++This prototype runs one active item per factory. Multiple factories have
++separate SQLite databases and coordinator locks. Release/deployment, additional
++bug-source adapters, enforced process isolation, container migration and Slack
++approvals are not implemented. Prompts and QA rules are configurable, but prompt
++text cannot grant tool access or weaken deterministic integration gates.
+--- a/docs/src/content/docs/configuration.md
++++ b/docs/src/content/docs/configuration.md
+@@ -4,6 +4,17 @@
+ ---
+ 
+ Pluto saves generator choices in `pluto.toml`. Runtime settings come from your application's config package and environment.
++
++## Master and factory settings
++
++The experimental software factory adds a secret-free master configuration at
++`$XDG_CONFIG_HOME/pluto/pluto.toml` (normally `~/.config/pluto/pluto.toml`) and a
++resolved `factory.toml` for each factory. These are distinct from an application's
++project manifest. Explicit setup choices override master defaults, and changes
++to master defaults do not silently alter existing factories.
++
++See [Software factory (experimental)](../cli/factory/) for installation, fnox
++backends, guided/headless setup, GitHub issue intake and prototype limits.
+ 
+ ## Project settings
+ 

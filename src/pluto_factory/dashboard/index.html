@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f4f2e9">
+    <title>Pluto Factory | Local operations</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to factory work</a>
+    <div class="app-shell">
+      <aside class="factory-rail" aria-label="Factory navigation">
+        <a class="brand" href="/" aria-label="Pluto Factory home">
+          <svg viewBox="0 0 36 36" aria-hidden="true">
+            <circle cx="18" cy="14" r="8" />
+            <path d="M18 22v11M11 28h14M5 12C0 20 30 28 33 16" />
+          </svg>
+          <span class="brand-copy">
+            <span class="brand-word">pluto<span class="brand-period">.</span></span>
+            <span class="brand-subtitle">Factory</span>
+          </span>
+        </a>
+        <div class="rail-heading"><span>Factories</span><span id="factory-count"></span></div>
+        <nav id="factory-list" class="factory-list" aria-label="Select a factory">
+          <p class="rail-empty">Connecting to local factories…</p>
+        </nav>
+        <div class="rail-footer">
+          <span class="local-label"><span class="local-dot"></span>Local operations</span>
+          <span>Observe here. Intervene in Herdr.</span>
+        </div>
+      </aside>
+
+      <main id="main" class="main-content">
+        <header class="page-header">
+          <div>
+            <p class="page-context">Factory operations</p>
+            <h1 id="factory-title">Your local factories</h1>
+            <p id="factory-description" class="page-description">Work, evidence, and the next step.</p>
+          </div>
+          <div class="header-actions">
+            <span id="connection-state" class="connection-state" role="status"><span class="status-dot"></span>Connecting</span>
+            <button id="refresh-button" class="button button-secondary" type="button">Refresh</button>
+          </div>
+        </header>
+
+        <div id="notice" class="notice" role="status" hidden></div>
+        <div id="factory-state" class="factory-state" hidden></div>
+
+        <section class="pipeline-surface" aria-labelledby="pipeline-heading">
+          <div class="section-topline">
+            <h2 id="pipeline-heading">Work in orbit</h2>
+            <span id="pipeline-caption" class="muted">Select a work item to trace its progress</span>
+          </div>
+          <ol id="pipeline" class="pipeline" aria-label="Selected work pipeline"></ol>
+        </section>
+
+        <section class="workbench" aria-label="Factory work and details">
+          <div class="queue-pane">
+            <div class="queue-heading"><h2>Work queue</h2><span id="work-count" class="count-label"></span></div>
+            <div class="queue-tools">
+              <div id="filters" class="filters" role="group" aria-label="Filter work">
+                <button type="button" data-filter="all" aria-pressed="true">All</button>
+                <button type="button" data-filter="active" aria-pressed="false">Active</button>
+                <button type="button" data-filter="waiting" aria-pressed="false">Waiting</button>
+                <button type="button" data-filter="done" aria-pressed="false">Done</button>
+              </div>
+              <label class="search-field"><span class="visually-hidden">Search work by title</span><input id="work-search" type="search" placeholder="Find work…" autocomplete="off"></label>
+            </div>
+            <div id="work-list" class="work-list" role="list" aria-label="Work items">
+              <div class="empty-state"><span class="empty-orbit" aria-hidden="true"></span><h3>Connecting to your factories</h3><p>Live work will appear here.</p></div>
+            </div>
+          </div>
+
+          <aside id="detail-pane" class="detail-pane" aria-label="Selected work details">
+            <div id="detail-tools" class="detail-tools" hidden>
+              <span>Task details</span>
+              <button id="expand-task" class="button button-small" type="button"
+                aria-expanded="false" aria-controls="detail-pane">Expand task</button>
+            </div>
+            <div id="detail-header" class="detail-header"></div>
+            <div id="detail-tabs" class="detail-tabs" role="tablist" aria-label="Work details" hidden>
+              <button id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="detail-content" data-tab="overview">Overview</button>
+              <button id="tab-activity" type="button" role="tab" aria-selected="false" aria-controls="detail-content" data-tab="activity" tabindex="-1">Activity</button>
+              <button id="tab-checks" type="button" role="tab" aria-selected="false" aria-controls="detail-content" data-tab="checks" tabindex="-1">Checks</button>
+              <button id="tab-output" type="button" role="tab" aria-selected="false" aria-controls="detail-content" data-tab="output" tabindex="-1">Output</button>
+            </div>
+            <div id="detail-content" class="detail-content" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+              <div class="empty-state detail-empty"><span class="empty-orbit" aria-hidden="true"></span><h3>Follow a piece of work</h3><p>Select an item to see its assignment, checks, and activity.</p></div>
+            </div>
+          </aside>
+        </section>
+        <footer class="page-footer"><span id="updated-at">Waiting for the first update</span><span>Refreshes every 2 seconds</span></footer>
+      </main>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>
