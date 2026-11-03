@@ -1,5 +1,6 @@
 """GitHub intake and PR waiting are independent of worker execution."""
 
+import copy
 import json
 import time
 
@@ -7,6 +8,7 @@ from .acceptance import acceptance_intent, current_evidence
 from .config import digest, resolved_bundle
 from .github import GitHubAdapter, GitHubFailure
 from .models import Decision, Submission
+from .state import StateConflict
 
 
 class GitHubFlow:
@@ -84,6 +86,13 @@ class GitHubFlow:
         )
 
     def publish(self, work, entries, remaining):
+        data = work["data"]
+        data["publication_acceptance"] = self._publication_snapshot(work)
+        for key in ("post_merge_acceptance", "post_merge_validation"):
+            data.pop(key, None)
+        work = self.state.update_work(
+            work["id"], data=data, event="acceptance.publication_frozen"
+        )
         operation = self.state.begin_operation(
             work["id"],
             "github.publish",
@@ -115,7 +124,7 @@ class GitHubFlow:
             },
         )
 
-    def advance(self, work, revise, defer):
+    def advance(self, work, revise, defer, reassess=None, confirm=None):
         result = self.adapter.poll_pull_requests(work["data"]["pull_requests"])
         data = work["data"]
         data["pull_requests"] = result["pull_requests"]
@@ -145,48 +154,66 @@ class GitHubFlow:
             )
             return
         try:
-            decision, remaining = self._merged_intent(work)
-            self.adapter.refresh_defaults(data["entries"])
-            decision, remaining = self._merged_intent(work)
+            decision, remaining = self._merged_intent(work, publication=True)
         except (KeyError, OSError, TypeError, ValueError) as error:
-            work = self.state.update_work(
-                work["id"],
-                data=data,
-                event="completion.reconciliation_required",
-            )
-            defer(
-                work,
-                "Merged PRs need completion reconciliation: " + str(error),
-            )
+            self._reconcile(work, defer, error)
             return
         work = self.state.update_work(
             work["id"], data=data, event="pull_requests.merged"
         )
-        if remaining:
-            history = data.setdefault("merged_increments", [])
-            increment = data.get("increment", 0)
-            if not any(item["increment"] == increment for item in history):
-                history.append(
-                    {
-                        "increment": increment,
-                        "candidates": data["acceptance_candidate"],
-                        "config_digest": data["acceptance_config_digest"],
-                        "acceptance_decision": decision.model_dump(),
-                        "pull_requests": data["pull_requests"],
-                    }
+        if reassess is not None:
+            reassessed = reassess(work)
+            if reassessed is None:
+                return
+            if (
+                not isinstance(reassessed, dict)
+                or reassessed.get("id") != work["id"]
+            ):
+                raise ValueError(
+                    "post-merge reassessment returned another item"
                 )
-            data["increment"] = increment + 1
-            data["revision_reason"] = "; ".join(remaining)
-            for key in ("entries", "reports", "pull_requests"):
-                data.pop(key, None)
-            self.state.update_work(
-                work["id"],
-                phase="queued",
-                control="ready",
-                data=data,
-                wake_at=0,
-                event="increment.merged",
+            work = reassessed
+            data = work["data"]
+        elif remaining:
+            defer(
+                work,
+                "Merged PRs need a fresh acceptance assessment before "
+                "starting another coding increment",
             )
+            return
+        self._current_work(work)
+        try:
+            self._merged_intent(work)
+            self.adapter.refresh_defaults(data["entries"])
+            decision, remaining = self._merged_intent(work)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            self._reconcile(work, defer, error)
+            return
+        self._current_work(work)
+        work = self.state.update_work(
+            work["id"], data=data, event="acceptance.merged_confirmed"
+        )
+        if confirm is not None:
+            confirmed = confirm(work)
+            if confirmed is None:
+                return
+            if (
+                not isinstance(confirmed, dict)
+                or confirmed.get("id") != work["id"]
+            ):
+                raise ValueError(
+                    "post-merge confirmation returned another item"
+                )
+            work = confirmed
+            self._current_work(work)
+            try:
+                decision, remaining = self._merged_intent(work)
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                self._reconcile(work, defer, error)
+                return
+            data = work["data"]
+        if remaining:
+            self.continue_after_merge(work, decision, remaining)
         else:
             if self.config.close_source_issues:
                 closure = self.adapter.complete_sources(work)
@@ -218,9 +245,103 @@ class GitHubFlow:
                 },
             )
 
-    def _merged_intent(self, work):
-        """Revalidate recorded intent without re-merging or inventing scope."""
+    def _current_work(self, work):
+        current = self.state.get_work(work["id"])
+        if (
+            current["updated"] != work["updated"]
+            or current["phase"] != "awaiting_merge"
+            or current["control"] == "paused"
+            or self.state.is_paused()
+        ):
+            raise StateConflict("work changed during post-merge acceptance")
+
+    def _reconcile(self, work, defer, error):
+        self._current_work(work)
+        work = self.state.update_work(
+            work["id"],
+            data=work["data"],
+            event="completion.reconciliation_required",
+        )
+        defer(work, "Merged PRs need completion reconciliation: " + str(error))
+
+    def continue_after_merge(self, work, decision, remaining):
+        """Start genuine remaining scope on a new namespace, retaining merges."""
+        self._current_work(work)
+        if not remaining or any(
+            not isinstance(item, str) or not item.strip() for item in remaining
+        ):
+            raise ValueError("post-merge continuation needs concrete scope")
         data = work["data"]
+        history = data.setdefault("merged_increments", [])
+        increment = data.get("increment", 0)
+        if not any(item["increment"] == increment for item in history):
+            history.append(
+                {
+                    "increment": increment,
+                    "candidates": data["acceptance_candidate"],
+                    "config_digest": data["acceptance_config_digest"],
+                    "acceptance_decision": decision.model_dump(),
+                    "publication_acceptance": copy.deepcopy(
+                        data.get("publication_acceptance")
+                    ),
+                    "pull_requests": data["pull_requests"],
+                }
+            )
+        data["increment"] = (
+            max(increment, *(item["increment"] for item in history)) + 1
+        )
+        data["revision_reason"] = "; ".join(remaining)
+        for key in (
+            "entries",
+            "reports",
+            "pull_requests",
+            "publication_acceptance",
+            "post_merge_acceptance",
+            "post_merge_validation",
+        ):
+            data.pop(key, None)
+        return self.state.update_work(
+            work["id"],
+            phase="queued",
+            control="ready",
+            current_run=None,
+            data=data,
+            wake_at=0,
+            event="increment.merged",
+        )
+
+    @staticmethod
+    def _publication_snapshot(work):
+        data = work["data"]
+        return copy.deepcopy(
+            {
+                "decision": data["acceptance_decision"],
+                "candidates": data["acceptance_candidate"],
+                "config_digest": data["acceptance_config_digest"],
+            }
+        )
+
+    def _merged_intent(self, work, *, publication=False):
+        """Revalidate frozen publication or current completion independently."""
+        data = work["data"]
+        if publication:
+            if "publication_acceptance" not in data:
+                if any(
+                    key in data
+                    for key in (
+                        "post_merge_acceptance",
+                        "post_merge_validation",
+                    )
+                ):
+                    raise ValueError(
+                        "original publication acceptance is missing"
+                    )
+                data["publication_acceptance"] = self._publication_snapshot(
+                    work
+                )
+            acceptance = data["publication_acceptance"]
+        else:
+            acceptance = self._publication_snapshot(work)
         registered = {repo.name: repo for repo in self.config.repositories}
         scope = set(work["payload"]["repositories"])
         entries = {entry["name"]: entry for entry in data["entries"]}
@@ -259,7 +380,12 @@ class GitHubFlow:
                     "merged PR identity lacks candidate provenance"
                 )
         current_digest = digest(resolved_bundle(self.state.home, self.config))
-        for kind in ("acceptance", "checks", "qa"):
+        if (
+            acceptance["candidates"] != candidates
+            or acceptance["config_digest"] != current_digest
+        ):
+            raise ValueError("acceptance candidate or configuration is stale")
+        for kind in ("checks", "qa"):
             if (
                 data.get(f"{kind}_candidate") != candidates
                 or data.get(f"{kind}_config_digest") != current_digest
@@ -273,7 +399,7 @@ class GitHubFlow:
                 != "ready"
             ):
                 raise ValueError(f"{role} report is absent or stale")
-        decision = Decision.model_validate(data["acceptance_decision"])
+        decision = Decision.model_validate(acceptance["decision"])
         if decision.action not in {"advance", "complete"}:
             raise ValueError(
                 "recorded acceptance does not authorize integration"
