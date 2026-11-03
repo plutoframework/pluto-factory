@@ -770,6 +770,11 @@ class GitHubAdapter:
             raise GitHubFailure("scope.denied", "Invalid pull request identity")
         return self.github[name], number
 
+    def default_branch_checks(self, pull_request) -> dict:
+        from .github_delivery import default_branch_checks
+
+        return default_branch_checks(self, pull_request)
+
     def poll_pull_requests(self, prs) -> dict:
         results = []
         for pull_request in prs:
@@ -786,7 +791,7 @@ class GitHubAdapter:
                     (
                         "number,title,url,state,headRefOid,headRefName,baseRefName,"
                         "reviewDecision,statusCheckRollup,mergeStateStatus,mergedAt,"
-                        "isDraft,autoMergeRequest"
+                        "isDraft,autoMergeRequest,mergeCommit"
                     ),
                 ]
             )
@@ -819,9 +824,14 @@ class GitHubAdapter:
                 raise GitHubFailure(
                     "github.invalid_response", "Unknown pull request state"
                 )
+            merge_commit = row.get("mergeCommit")
             results.append(
                 {
                     **pull_request,
+                    "merge_commit": merge_commit.get("oid")
+                    if isinstance(merge_commit, dict)
+                    else None,
+                    "merged_at": row.get("mergedAt"),
                     "state": state,
                     "title": row.get("title", "Factory work"),
                     "observed_head": row.get("headRefOid"),
