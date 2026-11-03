@@ -21,7 +21,7 @@ The sibling Pluto CLI supplies the `pluto factory` command bridge.
 | Review and QA | Separate worker roles plus independently executed validation commands |
 | Multiple repositories | Candidate sets and checks of intermediate combinations before sequential integration |
 | Completion | Every acceptance criterion needs current evidence; incomplete increments remain open |
-| Human control | Pause/dispatch lock, interruption observations, explicit resume and inspect |
+| Human control | Pause/dispatch lock, interruption observations, explicit resume/inspect and verified current-worker open |
 | Notifications | Independent durable Slack outbox; failures remain queued without stopping work |
 | Prompt customization | Role Markdown and QA guidance outside code; resolved bundles pinned to assignments |
 | Self-improvement | Scoped proposals, optional configured evaluation, activation for later assignments, rollback |
@@ -45,6 +45,14 @@ The sibling Pluto CLI supplies the `pluto factory` command bridge.
   from the supplied legal set, using existing subscription authentication.
 - A disposable age/fnox round trip stored ciphertext and retrieved the fake
   test value without passing it in command arguments.
+- The first live sequential Snake increment passed independent checks with
+  features disabled/enabled, separate review and QA, and GitHub CI. The factory
+  published and merged its PR, completed the source issue, then automatically
+  dispatched the dependent engine increment from updated main. This proves the
+  first complete cycle; it does not claim the remaining game increments are done.
+- `pluto factory open` was exercised against the newly dispatched live worker.
+  The command selects the current assignment rather than a retained paused or
+  replaced terminal; terminal-only attachment is separately covered by tests.
 - Native Pluto CLI forwarding tests cover arguments, streams, help, failure,
   and interactive/headless mode propagation. A real setup invocation reached
   its first wizard prompt and was cancelled without creating configuration.

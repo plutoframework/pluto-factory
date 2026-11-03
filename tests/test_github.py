@@ -628,3 +628,71 @@ def test_optional_pending_ci_also_prevents_unprotected_immediate_merge(
     assert not result["requested"]
     assert result["check_gate"]["pending"] == ["some-ci"]
     assert not any(call[:3] == ["gh", "pr", "merge"] for call in remote.calls)
+
+
+def test_publication_git_credentials_use_existing_gh_login_without_token_argv(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("GH_TOKEN", "sentinel-existing-credential")
+    integration, remote = adapter(tmp_path)
+    integration.publish(work(), entries(integration))
+    commands = [call for call in remote.calls if call[0] == "git"]
+    assert commands
+    for argv in commands:
+        assert "credential.helper=" in argv
+        assert (
+            "credential.https://github.com.helper=!gh auth git-credential"
+            in argv
+        )
+        assert "core.hooksPath=/dev/null" in argv
+        assert "sentinel-existing-credential" not in " ".join(argv)
+        assert "--global" not in argv
+
+
+@pytest.mark.parametrize(
+    "diagnostic,code,uncertain",
+    [
+        (
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "auth.required",
+            False,
+        ),
+        (
+            "remote: Permission to owner/core.git denied to user.",
+            "permission.required",
+            False,
+        ),
+        (
+            "fatal: Recv failure: Connection reset by peer",
+            "github.operation_failed",
+            True,
+        ),
+    ],
+)
+def test_git_push_failure_categories_are_sanitized_and_preserve_transport_uncertainty(
+    tmp_path,
+    diagnostic,
+    code,
+    uncertain,
+):
+    integration, _ = adapter(tmp_path)
+
+    def fail(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 128, "", diagnostic + "\nsentinel-credential"
+        )
+
+    integration.runner = fail
+    with pytest.raises(GitHubFailure) as error:
+        integration._git(
+            integration.home / "repositories" / "core",
+            "push",
+            "https://github.com/owner/core.git",
+            "candidate:refs/heads/task",
+            mutating=True,
+        )
+    assert error.value.code == code
+    assert error.value.uncertain is uncertain
+    assert "Git push" in error.value.summary
+    assert "sentinel" not in str(error.value)

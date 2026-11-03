@@ -1,0 +1,31 @@
+--- a/docs/src/content/docs/cli/factory.md
++++ b/docs/src/content/docs/cli/factory.md
+@@ -312,6 +312,28 @@
+ work. Missing authority or exhausted recovery options defer only affected work.
+ Slack delivery is outbound-only in this prototype.
+
++### Show the current worker
++
++```sh
++pluto factory open --factory snake
++pluto factory open --factory snake --terminal
++pluto factory open --factory snake --json
++```
++
++The default command peeks the currently active worker in an existing Herdr
++window. `--terminal` attaches through the calling terminal for SSH or headless
++use. The lookup follows the ledger's current assignment and checks live Core
++identity, ownership labels and generation before presenting the session. It
++does not reuse an old terminal ID after recovery.
++
++Paused, deferred and historical sessions are not selected. If the current phase
++has no active worker, such as checks or integration, the command reports that
++phase instead. If the app window is unavailable, it provides a rerunnable
++terminal fallback without opening a new window, space or tab.
++
++This visibility command does not pause coordination or change work state.
++Default output omits internal IDs; `--json` includes operational metadata.
++
+ Pause before taking over a worker:
+
+ ```sh

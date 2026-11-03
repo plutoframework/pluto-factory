@@ -14,6 +14,7 @@ from pathlib import Path
 from .config import atomic_json
 from .dependencies import DependencyError, source_key
 from .github_checks import merge_check_status
+from .github_process import classify_failure, git_command, operation_name
 from .models import FactoryConfig, Submission
 
 SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -74,20 +75,22 @@ class GitHubAdapter:
             )
         except subprocess.TimeoutExpired as error:
             raise GitHubFailure(
-                "github.timeout", "GitHub operation timed out", mutating
+                "github.timeout", f"{operation_name(argv)} timed out", mutating
             ) from error
         except OSError as error:
             raise GitHubFailure(
                 "github.unavailable",
-                "GitHub integration executable unavailable",
-                mutating,
+                f"{operation_name(argv)} executable unavailable",
+                False,
             ) from error
         if result.returncode not in acceptable:
-            auth = argv[0] == "gh" and result.returncode == 4
             raise GitHubFailure(
-                "auth.required" if auth else "github.operation_failed",
-                f"GitHub integration command failed (exit {result.returncode})",
-                mutating and not auth,
+                *classify_failure(
+                    argv,
+                    result.returncode,
+                    result.stderr,
+                    mutating=mutating,
+                )
             )
         return result
 
@@ -284,18 +287,7 @@ class GitHubAdapter:
 
     def _git(self, managed, *args, mutating=False, acceptable=(0,)):
         return self._run(
-            [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "commit.gpgsign=false",
-                "-C",
-                str(managed),
-                *args,
-            ],
+            git_command(managed, args),
             mutating=mutating,
             acceptable=acceptable,
         )

@@ -1,6 +1,7 @@
 """Read-only factory inventory; never instantiate or migrate runtime state."""
 
 import fcntl
+import json
 import math
 import os
 import shutil
@@ -189,7 +190,7 @@ def _number(value) -> float | None:
     return None
 
 
-def _read_snapshot(database: Path) -> dict:
+def _read_snapshot(database: Path, include_sessions: bool = False) -> dict:
     connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -211,7 +212,7 @@ def _read_snapshot(database: Path) -> dict:
         rows = [
             dict(row)
             for row in connection.execute(
-                "SELECT id,title,phase,control,current_run,updated FROM work "
+                "SELECT id,title,phase,control,current_run,generation,updated FROM work "
                 "ORDER BY created,id"
             )
         ]
@@ -234,16 +235,49 @@ def _read_snapshot(database: Path) -> dict:
             )
             if value is not None:
                 latest.append(value)
+        sessions = {}
+        if include_sessions and "runs" in tables:
+            allowed = {
+                "kind",
+                "address",
+                "core_identity",
+                "assignment_id",
+                "factory",
+                "owned",
+                "work_id",
+                "role",
+                "generation",
+            }
+            for row in connection.execute(
+                "SELECT id,work_id,generation,role,state,session FROM runs "
+                "WHERE id IN (SELECT current_run FROM work WHERE current_run IS NOT NULL)"
+            ):
+                session = json.loads(row["session"]) if row["session"] else None
+                if session is not None and not isinstance(session, dict):
+                    raise ValueError("invalid session metadata")
+                sessions[row["id"]] = {
+                    key: row[key]
+                    for key in ("id", "work_id", "generation", "role", "state")
+                } | {
+                    "session": {
+                        key: value
+                        for key, value in session.items()
+                        if key in allowed
+                    }
+                    if session
+                    else None
+                }
         return {
             "paused": bool(setting and setting["value"] == "true"),
             "work": rows,
             "last_activity": max(latest) if latest else None,
+            "sessions": sessions,
         }
     finally:
         connection.close()
 
 
-def _state(home: Path) -> dict | None:
+def _state(home: Path, include_sessions: bool = False) -> dict | None:
     database = home / "state.sqlite3"
     if not database.exists() and not database.is_symlink():
         return None
@@ -263,7 +297,7 @@ def _state(home: Path) -> dict | None:
             except FileNotFoundError:
                 continue
             if before == after:
-                return _read_snapshot(copied / database.name)
+                return _read_snapshot(copied / database.name, include_sessions)
     raise RuntimeError("factory state changed during inventory snapshot")
 
 

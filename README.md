@@ -324,6 +324,26 @@ existing Herdr app space. Without a space mapping, execution can remain headless
 The prototype does not automatically create app spaces or infer human takeover
 merely from someone opening a terminal. Use the explicit pause/resume flow.
 
+Show the currently active worker without copying a terminal ID:
+
+```sh
+pluto factory open --factory snake
+pluto factory open --factory snake --terminal
+pluto factory open --factory snake --json
+```
+
+The default command peeks the current worker in an existing Herdr window.
+`--terminal` instead attaches through the calling terminal for headless or SSH
+use. The lookup follows the current assignment and verifies live Core identity,
+ownership labels and generation. Paused, deferred and historical workers are
+not selected. During checks, integration or idle phases with no active worker,
+the command reports the phase instead of opening an old session.
+
+If the Herdr window is unavailable, the command prints a rerunnable terminal
+fallback. It does not create an app window, space or tab. This is a visibility
+operation and does not pause coordination or change work state. Default output
+omits internal IDs; `--json` returns operational metadata.
+
 The reporting extension emits typed assignment-bound results. Settled status
 alone does not accept work. The coordinator checks report shape, runtime state,
 candidate identity, check evidence, and required findings before moving on.
@@ -378,6 +398,10 @@ Register these same argument arrays as the repository's check and QA commands.
 The browser runner requires Node, Playwright and Google Chrome on the execution
 host; it does not install them or fetch dependencies during validation. A
 production project should own its appropriate test contracts and dependencies.
+
+The adapter uses the existing `gh` login for GitHub API calls and HTTPS Git
+operations. Its command-scoped Git credential helper leaves global Git
+configuration unchanged and does not put token values in arguments.
 
 `--github-repo` maps a registered local repository name to `OWNER/REPOSITORY`.
 Without an explicit mapping, GitHub mode can infer standard GitHub HTTPS or SSH

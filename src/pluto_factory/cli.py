@@ -59,6 +59,16 @@ def parser() -> argparse.ArgumentParser:
         "--root", type=Path, help="Alternate factory registry directory"
     )
 
+    visible = commands.add_parser(
+        "open", help="Show the current worker in Herdr"
+    )
+    _common(visible)
+    visible.add_argument(
+        "--terminal",
+        action="store_true",
+        help="Attach through this terminal instead of the Herdr app",
+    )
+
     setup = commands.add_parser(
         "setup", aliases=["init"], help="Create a factory configuration"
     )
@@ -834,6 +844,10 @@ def _submission(args: argparse.Namespace) -> Submission:
 
 
 def execute(args: argparse.Namespace) -> dict:
+    if args.command == "open":
+        from .visibility import open_worker
+
+        return open_worker(_home(args), terminal=args.terminal)
     if args.command == "list":
         from .inventory import list_factories
 
@@ -933,7 +947,11 @@ def main(argv: list[str] | None = None) -> int:
     }
     try:
         result = execute(args)
-        if args.command == "list" and not args.json:
+        if args.command == "open" and not args.json:
+            from .visibility import render_open
+
+            print(render_open(result))
+        elif args.command == "list" and not args.json:
             from .inventory import render_inventory
 
             print(render_inventory(result))
