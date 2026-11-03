@@ -1,0 +1,32 @@
+--- a/internal/cli/factory.go
++++ b/internal/cli/factory.go
+@@ -40,6 +40,11 @@
+ 				arguments = append([]string{"--no-input"}, arguments...)
+ 			}
+ 
++			interactive, _ := cmd.Root().PersistentFlags().GetBool("interactive")
++			if interactive {
++				arguments = append([]string{"--interactive"}, arguments...)
++			}
++
+ 			process := exec.CommandContext(cmd.Context(), binary, arguments...)
+ 			process.Dir = options.Directory
+ 			process.Stdin = cmd.InOrStdin()
+--- a/internal/cli/factory_test.go
++++ b/internal/cli/factory_test.go
+@@ -82,3 +82,15 @@
+ 		t.Fatalf("expected engine help, got %q", output)
+ 	}
+ }
++
++func TestFactoryForwardsInteractiveRootFlag(t *testing.T) {
++	t.Setenv(
++		"PLUTO_FACTORY_ENGINE",
++		factoryTestEngine(t, "printf '%s\\n' \"$@\"\n"),
++	)
++	output := mustInvoke(t, t.TempDir(), "--interactive", "factory", "setup")
++	if !strings.Contains(output, "--interactive") ||
++		!strings.Contains(output, "setup") {
++		t.Fatalf("expected interactive setup arguments, got %q", output)
++	}
++}

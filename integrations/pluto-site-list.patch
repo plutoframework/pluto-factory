@@ -1,0 +1,34 @@
+--- a/docs/src/content/docs/cli/factory.md
++++ b/docs/src/content/docs/cli/factory.md
+@@ -239,6 +239,31 @@
+ Direct callers can use `pluto factory submit` or `submit --file request.json`;
+ GitHub intake uses the same durable queue and duplicate-delivery protection.
+ 
++## List factories
++
++```sh
++pluto factory list
++pluto factory list --json
++pluto factory list --root /alternate/factories
++```
++
++The default view is a compact human-readable table with wrapped details; narrow
++terminals use a stacked view. `--json` returns the complete machine-readable
++inventory. Both `pluto factory list --json` and `pluto factory --json list`
++are supported.
++
++Inventory reports name, location, registered repositories, role models,
++coordinator status, current work phase and last recorded activity. It checks the
++coordinator lock rather than trusting a saved PID. Paused/deferred work and
++per-factory configuration or database errors remain visible. Human output omits
++internal work identifiers.
++
++Listing does not initialize or migrate a database or modify factory state. The
++standard registry is `$XDG_CONFIG_HOME/pluto/factories`, normally
++`~/.config/pluto/factories`. `--root` selects another registry. `--home` or
++`PLUTO_FACTORY_HOME` additionally includes an explicitly selected custom home;
++the command does not search arbitrary filesystem locations.
++
+ ## Run and inspect
+ 
+ ```sh
