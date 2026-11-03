@@ -29,6 +29,7 @@ The sibling Pluto CLI supplies the `pluto factory` command bridge.
 | Persistent watcher | GitHub mode waits for more work when its queue is empty |
 | Issue prerequisites | Durable source references, out-of-order intake, cycle rejection and merged-completion dispatch gates |
 | Factory inventory | Read-only machine registry, lock-based running state, readable default and explicit JSON |
+| Local dashboard | Loopback read-only snapshots, live queue and evidence, expandable task pane, fresh worker motion and task-scoped Herdr commands |
 | PR lifecycle | Owned branch publication, PR reconciliation, remote checks, opt-in ordered auto-merge and guarded issue closure |
 
 ## Verified examples

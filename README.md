@@ -273,6 +273,35 @@ metadata. Resolving an API credential for those checks can consult the selected
 fnox backend. A real provider-backed work item is the separate proof of model
 access. GitHub authentication is checked only with `doctor --verify-auth`.
 
+## Watch factories in the browser
+
+```sh
+pluto factory ui --port 8765
+```
+
+Open `http://127.0.0.1:8765` for the local operations dashboard. It refreshes
+factory and task state, dependencies, activity, reports, validation output and
+pull-request links. Select a task to inspect its evidence and copy a command
+that opens its current Herdr worker. The terminal-only command is also shown.
+Commands are copied for you to run; the browser does not execute them.
+
+Use **Expand task** to give the selected task the workspace. **Restore
+workspace** or Escape brings the queue back, retaining the task, tab and reading
+position. The orbit beside **Agent working** appears only for a current worker
+with a coordinator observation from the last 15 seconds. Queued, idle, paused
+and stale workers stay static; reduced-motion preferences disable animation.
+A lost connection stops the indicator while preserving the last displayed data.
+
+The server binds only to loopback. It reads private snapshots of factory state
+and does not pause, resume, dispatch or edit work. Stopping the dashboard leaves
+factories running. Configuration bundles, credentials, assignment packets and
+worker reasoning transcripts are not dashboard data. Known secret patterns in
+log text are masked, which is not comprehensive secret detection.
+
+Use `--root /alternate/factories` for another registry or `--home /path/to/factory`
+to additionally include a custom factory. The running coordinator and work-item
+status are shown separately, including dependency waits and blocked reasons.
+
 ## Submit, supervise, and intervene
 
 List the factories registered on this machine:

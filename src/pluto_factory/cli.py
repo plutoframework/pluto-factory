@@ -51,6 +51,9 @@ def parser() -> argparse.ArgumentParser:
     _common(root, root=True)
     commands = root.add_subparsers(dest="command", required=True)
 
+    from .cli_ui import register
+
+    register(commands, _common)
     inventory = commands.add_parser(
         "list", help="List registered local factories"
     )
@@ -63,6 +66,9 @@ def parser() -> argparse.ArgumentParser:
         "open", help="Show the current worker in Herdr"
     )
     _common(visible)
+    visible.add_argument(
+        "--work", help="Only open this work item’s current worker"
+    )
     visible.add_argument(
         "--terminal",
         action="store_true",
@@ -844,10 +850,16 @@ def _submission(args: argparse.Namespace) -> Submission:
 
 
 def execute(args: argparse.Namespace) -> dict:
+    if args.command == "ui":
+        from .cli_ui import execute_ui
+
+        return execute_ui(args)
     if args.command == "open":
         from .visibility import open_worker
 
-        return open_worker(_home(args), terminal=args.terminal)
+        return open_worker(
+            _home(args), terminal=args.terminal, work_id=args.work
+        )
     if args.command == "list":
         from .inventory import list_factories
 

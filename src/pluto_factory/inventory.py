@@ -277,7 +277,7 @@ def _read_snapshot(database: Path, include_sessions: bool = False) -> dict:
         connection.close()
 
 
-def _state(home: Path, include_sessions: bool = False) -> dict | None:
+def _snapshot(home: Path, reader) -> dict | None:
     database = home / "state.sqlite3"
     if not database.exists() and not database.is_symlink():
         return None
@@ -297,8 +297,14 @@ def _state(home: Path, include_sessions: bool = False) -> dict | None:
             except FileNotFoundError:
                 continue
             if before == after:
-                return _read_snapshot(copied / database.name, include_sessions)
+                return reader(copied / database.name)
     raise RuntimeError("factory state changed during inventory snapshot")
+
+
+def _state(home: Path, include_sessions: bool = False) -> dict | None:
+    return _snapshot(
+        home, lambda database: _read_snapshot(database, include_sessions)
+    )
 
 
 def _configuration(home: Path) -> tuple[FactoryConfig | None, str]:

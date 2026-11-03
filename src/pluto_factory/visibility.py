@@ -35,7 +35,7 @@ def _phase_context(work: list[dict]) -> str | None:
     return None
 
 
-def current_worker(home: Path) -> dict:
+def current_worker(home: Path, *, work_id: str | None = None) -> dict:
     config, status = _configuration(home)
     if status != "valid":
         raise VisibilityError("Factory configuration is unavailable.")
@@ -55,7 +55,12 @@ def current_worker(home: Path) -> dict:
             "status": "idle",
             "message": "No worker has been recorded.",
         }
-    work = [item for item in state["work"] if item["phase"] != "completed"]
+    if work_id is not None:
+        work = [item for item in state["work"] if item["id"] == work_id]
+        if not work:
+            raise VisibilityError("The selected work item was not found.")
+    else:
+        work = [item for item in state["work"] if item["phase"] != "completed"]
     result["phase"] = _phase_context(work)
     if state["paused"]:
         return result | {
@@ -65,7 +70,8 @@ def current_worker(home: Path) -> dict:
     candidates = [
         item
         for item in work
-        if item["current_run"]
+        if item["phase"] != "completed"
+        and item["current_run"]
         and item["control"] not in {"paused", "deferred", "quarantined"}
     ]
     if len(candidates) > 1:
@@ -166,13 +172,14 @@ def open_worker(
     home: Path,
     *,
     terminal: bool = False,
+    work_id: str | None = None,
     runner=None,
     stdin=None,
     stdout=None,
     stderr=None,
 ) -> dict:
     runner = runner or subprocess.run
-    selected = current_worker(home)
+    selected = current_worker(home, work_id=work_id)
     if selected["status"] != "active":
         return selected
     core = _json_operation(runner, ["hc", "server", "status", "--json"])
@@ -209,7 +216,7 @@ def open_worker(
         raise VisibilityError(
             "The live terminal does not belong to the current assignment."
         )
-    latest = current_worker(home)
+    latest = current_worker(home, work_id=work_id)
     if any(
         latest.get(key) != selected.get(key)
         for key in (
@@ -273,9 +280,11 @@ def open_worker(
     return selected | {
         "status": "app_unavailable",
         "message": "The Herdr window is unavailable.",
-        "fallback": "pluto factory open --home "
-        + shlex.quote(str(home.resolve()))
-        + " --terminal",
+        "fallback": shlex.join(
+            ["pluto", "factory", "open", "--home", str(home.resolve())]
+            + (["--work", work_id] if work_id is not None else [])
+            + ["--terminal"]
+        ),
     }
 
 

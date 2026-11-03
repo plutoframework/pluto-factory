@@ -311,3 +311,58 @@ def test_cli_open_human_and_json_modes(tmp_path, monkeypatch, capsys):
     assert "opaque-terminal" not in human and "opaque-work" not in human
     assert main(["--json", "open", "--home", str(tmp_path)]) == 0
     assert json.loads(capsys.readouterr().out)["terminal"] == "opaque-terminal"
+
+
+def test_selected_completed_task_never_opens_different_current_worker(tmp_path):
+    home, state = factory(tmp_path)
+    old, _ = worker(state, assignment="assignment-old", address="t-old")
+    state.update_work(old["id"], phase="completed", current_run=None)
+    worker(state)
+    result = open_worker(
+        home,
+        work_id=old["id"],
+        runner=lambda *_a, **_kw: pytest.fail("opened other task"),
+    )
+    assert result["status"] == "idle"
+    assert result["phase"] == "completed"
+    state.close()
+
+
+def test_selected_paused_task_never_falls_back_to_current_worker(tmp_path):
+    home, state = factory(tmp_path)
+    old, _ = worker(state, assignment="assignment-old", address="t-old")
+    state.pause(old["id"])
+    worker(state)
+    result = open_worker(
+        home,
+        work_id=old["id"],
+        runner=lambda *_a, **_kw: pytest.fail("opened other task"),
+    )
+    assert result["status"] == "idle"
+    assert result["phase"] == "implementing"
+    state.close()
+
+
+def test_selected_active_task_can_open_among_multiple_current_assignments(
+    tmp_path,
+):
+    home, state = factory(tmp_path)
+    worker(state, assignment="assignment-other", address="t-other")
+    work, session = worker(state)
+    runner = Core(session)
+    result = open_worker(home, work_id=work["id"], runner=runner)
+    assert result["status"] == "opened"
+    assert result["work_id"] == work["id"]
+    assert all("t-other" not in argv for argv, _options in runner.calls)
+    state.close()
+
+
+def test_selected_app_fallback_keeps_work_guard(tmp_path):
+    home, state = factory(tmp_path)
+    work, session = worker(state)
+    result = open_worker(
+        home, work_id=work["id"], runner=Core(session, app_available=False)
+    )
+    assert f"--work {work['id']}" in result["fallback"]
+    assert result["fallback"].endswith(" --terminal")
+    state.close()
