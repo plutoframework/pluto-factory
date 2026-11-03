@@ -503,7 +503,56 @@ class GitHubAdapter:
         temporary.replace(path)
         return path
 
+    def _preflight_publication(self, work, entries):
+
+        # Inspect every writable repository before the first remote mutation.
+        for entry in entries:
+            if entry.get("access") == "read":
+                continue
+            repo, managed, slug = self._entry(entry)
+            if repo.access != "write":
+                raise GitHubFailure("scope.denied", "Repository is read-only")
+            if not entry.get("branch", "").startswith("factory/"):
+                raise GitHubFailure("scope.denied", "Invalid factory branch")
+            self._git(managed, "check-ref-format", "--branch", entry["branch"])
+            candidate, base = entry.get("candidate", ""), entry.get("base", "")
+            if not REVISION.fullmatch(candidate) or not REVISION.fullmatch(
+                base
+            ):
+                raise GitHubFailure(
+                    "github.invalid_candidate",
+                    "Publication needs frozen base and candidate commits",
+                )
+            result = self._git(
+                managed,
+                "diff",
+                "--quiet",
+                base,
+                candidate,
+                "--",
+                acceptable=(0, 1),
+            )
+            if result.returncode == 0:
+                existing = self._discover(
+                    slug,
+                    entry["branch"],
+                    entry["default_branch"],
+                    self._marker(work, entry["name"]),
+                )
+                if (
+                    existing
+                    and existing.get("merged_at")
+                    and existing.get("head", {}).get("sha") == candidate
+                ):
+                    continue
+                raise GitHubFailure(
+                    "github.no_changes",
+                    "No changes to publish; reconcile prior merges and acceptance before retrying",
+                    False,
+                )
+
     def publish(self, work, entries) -> list[dict]:
+        self._preflight_publication(work, entries)
         for entry in entries:
             if entry.get("access") != "read":
                 self._entry(entry)

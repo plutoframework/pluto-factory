@@ -29,6 +29,7 @@ def plan_recovery(
         "config.invalid",
         "validation.unconfigured",
         "scope.denied",
+        "github.no_changes",
     }:
         return Recovery("defer", 0, "action_required")
     if recoveries >= maximum:

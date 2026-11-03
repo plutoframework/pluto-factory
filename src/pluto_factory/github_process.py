@@ -1,5 +1,6 @@
 """GitHub-scoped credentials and safe process failure classification."""
 
+import json
 import re
 
 
@@ -48,6 +49,46 @@ def operation_name(argv):
                 return f"GitHub {group} {argv[2]}"
             return f"GitHub {group}"
     return "GitHub integration operation"
+
+
+def _no_changes(diagnostic):
+    """Recognize a PR-creation validation rejection, never a transport hint."""
+    message = re.compile(
+        r"no commits between \S[^\r\n]* and \S[^\r\n]*", re.IGNORECASE
+    )
+    for line in diagnostic.splitlines():
+        line = re.sub(
+            r"^(?:pull request create failed:\s*)?(?:GraphQL:\s*)?",
+            "",
+            line.strip(),
+            flags=re.IGNORECASE,
+        )
+        if message.fullmatch(line):
+            return True
+    try:
+        response = json.loads(diagnostic)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(response, dict) or not isinstance(
+        response.get("errors"), list
+    ):
+        return False
+    for error in response["errors"]:
+        if not isinstance(error, dict) or not isinstance(
+            error.get("message"), str
+        ):
+            continue
+        path = error.get("path")
+        creation_path = isinstance(path, list) and any(
+            isinstance(value, str) and value.lower() == "createpullrequest"
+            for value in path
+        )
+        pull_request_resource = error.get("resource") == "PullRequest"
+        if (creation_path or pull_request_resource) and message.fullmatch(
+            error["message"].strip()
+        ):
+            return True
+    return False
 
 
 def classify_failure(argv, returncode, stderr, *, mutating):
@@ -99,6 +140,20 @@ def classify_failure(argv, returncode, stderr, *, mutating):
         return (
             "permission.required",
             f"{operation} requires GitHub permission",
+            False,
+        )
+    if (
+        argv
+        and list(argv[:3]) == ["gh", "pr", "create"]
+        and returncode != 0
+        and _no_changes(str(stderr or ""))
+    ):
+        return (
+            "github.no_changes",
+            (
+                "GitHub PR creation has no commits to publish; reconcile the "
+                "candidate with the target branch before retrying"
+            ),
             False,
         )
     return (
