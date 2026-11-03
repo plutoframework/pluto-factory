@@ -440,3 +440,145 @@ def test_green_then_pending_then_green_reassesses_without_deferral_or_worker(
     current = advance(engine, current)
     assert current["phase"] == "completed" and len(closed) == 1
     assert not engine.state.inspect()["runs"]
+
+
+def default_ci(engine, remote):
+    remote.pr["merge_commit"] = "2" * 40
+    remote.main = {
+        "state": "observed",
+        "branch": "main",
+        "head": "2" * 40,
+        "checks": [
+            {
+                "name": "validate",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "head_sha": "2" * 40,
+            }
+        ],
+        "runs": [
+            {
+                "id": 99,
+                "head_sha": "2" * 40,
+                "head_branch": "main",
+                "event": "push",
+                "conclusion": "success",
+            }
+        ],
+    }
+    engine.github.adapter.default_branch_checks = lambda _: copy.deepcopy(
+        remote.main
+    )
+
+
+def test_default_branch_ci_is_recorded_at_merge_commit_not_pr_head(merged):
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+    current = advance(engine, work)
+    assert current["phase"] == "completed" and closed
+    proofs = [
+        row
+        for row in current_evidence(
+            engine.state, engine.home, engine.config, current
+        )
+        if row["kind"] == "github_default_ci"
+    ]
+    assert len(proofs) == 1 and proofs[0]["revision"] == "2" * 40
+    assert proofs[0]["candidate_set"] == {"core": SHA}
+
+
+def test_pending_default_branch_ci_waits_after_pr_checks_pass(merged):
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+    remote.main["checks"][0].update(status="IN_PROGRESS", conclusion="")
+    current = advance(engine, work)
+    assert current["control"] == "backoff" and not closed
+    remote.main["checks"][0].update(status="COMPLETED", conclusion="SUCCESS")
+    assert advance(engine, current)["phase"] == "completed"
+    assert not engine.state.inspect()["runs"]
+
+
+def test_failed_default_branch_ci_blocks_closure_even_with_green_pr_ci(merged):
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+    remote.main["checks"][0]["conclusion"] = "FAILURE"
+    assert advance(engine, work)["control"] == "deferred" and not closed
+
+
+def test_default_branch_ci_rerun_during_model_decision_reassesses(merged):
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+
+    def rerun(_):
+        remote.main["checks"][0].update(status="IN_PROGRESS", conclusion="")
+
+    engine.coordinator = model(effect=rerun)
+    current = advance(engine, work)
+    assert current["control"] == "backoff" and not closed
+    assert not any(
+        row["kind"] == "github_default_ci"
+        for row in current_evidence(
+            engine.state, engine.home, engine.config, current
+        )
+    )
+    remote.main["checks"][0].update(status="COMPLETED", conclusion="SUCCESS")
+    engine.coordinator = model()
+    assert advance(engine, current)["phase"] == "completed"
+
+
+def test_new_merge_waits_briefly_for_main_workflow_discovery(merged):
+    from datetime import UTC, datetime
+
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+    remote.main.update(state="not_found", checks=[])
+    remote.pr["merged_at"] = datetime.now(UTC).isoformat()
+    assert advance(engine, work)["control"] == "backoff" and not closed
+
+
+def test_mismatched_main_ci_commit_cannot_prove_acceptance(merged):
+    engine, work, remote, closed = merged
+    default_ci(engine, remote)
+    remote.main["head"] = "3" * 40
+    assert advance(engine, work)["control"] == "deferred" and not closed
+
+
+def test_main_ci_provider_failure_keeps_work_awaiting_merge(merged):
+    from pluto_factory.github import GitHubFailure
+
+    engine, work, _remote, closed = merged
+
+    def unavailable(_):
+        raise GitHubFailure("github.timeout", "Observation timed out")
+
+    engine.github.adapter.default_branch_checks = unavailable
+    assert engine.tick()
+    current = engine.state.get_work(work["id"])
+    assert (
+        current["phase"] == "awaiting_merge" and current["control"] == "backoff"
+    )
+    assert not closed and not engine.state.inspect()["runs"]
+
+
+def test_check_result_order_changes_do_not_restart_acceptance(merged):
+    engine, work, remote, closed = merged
+    remote.pr["checks"].append(
+        {"name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}
+    )
+    default_ci(engine, remote)
+    remote.main["checks"].append(
+        {
+            "name": "format",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "head_sha": "2" * 40,
+        }
+    )
+
+    def reorder(_):
+        remote.pr["checks"].reverse()
+        remote.main["checks"].reverse()
+
+    engine.coordinator = model(effect=reorder)
+    assert advance(engine, work)["phase"] == "completed"
+    assert len(closed) == 1 and not engine.state.inspect()["runs"]

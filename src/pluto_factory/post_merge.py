@@ -1,6 +1,7 @@
 """Delivery gates and fresh acceptance after confirmed GitHub merges."""
 
 import time
+from datetime import UTC, datetime
 
 from .acceptance import acceptance_intent, current_evidence
 from .config import digest, resolved_bundle
@@ -9,33 +10,101 @@ from .github_checks import merge_check_status
 from .models import Failure
 
 
+def observe_default_branch(engine, work):
+    reader = getattr(engine.github.adapter, "default_branch_checks", None)
+    observations = []
+    for pr in work["data"]["pull_requests"]:
+        observed = (
+            reader(pr) if reader else {"state": "unavailable", "checks": []}
+        )
+        observed = {
+            **observed,
+            "repository": pr["repository"],
+            "merge_commit": pr.get("merge_commit"),
+        }
+        if observed.get("state") == "not_found" and pr.get("merged_at"):
+            try:
+                merged = datetime.fromisoformat(pr["merged_at"])
+                age = (datetime.now(UTC) - merged).total_seconds()
+            except (ValueError, TypeError):
+                age = float("inf")
+            if 0 <= age < max(60, 3 * engine.config.github_poll_seconds):
+                observed["state"] = "pending"
+        observations.append(observed)
+    work["data"]["default_branch_ci"] = observations
+
+
 def observation(engine, work):
     data = work["data"]
     gates = [
         merge_check_status(pr, engine.config.github_required_checks)
         for pr in data["pull_requests"]
     ]
+    for observed in data.get("default_branch_ci", []):
+        if observed.get("state") == "pending":
+            gates.append({"ready": False, "reason": "checks_not_ready"})
+        elif observed.get("state") == "invalid":
+            gates.append({"ready": False, "reason": "head_changed"})
+        elif observed.get("state") == "observed":
+            pr = next(
+                pr
+                for pr in data["pull_requests"]
+                if pr["repository"] == observed["repository"]
+            )
+            valid = observed.get("head") == pr.get(
+                "merge_commit"
+            ) and observed.get("branch") == pr.get("base")
+            gates.append(
+                merge_check_status(
+                    {
+                        "head": pr.get("merge_commit"),
+                        "observed_head": observed.get("head")
+                        if valid
+                        else None,
+                        "checks": observed.get("checks", []),
+                    },
+                    [],
+                )
+            )
     fingerprint = digest(
         {
             "candidates": data["acceptance_candidate"],
             "config_digest": digest(
                 resolved_bundle(engine.home, engine.config)
             ),
-            "pull_requests": [
-                {
-                    k: pr.get(k)
-                    for k in (
-                        "repository",
-                        "slug",
-                        "number",
-                        "head",
-                        "observed_head",
-                        "checks",
-                    )
-                }
-                for pr in data["pull_requests"]
-            ],
+            "pull_requests": sorted(
+                [
+                    {
+                        **{
+                            k: pr.get(k)
+                            for k in (
+                                "repository",
+                                "slug",
+                                "number",
+                                "head",
+                                "observed_head",
+                            )
+                        },
+                        "checks": sorted(pr.get("checks", []), key=digest),
+                    }
+                    for pr in data["pull_requests"]
+                ],
+                key=digest,
+            ),
             "required_checks": engine.config.github_required_checks,
+            "default_branch_ci": sorted(
+                [
+                    {
+                        **observed,
+                        "checks": sorted(
+                            observed.get("checks", []), key=digest
+                        ),
+                        "runs": sorted(observed.get("runs", []), key=digest),
+                    }
+                    for observed in data.get("default_branch_ci", [])
+                ],
+                key=digest,
+            ),
         }
     )
     return gates, fingerprint
@@ -118,6 +187,7 @@ def reassess_merged(engine, work):
 
 
 def _reassess_merged(engine, work):
+    observe_default_branch(engine, work)
     gates, fingerprint = observation(engine, work)
     if not gate_checks(engine, work, gates, fingerprint):
         return None
@@ -151,6 +221,40 @@ def _reassess_merged(engine, work):
                     },
                 )
             )
+        for observed in data.get("default_branch_ci", []):
+            if observed.get("state") != "observed" or not observed.get(
+                "checks"
+            ):
+                continue
+            gate = merge_check_status(
+                {
+                    "head": observed["head"],
+                    "observed_head": observed["head"],
+                    "checks": observed["checks"],
+                },
+                [],
+            )
+            if not gate["ready"] or not gate.get("successful"):
+                continue
+            ids.append(
+                engine.state.evidence(
+                    work["id"],
+                    {
+                        "kind": "github_default_ci",
+                        "passed": True,
+                        "candidate_set": data["acceptance_candidate"],
+                        "config_digest": data["acceptance_config_digest"],
+                        "repository": observed["repository"],
+                        "revision": observed["head"],
+                        "default_branch": observed["branch"],
+                        "observation_fingerprint": fingerprint,
+                        "checks": observed["checks"],
+                        "runs": observed.get("runs", []),
+                        "scope": "Default-branch workflow execution on the exact merged commit",
+                        "summary": "Observed successful default-branch CI on the merged commit",
+                    },
+                )
+            )
         data["post_merge_validation"] = {
             "fingerprint": fingerprint,
             "status": "passed",
@@ -171,6 +275,7 @@ def _reassess_merged(engine, work):
             report={
                 "stage": "post_merge",
                 "pull_requests": data["pull_requests"],
+                "default_branch_ci": data.get("default_branch_ci", []),
                 "delivery_evidence_ids": data["post_merge_validation"][
                     "evidence_ids"
                 ],
@@ -276,6 +381,7 @@ def _confirm_merged(engine, work, expected_fingerprint):
         )
         return None
     data["pull_requests"] = observed["pull_requests"]
+    observe_default_branch(engine, work)
     gates, fingerprint = observation(engine, work)
     if not gate_checks(engine, work, gates, fingerprint):
         return None
