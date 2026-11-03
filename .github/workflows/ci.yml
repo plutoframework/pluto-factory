@@ -1,0 +1,30 @@
+name: Factory CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: factory-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@4c58170a945e4e68ce3fc5b7af3d341d9b8c64ef
+        with:
+          version: '0.13.5'
+      - run: uv sync --locked --group dev
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked ruff check .
+      - run: node --check src/pluto_factory/dashboard/app.js
+      - run: uv run --locked pytest -q
+      - run: uv build --wheel
