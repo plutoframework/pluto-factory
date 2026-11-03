@@ -286,10 +286,19 @@ def test_coordinator_failure_becomes_recoverable_state(tmp_path):
         coordinator=UnavailableCoordinator(),
     )
     work_id = prepared["submitted"]["id"]
-    engine.state.update_work(work_id, phase="implementing")
+    engine.state.update_work(
+        work_id,
+        phase="reviewing",
+        data={
+            "entries": [
+                {"name": "core", "candidate": "candidate-core"},
+                {"name": "cli", "candidate": "candidate-cli"},
+            ]
+        },
+    )
     run = engine.state.create_run(
         work_id,
-        "implementer",
+        "reviewer",
         {
             "id": "run-model-error",
             "report_path": str(home / "absent-report.json"),
@@ -303,7 +312,9 @@ def test_coordinator_failure_becomes_recoverable_state(tmp_path):
             "assignment_id": run["id"],
             "generation": run["generation"],
             "report": WorkerReport(
-                outcome="ready", summary="Work completed"
+                outcome="ready",
+                summary="Review completed",
+                reviewed_repositories=["core", "cli"],
             ).model_dump(),
         },
     )

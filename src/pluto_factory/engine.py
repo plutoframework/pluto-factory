@@ -425,8 +425,53 @@ class Engine:
             "candidate": work["data"].get("entries"),
             "evaluation": evaluation,
         }
-        if evaluation == "acceptance":
+        if evaluation in {"acceptance", "handoff"}:
             snapshot["evidence"] = self._current_evidence(work)
+        if evaluation == "handoff":
+            next_phase = {
+                "implementing": "checking",
+                "reviewing": "preparing",
+                "qa": "integrating",
+            }[work["phase"]]
+            advance_meanings = {
+                "checking": (
+                    "Snapshot the implementation and execute independent "
+                    "checks; this grants neither integration nor completion."
+                ),
+                "preparing": (
+                    "Synchronize the reviewed candidate and run required QA; "
+                    "this does not authorize a merge or completion."
+                ),
+                "integrating": (
+                    "Evaluate independent integration and acceptance gates; "
+                    "this handoff alone does not authorize a merge."
+                ),
+            }
+            meanings = {
+                "advance": advance_meanings[next_phase],
+                "revise": (
+                    "Return to implementation with the concrete correction "
+                    "described in the decision rationale."
+                ),
+                "retry": (
+                    "Request another implementation attempt within the "
+                    "configured revision budget."
+                ),
+                "defer": (
+                    "Park only this work item with the decision rationale; "
+                    "other eligible work can continue."
+                ),
+            }
+            snapshot["handoff"] = {
+                "next_phase": next_phase,
+                "action_meanings": {
+                    action: meanings[action] for action in sorted(allowed)
+                },
+                "evidence_scope": (
+                    "Current candidate set and configuration. Evidence from "
+                    "later phases is not required for this handoff."
+                ),
+            }
         decision = self.coordinator.decide(
             snapshot, allowed, bundle["prompts"]["orchestrator"]
         )
@@ -451,7 +496,11 @@ class Engine:
                 "strategy": self.config.coordinator,
             },
         )
-        return decision if evaluation == "acceptance" else decision.action
+        return (
+            decision
+            if evaluation in {"acceptance", "handoff"}
+            else decision.action
+        )
 
     def _current_evidence(self, work):
         candidates = {
@@ -499,7 +548,45 @@ class Engine:
             allowed, preferred = {"revise", "defer"}, "revise"
         else:
             allowed, preferred = {"advance", "revise", "defer"}, "advance"
-        action = self._decide(work, allowed, preferred, report.model_dump())
+        if (
+            run["role"] == "implementer"
+            and report.outcome == "ready"
+            and not required_findings
+        ):
+            current = self.state.get_work(work["id"])
+            if (
+                current["updated"] != work["updated"]
+                or current["control"] == "paused"
+                or self.state.is_paused()
+            ):
+                raise StateConflict(
+                    "work changed before implementation handoff"
+                )
+            action = "advance"
+            rationale = (
+                "Implementation is ready to snapshot and independently check; "
+                "acceptance and integration remain separately gated."
+            )
+            self.state.event(
+                "handoff.authorized",
+                work["id"],
+                {
+                    "run_id": run["id"],
+                    "next_phase": "checking",
+                    "strategy": "deterministic",
+                    "rationale": rationale,
+                },
+            )
+        else:
+            decision = self._decide(
+                work,
+                allowed,
+                preferred,
+                report.model_dump(),
+                evaluation="handoff",
+            )
+            action = decision.action
+            rationale = decision.rationale
         for improvement in report.improvements:
             propose(self.state, self.config, work["id"], improvement)
         data = work["data"]
@@ -526,9 +613,9 @@ class Engine:
         self.state.update_run(run["id"], state="settled")
         work = self.state.update_work(work["id"], current_run=None, data=data)
         if action in {"revise", "retry"}:
-            self._revise(work, report.summary)
+            self._revise(work, rationale)
         elif action == "defer":
-            self._defer(work, report.summary)
+            self._defer(work, rationale)
         else:
             phase = {
                 "implementer": "checking",
