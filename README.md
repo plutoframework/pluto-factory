@@ -508,6 +508,13 @@ merges and acceptance instead of blindly retrying or claiming completion.
 Already-running coordinators do not hot-reload these rules. Older queued merge
 records without the new acceptance bindings require explicit reconciliation.
 
+After a PR merges, the factory waits for required checks at the validated PR
+head and records that delivery evidence. It then reassesses acceptance before
+closing the issue or scheduling another increment. Pending CI does not dispatch
+a coding worker. PR-head CI is distinct from default-branch CI, and no required
+checks is not evidence that CI executed. A final check observation immediately
+before closure prevents a changed or failed rerun from using stale green proof.
+
 ## Recovery, notifications, and improvement
 
 Recovery runs autonomously within configured authority and budgets. Unknown

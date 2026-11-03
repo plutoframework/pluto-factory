@@ -16,6 +16,15 @@ def current_evidence(state, home, config, work):
     results = []
     for row in rows:
         result = json.loads(row["data"])
+        if result.get("kind") in {"github_ci", "github_delivery"} and (
+            result.get("observation_fingerprint")
+            != work["data"].get("post_merge_validation", {}).get("fingerprint")
+            or row["id"]
+            not in work["data"]
+            .get("post_merge_validation", {})
+            .get("evidence_ids", [])
+        ):
+            continue
         if (
             result.get("candidate_set") == candidates
             and result.get("config_digest") == current_digest

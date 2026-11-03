@@ -16,6 +16,7 @@ from .harness import HarnessError, make_harness
 from .improvements import propose
 from .models import Failure, WorkerReport
 from .notifications import flush
+from .post_merge import confirm_merged, reassess_merged
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 
@@ -210,7 +211,13 @@ class Engine:
         elif phase == "integrating":
             self._integrate(work)
         elif phase == "awaiting_merge" and self.github:
-            self.github.advance(work, self._revise, self._defer)
+            self.github.advance(
+                work,
+                self._revise,
+                self._defer,
+                reassess=lambda item: reassess_merged(self, item),
+                confirm=lambda item: confirm_merged(self, item),
+            )
         else:
             raise ValueError(f"unsupported phase {phase}")
 
@@ -475,6 +482,9 @@ class Engine:
             }
         if evaluation == "acceptance":
             snapshot["acceptance_policy"] = {
+                "stage": "post_merge"
+                if work["phase"] == "awaiting_merge"
+                else "pre_publication",
                 "complete": "All product criteria pass with current evidence; publish and confirm merges before closing the issue.",
                 "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete.",
                 "worker_remaining_work": work["data"]
@@ -848,6 +858,7 @@ class Engine:
         }
         if (
             failure.code not in known_codes
+            and work["phase"] != "awaiting_merge"
             and not failure.uncertain
             and work["recoveries"] < self.config.max_recoveries
         ):
