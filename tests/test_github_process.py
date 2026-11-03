@@ -122,3 +122,149 @@ def test_error_classifier_handles_missing_or_binary_stderr():
         )[0]
         == "auth.required"
     )
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "pull request create failed: GraphQL: No commits between main and factory/private-task (createPullRequest)",
+        "GraphQL: No commits between private-main and private-candidate (createPullRequest)",
+        "No commits between private-main and private-candidate",
+        b"pull request create failed: GraphQL: No commits between main and private-candidate (createPullRequest)",
+        '{"errors":[{"type":"UNPROCESSABLE","path":["createPullRequest"],"message":"No commits between private-main and private-candidate"}]}',
+        '{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between private-main and private-candidate"}]}',
+    ],
+)
+def test_empty_pr_creation_is_a_safe_deterministic_validation_rejection(
+    diagnostic,
+):
+    result = classify_failure(
+        [
+            "gh",
+            "pr",
+            "create",
+            "--head",
+            "private-candidate",
+            "--body-file",
+            "/private/request.md",
+        ],
+        1,
+        diagnostic,
+        mutating=True,
+    )
+    assert result[0] == "github.no_changes"
+    assert result[2] is False
+    assert "reconcile" in result[1]
+    assert "private" not in result[1] and "factory/" not in result[1]
+
+
+@pytest.mark.parametrize(
+    "argv,diagnostic",
+    [
+        (["git", "push"], "No commits between main and candidate"),
+        (["gh", "issue", "create"], "No commits between main and candidate"),
+        (["gh", "pr", "view"], "No commits between main and candidate"),
+        (
+            ["gh", "pr", "create"],
+            'HTTP 502: upstream connection lost while handling "No commits between main and candidate"',
+        ),
+        (["gh", "pr", "create"], "Connection reset by peer\nunknown outcome"),
+        (
+            ["gh", "pr", "create"],
+            '{"errors":[{"message":"No commits between main and candidate"}]}',
+        ),
+        (
+            ["gh", "pr", "create"],
+            '{"errors":[{"path":["otherMutation"],"message":"No commits between main and candidate"}]}',
+        ),
+        (
+            ["gh", "pr", "create"],
+            '{"errors": "No commits between main and candidate"}',
+        ),
+    ],
+)
+def test_empty_pr_classifier_does_not_hide_other_operation_or_transport_failures(
+    argv, diagnostic
+):
+    result = classify_failure(argv, 1, diagnostic, mutating=True)
+    assert result[0] == "github.operation_failed"
+    assert result[2] is True
+    assert "candidate" not in result[1]
+
+
+@pytest.mark.parametrize(
+    "returncode,diagnostic,expected",
+    [
+        (4, "No commits between main and candidate", "auth.required"),
+        (
+            1,
+            "HTTP 401: Bad credentials\nNo commits between main and candidate",
+            "auth.required",
+        ),
+        (
+            1,
+            "HTTP 403: Resource not accessible\nNo commits between main and candidate",
+            "permission.required",
+        ),
+    ],
+)
+def test_auth_and_permission_classifications_keep_precedence(
+    returncode, diagnostic, expected
+):
+    result = classify_failure(
+        ["gh", "pr", "create"], returncode, diagnostic, mutating=True
+    )
+    assert result[0] == expected
+    assert result[2] is False
+
+
+def test_no_changes_summary_never_exposes_provider_diagnostics_or_refs():
+    result = classify_failure(
+        ["gh", "pr", "create", "--repo", "private-owner/private-repository"],
+        1,
+        "pull request create failed: GraphQL: No commits between private-base and private-head (createPullRequest)\nsentinel-token ghp_abcdefghijklmnop123456",
+        mutating=True,
+    )
+    assert result[0] == "github.no_changes"
+    assert not any(
+        value in result[1]
+        for value in (
+            "private",
+            "sentinel",
+            "ghp_",
+            "GraphQL",
+            "createPullRequest",
+        )
+    )
+
+
+def test_pr_adapter_propagates_typed_no_changes_without_runtime_side_effects(
+    tmp_path,
+):
+    import subprocess
+
+    from pluto_factory.github import GitHubAdapter, GitHubFailure
+    from pluto_factory.models import FactoryConfig, Repository
+
+    def rejected(argv, **_options):
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "",
+            "pull request create failed: GraphQL: No commits between private-base and private-head (createPullRequest)",
+        )
+
+    adapter = GitHubAdapter(
+        tmp_path,
+        FactoryConfig(
+            name="example",
+            repositories=[Repository(name="app", path=str(tmp_path / "repo"))],
+        ),
+        runner=rejected,
+    )
+    with pytest.raises(GitHubFailure) as error:
+        adapter._run(["gh", "pr", "create"], mutating=True)
+    assert error.value.code == "github.no_changes"
+    assert error.value.uncertain is False
+    assert "private" not in str(error.value)
+    assert not list(tmp_path.iterdir())

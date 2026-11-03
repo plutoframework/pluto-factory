@@ -480,3 +480,214 @@ def test_completion_requires_each_acceptance_criterion(tmp_path):
         assert engine.state.get_work(work["id"])["phase"] != "completed"
     finally:
         engine.state.close()
+
+
+def test_admin_remaining_and_all_passed_advance_do_not_create_another_increment(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from pluto_factory.models import CriterionAssessment
+
+    home, prepared = prepare_demo(tmp_path / "admin-remaining")
+    engine = Engine(home)
+    work = integration_work(engine, prepared["submitted"]["id"])
+    data = work["data"]
+    admin = "Coordinator to finalize already-staged merge; no code fixes remain"
+    data["reports"]["implementer"]["remaining_work"] = [admin]
+    work = engine.state.update_work(work["id"], data=data)
+    evidence_id = engine.state.evidence(
+        work["id"],
+        {
+            "passed": True,
+            "candidate_set": data["checks_candidate"],
+            "config_digest": data["checks_config_digest"],
+            "kind": "checks",
+        },
+    )
+
+    class FinalAcceptance:
+        def decide(self, snapshot, allowed, prompt):
+            assert snapshot["acceptance_policy"]["worker_remaining_work"] == [
+                admin
+            ]
+            return Decision(
+                action="advance",
+                rationale="Publication remains with factory",
+                acceptance=[
+                    CriterionAssessment(
+                        criterion=i,
+                        result="passed",
+                        evidence_refs=[evidence_id],
+                        explanation="Current evidence satisfies product scope",
+                    )
+                    for i in range(len(work["payload"]["acceptance"]))
+                ],
+            )
+
+    observed = []
+
+    def publish(item, entries, remaining):
+        persisted = engine.state.get_work(item["id"])["data"]
+        observed.append((remaining, persisted))
+
+    engine.coordinator = FinalAcceptance()
+    engine.git = SimpleNamespace(
+        sync=lambda entries: (entries, False),
+        validate_integration_plan=lambda entries: [],
+    )
+    engine.github = SimpleNamespace(
+        adapter=SimpleNamespace(refresh_defaults=lambda entries: None),
+        publish=publish,
+    )
+    try:
+        engine._integrate(work)
+        remaining, persisted = observed[0]
+        assert remaining == []
+        assert persisted["acceptance_decision"]["action"] == "complete"
+        assert persisted["acceptance_candidate"] == data["checks_candidate"]
+        assert (
+            persisted["acceptance_config_digest"]
+            == data["checks_config_digest"]
+        )
+        assert "increment" not in persisted
+        assert engine.state.get_work(work["id"])["phase"] != "completed"
+        assert any(
+            e["kind"] == "acceptance.intent_normalized"
+            for e in engine.state.inspect()["events"]
+        )
+    finally:
+        engine.state.close()
+
+
+def test_no_changes_failure_defers_without_model_retry_or_worker_dispatch(
+    tmp_path,
+):
+    home, prepared = prepare_demo(tmp_path / "no-change-recovery")
+
+    class NoDiagnosis:
+        def decide(self, *args):
+            raise AssertionError(
+                "Known empty publication must not request a blind model retry"
+            )
+
+    engine = Engine(home, coordinator=NoDiagnosis())
+    try:
+        engine._failure(
+            prepared["submitted"]["id"],
+            Failure(
+                code="github.no_changes",
+                summary="Reconcile already merged work",
+                source="adapter",
+            ),
+        )
+        item = engine.state.get_work(prepared["submitted"]["id"])
+        assert item["control"] == "deferred"
+        assert item["recoveries"] == 0
+        assert item["current_run"] is None
+        assert (
+            engine.state.inspect()["notifications"][-1]["kind"]
+            == "action_required"
+        )
+    finally:
+        engine.state.close()
+
+
+def test_acceptance_policy_change_during_decision_prevents_publication(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from pluto_factory.models import CriterionAssessment
+
+    home, prepared = prepare_demo(tmp_path / "acceptance-policy-change")
+    engine = Engine(home)
+    work = integration_work(engine, prepared["submitted"]["id"])
+
+    class ChangedPolicy:
+        def decide(self, snapshot, allowed, prompt):
+            path = home / "prompts" / "orchestrator.md"
+            path.write_text(path.read_text() + "\nUpdated QA policy.\n")
+            return Decision(
+                action="advance",
+                rationale="Safe incomplete increment",
+                acceptance=[
+                    CriterionAssessment(
+                        criterion=i,
+                        result="incomplete",
+                        explanation="Product scope remains",
+                    )
+                    for i in range(len(work["payload"]["acceptance"]))
+                ],
+            )
+
+    def forbidden(*args):
+        raise AssertionError("Changed acceptance policy reached publication")
+
+    engine.coordinator = ChangedPolicy()
+    engine.git = SimpleNamespace(
+        sync=lambda entries: (entries, False),
+        validate_integration_plan=lambda entries: [],
+        integrate=forbidden,
+    )
+    engine.github = SimpleNamespace(
+        adapter=SimpleNamespace(refresh_defaults=lambda entries: None),
+        publish=forbidden,
+    )
+    try:
+        engine._integrate(work)
+        current = engine.state.get_work(work["id"])
+        assert current["phase"] == "checking"
+        assert "acceptance_decision" not in current["data"]
+    finally:
+        engine.state.close()
+
+
+@pytest.mark.parametrize("action", ["revise", "defer"])
+def test_explicit_acceptance_veto_wins_over_all_passed_assessments(
+    tmp_path, action
+):
+    from types import SimpleNamespace
+
+    from pluto_factory.models import CriterionAssessment
+
+    home, prepared = prepare_demo(tmp_path / action)
+    engine = Engine(home)
+    work = integration_work(engine, prepared["submitted"]["id"])
+
+    class Veto:
+        def decide(self, snapshot, allowed, prompt):
+            return Decision(
+                action=action,
+                rationale="Authority or quality blocker",
+                acceptance=[
+                    CriterionAssessment(
+                        criterion=i,
+                        result="passed",
+                        evidence_refs=["claimed-evidence"],
+                        explanation="Product criterion passes",
+                    )
+                    for i in range(len(work["payload"]["acceptance"]))
+                ],
+            )
+
+    def forbidden(*args):
+        raise AssertionError("Explicit acceptance veto reached publication")
+
+    engine.coordinator = Veto()
+    engine.git = SimpleNamespace(
+        sync=lambda entries: (entries, False),
+        validate_integration_plan=lambda entries: [],
+        integrate=forbidden,
+    )
+    try:
+        engine._integrate(work)
+        current = engine.state.get_work(work["id"])
+        assert (
+            current["control"] == "deferred"
+            if action == "defer"
+            else current["phase"] == "implementing"
+        )
+        assert "acceptance_decision" not in current["data"]
+    finally:
+        engine.state.close()

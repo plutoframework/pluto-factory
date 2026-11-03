@@ -495,6 +495,19 @@ checks withhold merge requests, as do observed pending/failed checks at the
 validated head. This also covers the initial empty rollup before CI starts.
 The adapter never uses an administrator merge bypass.
 
+Integration assesses every product acceptance criterion against current
+candidate/configuration evidence. Worker remaining-work prose is advisory:
+publication, merging and issue closure are coordinator duties, not a reason to
+start another coding increment. Only explicitly incomplete criteria justify a
+continuation. A final all-passed advance is recorded as terminal completion
+intent; closing still requires confirmed owned merges for every writable repo.
+
+Publication checks all repositories for an empty diff before pushing anything.
+An unchanged candidate is a typed `github.no_changes` result: reconcile prior
+merges and acceptance instead of blindly retrying or claiming completion.
+Already-running coordinators do not hot-reload these rules. Older queued merge
+records without the new acceptance bindings require explicit reconciliation.
+
 ## Recovery, notifications, and improvement
 
 Recovery runs autonomously within configured authority and budgets. Unknown

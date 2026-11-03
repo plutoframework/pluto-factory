@@ -7,6 +7,7 @@ from threading import Event
 
 from pydantic import ValidationError
 
+from .acceptance import acceptance_intent, current_evidence
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
 from .git import GitFailure, GitWorkspace
@@ -472,6 +473,16 @@ class Engine:
                     "later phases is not required for this handoff."
                 ),
             }
+        if evaluation == "acceptance":
+            snapshot["acceptance_policy"] = {
+                "complete": "All product criteria pass with current evidence; publish and confirm merges before closing the issue.",
+                "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete.",
+                "worker_remaining_work": work["data"]
+                .get("reports", {})
+                .get("implementer", {})
+                .get("remaining_work", []),
+                "boundary": "Publication, merging, issue closure and coordinator handoffs are factory duties, not unfinished product scope. Worker remaining-work text is advisory; assess every criterion.",
+            }
         decision = self.coordinator.decide(
             snapshot, allowed, bundle["prompts"]["orchestrator"]
         )
@@ -503,24 +514,7 @@ class Engine:
         )
 
     def _current_evidence(self, work):
-        candidates = {
-            entry["name"]: entry["candidate"]
-            for entry in work["data"]["entries"]
-        }
-        current_digest = digest(resolved_bundle(self.home, self.config))
-        rows = self.state.db.execute(
-            "SELECT id,data FROM evidence WHERE work_id=?", (work["id"],)
-        ).fetchall()
-        results = []
-        for row in rows:
-            result = json.loads(row["data"])
-            if (
-                result.get("candidate_set") == candidates
-                and result.get("config_digest") == current_digest
-                and result.get("passed")
-            ):
-                results.append({"id": row["id"], **result})
-        return results
+        return current_evidence(self.state, self.home, self.config, work)
 
     def _report(self, work, run):
         report = WorkerReport.model_validate(run["report"])
@@ -717,34 +711,34 @@ class Engine:
         if decision.action == "defer":
             self._defer(work, decision.rationale)
             return
+        if digest(resolved_bundle(self.home, self.config)) != current_digest:
+            self.state.update_work(
+                work_id,
+                phase="checking",
+                control="ready",
+                event="validation.configuration_changed",
+            )
+            return
         evidence_ids = {item["id"] for item in self._current_evidence(work)}
-        expected = set(range(len(work["payload"]["acceptance"])))
-        assessments = {item.criterion: item for item in decision.acceptance}
-        if decision.action == "complete":
-            if (
-                remaining
-                or set(assessments) != expected
-                or (len(assessments) != len(decision.acceptance))
-            ):
-                raise ValueError(
-                    "completion lacks a complete acceptance assessment"
-                )
-            for assessment in assessments.values():
-                if (
-                    assessment.result != "passed"
-                    or not assessment.evidence_refs
-                    or not set(assessment.evidence_refs).issubset(evidence_ids)
-                ):
-                    raise ValueError(
-                        "acceptance cites absent or stale evidence"
-                    )
-        elif not remaining:
-            remaining = [
-                item.explanation
-                for item in decision.acceptance
-                if item.result != "passed"
-            ] or [decision.rationale]
-        data["acceptance_decision"] = decision.model_dump()
+        intent, remaining = acceptance_intent(
+            decision, len(work["payload"]["acceptance"]), evidence_ids
+        )
+        if intent.action != decision.action:
+            self.state.event(
+                "acceptance.intent_normalized",
+                work_id,
+                {
+                    "original_action": decision.action,
+                    "action": intent.action,
+                    "reason": "All product acceptance criteria passed",
+                },
+            )
+        data["acceptance_decision"] = intent.model_dump()
+        data["acceptance_candidate"] = candidates
+        data["acceptance_config_digest"] = current_digest
+        work = self.state.update_work(
+            work_id, data=data, event="acceptance.intent_recorded"
+        )
         if self.github:
             self.github.publish(work, entries, remaining)
             return
@@ -850,6 +844,7 @@ class Engine:
             "report.missing",
             "phase.timeout",
             "coordinator.failed",
+            "github.no_changes",
         }
         if (
             failure.code not in known_codes

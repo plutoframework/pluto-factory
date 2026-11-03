@@ -28,6 +28,7 @@ class Remote:
         self.timeout_push = False
         self.diverged = False
         self.dirty = False
+        self.empty_diffs = set()
         self.default_branch = "main"
 
     def __call__(self, argv, **kwargs):
@@ -70,6 +71,8 @@ class Remote:
                 if self.timeout_push:
                     self.timeout_push = False
                     raise subprocess.TimeoutExpired(argv, 1)
+            elif operation == "diff":
+                code = 0 if managed in self.empty_diffs else 1
             elif operation == "merge-base":
                 code = 1 if self.diverged else 0
             elif operation == "merge":
@@ -183,6 +186,7 @@ def entries(integration, names=("core",)):
             "managed": str(integration.home / "repositories" / name),
             "access": "write",
             "candidate": NEW,
+            "base": OLD,
             "branch": "factory/work-example",
             "default_branch": "main",
         }
@@ -696,3 +700,50 @@ def test_git_push_failure_categories_are_sanitized_and_preserve_transport_uncert
     assert error.value.uncertain is uncertain
     assert "Git push" in error.value.summary
     assert "sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize("empty_index", [0, 1])
+def test_empty_diff_preflight_prevents_every_remote_mutation(
+    tmp_path, empty_index
+):
+    integration, remote = adapter(tmp_path)
+    candidates = entries(integration, ("core", "cli"))
+    remote.empty_diffs.add(candidates[empty_index]["managed"])
+    with pytest.raises(GitHubFailure) as failure:
+        integration.publish(work(), candidates)
+    assert failure.value.code == "github.no_changes"
+    assert failure.value.uncertain is False
+    assert not any(call[0] == "git" and "push" in call for call in remote.calls)
+    assert not any(call[:3] == ["gh", "pr", "create"] for call in remote.calls)
+
+
+def test_identical_base_candidate_is_a_no_change_result(tmp_path):
+    integration, remote = adapter(tmp_path)
+    candidate = entries(integration, ("core",))
+    candidate[0]["base"] = candidate[0]["candidate"]
+    remote.empty_diffs.add(candidate[0]["managed"])
+    with pytest.raises(GitHubFailure) as failure:
+        integration.publish(work(), candidate)
+    assert failure.value.code == "github.no_changes"
+
+
+def test_empty_diff_exact_owned_merged_pr_reconciles_without_republication(
+    tmp_path,
+):
+    integration, remote = adapter(tmp_path)
+    candidate = entries(integration, ("core",))
+    original = integration.publish(work(), candidate)
+    row = remote.prs[("owner/core", candidate[0]["branch"])][0]
+    row.update(state="closed", merged_at="confirmed")
+    candidate[0]["base"] = NEW
+    remote.empty_diffs.add(candidate[0]["managed"])
+    before = len(remote.calls)
+    reconciled = integration.publish(work(), candidate)
+    assert reconciled[0]["state"] == "merged"
+    assert reconciled[0]["number"] == original[0]["number"]
+    assert not any(
+        call[0] == "git" and "push" in call for call in remote.calls[before:]
+    )
+    assert not any(
+        call[:3] == ["gh", "pr", "create"] for call in remote.calls[before:]
+    )
