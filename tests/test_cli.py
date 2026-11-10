@@ -371,3 +371,31 @@ def test_missing_validation_is_not_ready(tmp_path, missing, capsys):
     assert main(args) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["readiness"]["ready"] is False
+
+
+def test_setup_claude_harness_uses_claude_model_defaults(tmp_path, capsys):
+    home = tmp_path / "factory"
+    repo = repository(tmp_path / "repo")
+    args = setup_args(home, repo)
+    args[args.index("fixture")] = "claude"
+    main(args)
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.harness == "claude"
+    assert config.worker.provider == "anthropic"
+    assert config.worker.model == "claude-opus-5-5"
+    assert config.reviewer.model == "claude-opus-5-5"
+    assert config.qa_model.model == "claude-sonnet-5-5"
+    assert config.qa_model.reasoning == "medium"
+
+
+def test_setup_claude_harness_preserves_explicit_model(tmp_path, capsys):
+    home = tmp_path / "factory"
+    repo = repository(tmp_path / "repo")
+    args = setup_args(home, repo)
+    args[args.index("fixture")] = "claude"
+    main([*args, "--model", "claude-fable-5-2"])
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.worker.model == "claude-fable-5-2"
+    assert config.reviewer.model == "claude-opus-5-5"

@@ -21,6 +21,7 @@ from .credentials import (
 )
 from .defaults import SecretDefaults, merge, read_defaults
 from .models import (
+    CLAUDE_PROFILES,
     FactoryConfig,
     ImprovementPolicy,
     ModelProfile,
@@ -90,7 +91,9 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--qa", action="append", default=[], metavar="ARGV_JSON")
     setup.add_argument("--config", type=Path)
     setup.add_argument("--defaults-file", type=Path)
-    setup.add_argument("--harness", choices=["pi", "fixture"], default="pi")
+    setup.add_argument(
+        "--harness", choices=["pi", "claude", "fixture"], default="pi"
+    )
     setup.add_argument(
         "--coordinator", choices=["model", "rules"], default="model"
     )
@@ -102,7 +105,7 @@ def parser() -> argparse.ArgumentParser:
         "--trust-repositories",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Trust project guidance in registered repositories for each Pi run",
+        help="Trust project guidance in registered repositories for each run",
     )
     setup.add_argument(
         "--integration", choices=["managed", "github"], default="managed"
@@ -391,7 +394,8 @@ def _wizard(args: argparse.Namespace) -> bool:
         ]
     if not args.qa:
         args.qa = [input("QA argv JSON: ")]
-    args.harness = _ask("Worker harness [pi/fixture]", args.harness)
+    args.harness = _ask("Worker harness [pi/claude/fixture]", args.harness)
+    _harness_model_defaults(args)
     args.integration = _ask("Integration [managed/github]", args.integration)
     if args.integration == "github":
         registered = mappings(args.github_repo)
@@ -429,7 +433,7 @@ def _wizard(args: argparse.Namespace) -> bool:
     args.isolation = _ask("Isolation [required/cooperative]", args.isolation)
     args.trust_repositories = (
         _ask(
-            "Trust registered repository guidance for unattended Pi runs [yes/no]",
+            "Trust registered repository guidance for unattended runs [yes/no]",
             "yes" if args.trust_repositories else "no",
         ).lower()
         == "yes"
@@ -488,9 +492,43 @@ def _wizard(args: argparse.Namespace) -> bool:
     return True
 
 
+def _harness_model_defaults(
+    args: argparse.Namespace, master: dict | None = None
+) -> None:
+    """Swap untouched Pi model defaults for Claude ones on the Claude harness.
+
+    Only values still equal to the built-in defaults change, so explicit
+    flags and customized master defaults are preserved.
+    """
+    if args.harness != "claude":
+        return
+    builtin = FactoryConfig.model_fields
+    pi = {
+        "worker": builtin["worker"].default_factory().model_dump(),
+        "reviewer": builtin["reviewer"].default_factory().model_dump(),
+        "qa_model": builtin["qa_model"].default_factory().model_dump(),
+    }
+    explicit = getattr(args, "_explicit", set())
+    for argument, role, field in (
+        ("provider", "worker", "provider"),
+        ("model", "worker", "model"),
+        ("review_model", "reviewer", "model"),
+        ("qa_model", "qa_model", "model"),
+    ):
+        flag = "--" + argument.replace("_", "-")
+        if flag not in explicit and getattr(args, argument) == pi[role][field]:
+            setattr(args, argument, CLAUDE_PROFILES[role][field])
+    if master is not None:
+        for role, profile in master["factory"].items():
+            if role in pi and profile == pi[role]:
+                master["factory"][role] = dict(CLAUDE_PROFILES[role])
+
+
 def _setup(args: argparse.Namespace) -> dict:
     master = _apply_master(args)
+    _harness_model_defaults(args, master)
     interactive = _wizard(args)
+    _harness_model_defaults(args, master)
     if args.config:
         import tomllib
 
@@ -738,9 +776,8 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
             "credential_available": False,
             "verified": False,
         }
-    for executable in ("git",) + (
-        ("hc", "pi") if config.harness == "pi" else ()
-    ):
+    native = {"pi": "pi", "claude": "claude"}.get(config.harness)
+    for executable in ("git",) + (("hc", native) if native else ()):
         checks.append(
             {
                 "name": f"executable:{executable}",
@@ -807,16 +844,16 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
             }
         )
     native_readiness = {}
-    if config.harness == "pi" and shutil.which("pi"):
-        from .harness import PiHarness
+    if native and shutil.which(native):
+        from .harness import make_harness
 
-        adapter = PiHarness(config)
+        adapter = make_harness(config)
         for role in ("implementer", "reviewer", "qa"):
             status = adapter.readiness(home, role, refresh=False)
             native_readiness[role] = status
             checks.append(
                 {
-                    "name": f"pi-authentication:{role}",
+                    "name": f"{native}-authentication:{role}",
                     "passed": status["status"] == "ready",
                 }
             )
