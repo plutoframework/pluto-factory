@@ -29,6 +29,25 @@ class ModelProfile(Contract):
     reasoning: str = "high"
 
 
+CLAUDE_PROFILES = {
+    "worker": {
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "reasoning": "high",
+    },
+    "reviewer": {
+        "provider": "anthropic",
+        "model": "claude-opus-5-5",
+        "reasoning": "high",
+    },
+    "qa_model": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5-5",
+        "reasoning": "medium",
+    },
+}
+
+
 class ImprovementPolicy(Contract):
     mode: Literal["disabled", "propose", "automatic"] = "propose"
     allowed_areas: list[str] = Field(
@@ -41,7 +60,7 @@ class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     repositories: list[Repository] = Field(min_length=1)
-    harness: Literal["pi", "fixture"] = "pi"
+    harness: Literal["pi", "claude", "fixture"] = "pi"
     coordinator: Literal["model", "rules"] = "model"
     coordinator_model: str = "openai-codex:gpt-6.1-terra"
     auth_mode: Literal["existing", "codex", "api_key"] = "existing"

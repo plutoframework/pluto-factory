@@ -67,6 +67,9 @@ class PiHarness:
     creating a terminal; a repository list is not an OS access boundary.
     """
 
+    kind = "pi"
+    label = "Pi"
+
     def __init__(
         self,
         config: FactoryConfig | dict,
@@ -92,31 +95,15 @@ class PiHarness:
     ) -> dict:
         """Return only native readiness metadata, never a credential value."""
         profile = self._profile(role)
-        arguments = [
-            sys.executable,
-            "-m",
-            "pluto_factory.worker_launcher",
-            str(home),
-            "pi",
-            "auth",
-            "check",
-            "--provider",
-            profile["provider"],
-            "--model",
-            profile["model"],
-            "--json",
-        ]
-        if not refresh:
-            arguments.append("--no-refresh")
         try:
             result = self.runner(
-                arguments,
+                self._readiness_command(home, profile, refresh=refresh),
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
             )
-            value = json.loads(result.stdout)
+            value = self._readiness_value(json.loads(result.stdout))
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
             return {
                 "status": "invalid",
@@ -157,6 +144,30 @@ class PiHarness:
         }:
             readiness["auth_type"] = value["authType"]
         return readiness
+
+    def _readiness_command(
+        self, home: Path | str, profile: dict, *, refresh: bool
+    ) -> list[str]:
+        arguments = [
+            sys.executable,
+            "-m",
+            "pluto_factory.worker_launcher",
+            str(home),
+            "pi",
+            "auth",
+            "check",
+            "--provider",
+            profile["provider"],
+            "--model",
+            profile["model"],
+            "--json",
+        ]
+        if not refresh:
+            arguments.append("--no-refresh")
+        return arguments
+
+    def _readiness_value(self, value):
+        return value
 
     def _hc(self, args: list[str], *, mutating: bool = False) -> dict:
         try:
@@ -250,7 +261,7 @@ class PiHarness:
                 uncertain=True,
             )
         return {
-            "kind": "pi",
+            "kind": self.kind,
             "address": address,
             "core_identity": self._core_identity(),
             "assignment_id": assignment["id"],
@@ -303,13 +314,12 @@ class PiHarness:
         if readiness["status"] != "ready":
             raise HarnessError(
                 "auth.required",
-                "Pi provider authentication is not ready; use the native "
-                "Pi login flow before dispatch",
+                f"{self.label} provider authentication is not ready; use "
+                f"the native {self.label} login flow before dispatch",
             )
         assignment_path = _assignment_path(assignment)
         assignment = {**assignment, "assignment_path": str(assignment_path)}
         atomic_json(assignment_path, assignment)
-        profile = self._profile(assignment["role"])
         name = f"pf-{assignment['id']}"[:32]
         labels = {
             "factory": self.config["name"],
@@ -332,60 +342,64 @@ class PiHarness:
         ]
         for key, value in labels.items():
             args.extend(["--label", f"{key}={value}"])
-        tools = "read,grep,find,ls,factory_report"
-        if assignment["role"] == "implementer":
-            tools = "read,bash,edit,write,grep,find,ls,factory_report"
-        args.extend(
-            [
-                "env",
-                f"PLUTO_FACTORY_ASSIGNMENT={assignment_path}",
-                f"PATH={os.environ.get('PATH', os.defpath)}",
-                *[
-                    f"{key}={os.environ[key]}"
-                    for key in (
-                        "PI_CODING_AGENT_DIR",
-                        "PI_CODING_AGENT_SESSION_DIR",
-                        "PI_PACKAGE_DIR",
-                    )
-                    if key in os.environ
-                ],
-                sys.executable,
-                "-m",
-                "pluto_factory.worker_launcher",
-                assignment["home"],
-                "pi",
-                *(
-                    ["--approve"]
-                    if self.config.get("trust_registered_repositories")
-                    else []
-                ),
-                "--provider",
-                profile["provider"],
-                "--model",
-                profile["model"],
-                "--thinking",
-                profile["reasoning"],
-                "--session-dir",
-                assignment["session_dir"],
-                "--name",
-                f"{self.config['name']}: {assignment['role']}",
-                "--no-extensions",
-                "--no-mcp",
-                "--tools",
-                tools,
-                "--append-system-prompt",
-                assignment["role_path"],
-                "--extension",
-                str(Path(__file__).with_name("pi_extension.ts")),
-                f"@{assignment['packet_path']}",
-            ]
-        )
+        args.extend(self._worker_command(assignment, assignment_path))
         terminal = self._hc(args, mutating=True)
         try:
             return self._session(terminal, assignment)
         except HarnessError as error:
             error.failure["uncertain"] = True
             raise
+
+    def _worker_command(
+        self, assignment: dict, assignment_path: Path
+    ) -> list[str]:
+        profile = self._profile(assignment["role"])
+        tools = "read,grep,find,ls,factory_report"
+        if assignment["role"] == "implementer":
+            tools = "read,bash,edit,write,grep,find,ls,factory_report"
+        return [
+            "env",
+            f"PLUTO_FACTORY_ASSIGNMENT={assignment_path}",
+            f"PATH={os.environ.get('PATH', os.defpath)}",
+            *[
+                f"{key}={os.environ[key]}"
+                for key in (
+                    "PI_CODING_AGENT_DIR",
+                    "PI_CODING_AGENT_SESSION_DIR",
+                    "PI_PACKAGE_DIR",
+                )
+                if key in os.environ
+            ],
+            sys.executable,
+            "-m",
+            "pluto_factory.worker_launcher",
+            assignment["home"],
+            "pi",
+            *(
+                ["--approve"]
+                if self.config.get("trust_registered_repositories")
+                else []
+            ),
+            "--provider",
+            profile["provider"],
+            "--model",
+            profile["model"],
+            "--thinking",
+            profile["reasoning"],
+            "--session-dir",
+            assignment["session_dir"],
+            "--name",
+            f"{self.config['name']}: {assignment['role']}",
+            "--no-extensions",
+            "--no-mcp",
+            "--tools",
+            tools,
+            "--append-system-prompt",
+            assignment["role_path"],
+            "--extension",
+            str(Path(__file__).with_name("pi_extension.ts")),
+            f"@{assignment['packet_path']}",
+        ]
 
     def reassign(self, session: dict, assignment: dict) -> dict:
         """Rebind a settled session without replaying uncertain submissions.
@@ -617,6 +631,125 @@ class PiHarness:
         self._hc(["rm", "--json", session["address"]], mutating=True)
 
 
+class ClaudeHarness(PiHarness):
+    """Run Claude Code workers in Core terminals.
+
+    Typed delivery uses the ``claude_worker`` MCP server and hooks instead
+    of a Pi extension. Claude sessions cannot rebind to a newer assignment,
+    so revisions always start a fresh session.
+    """
+
+    kind = "claude"
+    label = "Claude Code"
+    EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+    READ_TOOLS = ("Read", "Grep", "Glob")
+    WRITE_TOOLS = ("Bash", "Edit", "Write")
+
+    def _readiness_command(
+        self, home: Path | str, profile: dict, *, refresh: bool
+    ) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "pluto_factory.worker_launcher",
+            str(home),
+            "claude",
+            "auth",
+            "status",
+            "--json",
+        ]
+
+    def _readiness_value(self, value):
+        if not isinstance(value, dict):
+            return value
+        method = str(value.get("authMethod", "")).lower()
+        if value.get("loggedIn") is True or "api" in method:
+            readiness = {"status": "ready"}
+        else:
+            readiness = {
+                "status": "not_ready",
+                "reason": "credentials_not_configured",
+            }
+        if "api" in method:
+            readiness["authType"] = "api_key"
+        elif method in {"claude.ai", "oauth", "oauth_token"}:
+            readiness["authType"] = "oauth"
+        elif method:
+            readiness["authType"] = "ambient"
+        return readiness
+
+    def _worker_command(
+        self, assignment: dict, assignment_path: Path
+    ) -> list[str]:
+        from .claude_worker import QUALIFIED_TOOL, hook_settings, mcp_config
+
+        profile = self._profile(assignment["role"])
+        folder = assignment_path.parent
+        settings_path = folder / "claude-settings.json"
+        mcp_path = folder / "claude-mcp.json"
+        atomic_json(settings_path, hook_settings(sys.executable))
+        atomic_json(mcp_path, mcp_config(sys.executable, assignment_path))
+        tools = list(self.READ_TOOLS)
+        if assignment["role"] == "implementer":
+            tools.extend(self.WRITE_TOOLS)
+        sources = "user"
+        if self.config.get("trust_registered_repositories"):
+            sources = "user,project,local"
+        effort = (
+            ["--effort", profile["reasoning"]]
+            if profile["reasoning"] in self.EFFORTS
+            else []
+        )
+        # Variadic options (--tools, --allowedTools, --mcp-config) must not
+        # directly precede the positional prompt.
+        return [
+            "env",
+            f"PLUTO_FACTORY_ASSIGNMENT={assignment_path}",
+            f"PATH={os.environ.get('PATH', os.defpath)}",
+            *[
+                f"{key}={os.environ[key]}"
+                for key in ("CLAUDE_CONFIG_DIR",)
+                if key in os.environ
+            ],
+            sys.executable,
+            "-m",
+            "pluto_factory.worker_launcher",
+            assignment["home"],
+            "claude",
+            "--tools",
+            ",".join(tools),
+            "--allowedTools",
+            ",".join([*tools, QUALIFIED_TOOL]),
+            "--mcp-config",
+            str(mcp_path),
+            "--strict-mcp-config",
+            "--settings",
+            str(settings_path),
+            "--setting-sources",
+            sources,
+            "--permission-mode",
+            "dontAsk",
+            "--model",
+            profile["model"],
+            *effort,
+            "--name",
+            f"{self.config['name']}: {assignment['role']}",
+            "--append-system-prompt",
+            Path(assignment["role_path"]).read_text(),
+            Path(assignment["packet_path"]).read_text(),
+        ]
+
+    def reassign(self, session: dict, assignment: dict) -> dict:
+        try:
+            self.close(session)
+        except HarnessError:
+            pass
+        raise HarnessError(
+            "config.fresh_session_required",
+            "Claude Code sessions cannot rebind; a fresh session is required",
+        )
+
+
 class FixtureHarness:
     """Deterministic examples, never a substitute for live model evidence."""
 
@@ -756,4 +889,6 @@ def make_harness(config: FactoryConfig | dict):
     values = _config(config)
     if values["harness"] == "fixture":
         return FixtureHarness(values)
+    if values["harness"] == "claude":
+        return ClaudeHarness(values)
     return PiHarness(values)

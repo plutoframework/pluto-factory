@@ -3,7 +3,8 @@
 The [Pluto factory](https://github.com/plutoframework/pluto-factory)
 package runs a durable local work loop with isolated managed Git clones,
 candidate checks, separate review and QA roles, typed worker reports, bounded
-recovery, and a notification outbox. Pi is the first interactive worker adapter.
+recovery, and a notification outbox. Pi is the default interactive worker adapter; Claude Code
+is also supported (`harness = "claude"`).
 The coordinator can use Pydantic AI or deterministic rules for fixture tests.
 GitHub integration can ingest ready-labeled issues and publish validated PRs;
 managed integration keeps example work entirely local.
@@ -191,6 +192,23 @@ factory config with `--config`.
 `--trust-repositories` preauthorizes Pi to load guidance from the registered
 repositories for each run. Without it, Pi can ask for project trust when a new
 managed worktree starts. This does not provide OS isolation.
+
+### Worker harness
+
+`--harness` (or `harness` in `factory.toml`) selects the worker adapter:
+`pi` (default), `claude` for Claude Code, or `fixture` for simulated runs.
+Both native harnesses run interactively in Herdr Core and need `hc` plus the
+harness executable on `PATH`.
+
+With `--harness claude`, untouched model defaults become `claude-opus-5-5`
+(worker, reviewer) and `claude-sonnet-5-5` (QA); `reasoning` maps to
+`--effort`. Log in with `claude auth login` (or provide `ANTHROPIC_API_KEY`).
+Typed reports use a per-assignment `factory_report` MCP server and hooks from
+`pluto_factory.claude_worker` instead of the Pi extension. Workers run with
+`--permission-mode dontAsk` and a role-scoped tool allowlist;
+`--trust-repositories` also loads project and local Claude settings. Claude
+sessions cannot rebind to a revision, so each revision starts a fresh session.
+The coordinator model is configured separately (`coordinator_model`).
 
 Owner-permitted prompt changes can be inspected and activated explicitly:
 
