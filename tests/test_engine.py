@@ -842,3 +842,88 @@ def test_qa_dispatch_skips_sync_when_default_is_unchanged(tmp_path):
         )
     finally:
         engine.state.close()
+
+
+@pytest.mark.parametrize("outcome", ["revise", "defer"])
+def test_implementer_handoff_decision_sees_committed_worktree_head(
+    tmp_path, outcome
+):
+    home, prepared = prepare_demo(tmp_path / f"handoff-{outcome}")
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    try:
+        work = engine.state.get_work(work_id)
+        entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+        writable = next(e for e in entries if e["access"] == "write")
+        base = writable["base"]
+        worktree = Path(writable["worktree"])
+        (worktree / "feature.txt").write_text("implemented\n")
+        git(worktree, "add", ".")
+        git(
+            worktree,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@localhost",
+            "commit",
+            "-m",
+            "Implement feature",
+        )
+        head = git(worktree, "rev-parse", "HEAD")
+        assert head != base
+        work = engine.state.update_work(
+            work_id,
+            phase="implementing",
+            data={"entries": entries, "workspace_id": work_id},
+        )
+        run = engine.state.create_run(
+            work_id,
+            "implementer",
+            {
+                "id": f"run-{outcome}",
+                "config_digest": digest(resolved_bundle(home, engine.config)),
+            },
+        )
+        engine.state.update_run(
+            run["id"], state="running", session={"owned": True}
+        )
+        engine.state.accept_report(
+            run["id"],
+            {
+                "assignment_id": run["id"],
+                "generation": run["generation"],
+                "report": WorkerReport(
+                    outcome=outcome,
+                    summary="Committed work; policy blocker remains",
+                    findings=[
+                        {"severity": "required", "summary": "Policy blocker"}
+                    ],
+                ).model_dump(),
+            },
+        )
+        seen = []
+
+        class Judge:
+            def decide(self, snapshot, allowed, prompt):
+                seen.append(snapshot)
+                return Decision(action="defer", rationale="Needs maintainer")
+
+        engine.coordinator = Judge()
+        engine.harness = ObservedHarness("settled")
+        engine._report(
+            engine.state.get_work(work_id), engine.state.get_run(run["id"])
+        )
+        decided = next(
+            e for e in seen[0]["candidate"] if e["name"] == writable["name"]
+        )
+        assert decided["candidate"] == head
+        assert "feature.txt" in decided["diff_stat"]
+        assert any("Implement feature" in line for line in decided["commits"])
+        stored = next(
+            e
+            for e in engine.state.get_work(work_id)["data"]["entries"]
+            if e["name"] == writable["name"]
+        )
+        assert stored["candidate"] == head
+    finally:
+        engine.state.close()

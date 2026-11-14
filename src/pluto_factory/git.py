@@ -342,6 +342,13 @@ class GitWorkspace:
                 ).stdout
             )
             entry["review_artifact"] = str(artifact)
+            span = f"{entry['base']}..{entry['candidate']}"
+            entry["commits"] = self._text(
+                worktree, "log", "--oneline", "--max-count=50", span
+            ).splitlines()
+            entry["diff_stat"] = self._text(worktree, "diff", "--stat", span)[
+                :4000
+            ]
             result.append(entry)
         self._save(result)
         return result
