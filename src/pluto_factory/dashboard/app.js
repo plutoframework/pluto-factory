@@ -550,7 +550,9 @@
       } else {
         herdr.append(node("p", "body-copy", "This task has no active worker to open. Its recorded reports, checks, and activity remain available here."));
       }
-      sections.push(herdr);
+      // A live worker is the main thing to act on: show how to open it first.
+      if (work.herdr.available) sections.unshift(herdr);
+      else sections.push(herdr);
     }
     if (reportsSection) sections.push(reportsSection);
     if (workers) sections.push(workers);
