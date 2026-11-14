@@ -667,15 +667,18 @@ def trust_claude_workspaces(paths: list[str]) -> list[str]:
     """Pre-accept Claude Code's workspace trust dialog for these folders.
 
     Interactive Claude Code has no flag to skip the dialog, so an unattended
-    worker would block on it. Only called when the owner registered the
-    repositories as trusted. Existing config is preserved; only
-    ``projects[path].hasTrustDialogAccepted`` is set.
+    worker would block on it. Accepting it loads nothing by itself: workers
+    read project settings only when the owner sets
+    ``trust_registered_repositories``. Claude keys a git worktree's trust by
+    its main repository (parent folders do not count), so trusting that once
+    covers every later worktree of the repository. Existing config is
+    preserved; only ``projects[path].hasTrustDialogAccepted`` is set.
     """
     targets: list[str] = []
     for path in paths:
-        for candidate in (str(Path(path).resolve()), _git_main_root(path)):
-            if candidate and candidate not in targets:
-                targets.append(candidate)
+        candidate = _git_main_root(path) or str(Path(path).resolve())
+        if candidate not in targets:
+            targets.append(candidate)
     path = claude_config_path()
     try:
         data = json.loads(path.read_text()) if path.exists() else {}
@@ -779,21 +782,35 @@ class ClaudeHarness(PiHarness):
         mcp_path = folder / "claude-mcp.json"
         atomic_json(
             settings_path,
-            hook_settings(sys.executable, trace=bool(assignment.get("trace"))),
+            hook_settings(
+                sys.executable,
+                trace=bool(assignment.get("trace")),
+                skip_permissions=bool(
+                    self.config.get("dangerously_skip_permissions")
+                ),
+            ),
         )
         atomic_json(mcp_path, mcp_config(sys.executable, assignment_path))
         tools = list(self.READ_TOOLS)
         if assignment["role"] == "implementer":
             tools.extend(self.WRITE_TOOLS)
+        # Always pre-accept the folder-trust dialog so new worktrees never
+        # prompt; project settings still load only for trusted repositories.
+        trust_claude_workspaces(
+            [
+                assignment["directory"],
+                *(root["path"] for root in assignment.get("roots", [])),
+            ]
+        )
         sources = "user"
         if self.config.get("trust_registered_repositories"):
             sources = "user,project,local"
-            trust_claude_workspaces(
-                [
-                    assignment["directory"],
-                    *(root["path"] for root in assignment.get("roots", [])),
-                ]
-            )
+        skip = bool(self.config.get("dangerously_skip_permissions"))
+        permissions = (
+            ["--dangerously-skip-permissions"]
+            if skip
+            else ["--permission-mode", "dontAsk"]
+        )
         effort = (
             ["--effort", profile["reasoning"]]
             if profile["reasoning"] in self.EFFORTS
@@ -826,8 +843,7 @@ class ClaudeHarness(PiHarness):
             str(settings_path),
             "--setting-sources",
             sources,
-            "--permission-mode",
-            "dontAsk",
+            *permissions,
             "--model",
             profile["model"],
             *effort,

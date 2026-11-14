@@ -89,6 +89,8 @@ class FactoryConfig(Contract):
     )
     isolation: Literal["cooperative", "required"] = "required"
     trust_registered_repositories: bool = False
+    # Claude workers bypass all permission checks (unattended factories).
+    dangerously_skip_permissions: bool = False
     integration: Literal["managed", "github"] = "managed"
     github_issue_label: str = Field(default="factory:ready", min_length=1)
     github_poll_seconds: int = Field(default=30, ge=1)

@@ -519,3 +519,15 @@ def test_setup_debug_defaults_off(tmp_path, capsys):
     main(setup_args(home, repository(tmp_path / "repo")))
     capsys.readouterr()
     assert not load_config(home).debug.enabled
+
+
+def test_setup_skip_permissions_flag(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    main([*args, "--dangerously-skip-permissions"])
+    capsys.readouterr()
+    assert load_config(home).dangerously_skip_permissions
+    other = tmp_path / "other"
+    main(setup_args(other, repository(tmp_path / "repo2")))
+    capsys.readouterr()
+    assert not load_config(other).dangerously_skip_permissions

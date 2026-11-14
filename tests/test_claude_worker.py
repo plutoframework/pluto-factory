@@ -228,11 +228,40 @@ def test_trusted_launch_pre_accepts_workspace_trust(
     assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_untrusted_launch_leaves_claude_config_alone(
+def test_default_launch_trusts_folder_without_project_settings(
     tmp_path, isolated_claude_config
 ):
-    launch(tmp_path)
-    assert not (isolated_claude_config / ".claude.json").exists()
+    item, _, call = launch(tmp_path)
+    projects = _claude_config(isolated_claude_config)["projects"]
+    target = str(Path(item["directory"]).resolve())
+    assert projects[target]["hasTrustDialogAccepted"] is True
+    native = call[call.index("claude") :]
+    assert native[native.index("--setting-sources") + 1] == "user"
+    assert native[native.index("--permission-mode") + 1] == "dontAsk"
+    assert "--dangerously-skip-permissions" not in native
+
+
+def test_skip_permissions_bypasses_checks_and_preaccepts_warning(
+    tmp_path, isolated_claude_config
+):
+    item, _, call = launch(tmp_path, dangerously_skip_permissions=True)
+    native = call[call.index("claude") :]
+    assert "--dangerously-skip-permissions" in native
+    assert "--permission-mode" not in native
+    # The tool set stays restricted even when checks are bypassed.
+    assert "--tools" in native
+    settings = json.loads(
+        (
+            Path(item["assignment_path"]).parent / "claude-settings.json"
+        ).read_text()
+    )
+    assert settings["skipDangerousModePermissionPrompt"] is True
+    assert "PreToolUse" in settings["hooks"]
+
+
+def test_default_settings_keep_bypass_warning():
+    settings = claude_worker.hook_settings("python")
+    assert "skipDangerousModePermissionPrompt" not in settings
 
 
 def test_trust_covers_git_worktree_main_repository(
@@ -257,8 +286,14 @@ def test_trust_covers_git_worktree_main_repository(
     )
     trust_claude_workspaces([str(worktree)])
     projects = _claude_config(isolated_claude_config)["projects"]
-    for path in (worktree, main):
-        assert projects[str(path.resolve())]["hasTrustDialogAccepted"] is True
+    # Trusting the main repository covers all of its worktrees, so new
+    # worktrees add no config entries.
+    assert projects[str(main.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(worktree.resolve()) not in projects
+    before = (isolated_claude_config / ".claude.json").stat().st_mtime_ns
+    trust_claude_workspaces([str(worktree)])
+    after = (isolated_claude_config / ".claude.json").stat().st_mtime_ns
+    assert before == after
 
 
 def test_unreadable_claude_config_blocks_launch(
