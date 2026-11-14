@@ -28,6 +28,7 @@ STATIC = {
     ),
     "/fonts/ibm-plex-mono.ttf": ("fonts/ibm-plex-mono.ttf", "font/ttf"),
 }
+PAGES = {"/", "/index.html"}
 DETAIL = re.compile(
     r"^/api/factories/([a-f0-9]{20})/work/([A-Za-z0-9_-]{1,100})(/terminal)?$"
 )
@@ -59,36 +60,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Do not log URLs or browser-supplied request strings.
         pass
 
-    def _trusted(self):
+    def _refusal(self):
+        """Why this request is refused, or None when it is trusted.
+
+        Reasons name the failed check and the header values involved (never
+        the URL), so a refused browser can be diagnosed.
+        """
         port = self.server.server_address[1]
         hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         if port == 80:
             hosts.update({"127.0.0.1", "localhost"})
         values = self.headers.get_all("Host", [])
         if len(values) != 1:
-            return False
+            return "exactly one Host header is required"
+        host = values[0]
         scheme = "http://"
+        origin_host = host
         tailnet = self.server.tailnet
-        if values[0] not in hosts:
+        if host not in hosts:
             # Tailnet requests arrive through tailscale serve, which names
             # the requesting tailnet user. Only allowed logins get through.
-            if tailnet is None or values[0] not in tailnet.hosts:
-                return False
+            if tailnet is None:
+                return f"host {host!r} is not loopback"
+            if host not in tailnet.hosts:
+                expected = ", ".join(sorted(tailnet.hosts))
+                return f"host {host!r} is not this tailnet name ({expected})"
             logins = self.headers.get_all("Tailscale-User-Login", [])
-            if len(logins) != 1 or logins[0] not in tailnet.logins:
-                return False
+            if len(logins) != 1:
+                return (
+                    "no single Tailscale-User-Login (tagged or shared devices "
+                    "carry no user identity)"
+                )
+            if logins[0] not in tailnet.logins:
+                return (
+                    f"tailnet login {logins[0]!r} is not allowed; restart "
+                    f"with --tailscale-allow {logins[0]}"
+                )
             scheme = "https://"
-            origin_host = values[0]
             if tailnet.https_port == 443:
                 origin_host = tailnet.dns_name
-        else:
-            origin_host = values[0]
         origins = self.headers.get_all("Origin", [])
         if origins and (
             len(origins) != 1 or origins[0] != scheme + origin_host
         ):
-            return False
-        return self.headers.get("Sec-Fetch-Site") != "cross-site"
+            return f"origin {origins!r} does not match {scheme + origin_host}"
+        if (
+            self.headers.get("Sec-Fetch-Site") == "cross-site"
+            and not self._page_navigation()
+        ):
+            return "cross-site request"
+        return None
+
+    def _page_navigation(self):
+        """A top-level visit to the dashboard page itself, e.g. from a link
+        in another app. Its data requests are then same-origin; cross-site
+        fetches, embeds and links to API or terminal routes stay refused."""
+        return (
+            self.headers.get("Sec-Fetch-Mode") == "navigate"
+            and self.headers.get("Sec-Fetch-Dest") == "document"
+            and self.path in PAGES
+        )
 
     def _send(
         self, status, content, content_type="application/json; charset=utf-8"
@@ -128,12 +159,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send(status, encoded)
 
     def do_GET(self):
-        if not self._trusted():
+        refusal = self._refusal()
+        if refusal:
+            print(f"dashboard: refused request: {refusal}", file=sys.stderr)
             return self._json(
                 403,
                 {
                     "error": "Loopback or allowed tailnet same-origin "
-                    "requests are required."
+                    f"requests are required: {refusal}."
                 },
             )
         try:
