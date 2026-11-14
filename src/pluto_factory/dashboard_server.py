@@ -1,4 +1,7 @@
-"""Read-only loopback HTTP boundary for the local factory dashboard."""
+"""Read-only loopback HTTP boundary for the local factory dashboard.
+
+The server only binds 127.0.0.1. Optional tailnet access goes through a
+foreground ``tailscale serve`` proxy (see ``tailnet``)."""
 
 import json
 import re
@@ -10,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .dashboard_data import DashboardData
+from .tailnet import TailnetAccess, TailnetProxy, discover
 from .visibility import VisibilityError
 
 STATIC = {
@@ -34,10 +38,16 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
 
-    def __init__(self, data: DashboardData, port=8765):
+    def __init__(
+        self,
+        data: DashboardData,
+        port=8765,
+        tailnet: TailnetAccess | None = None,
+    ):
         if not isinstance(port, int) or not 0 <= port <= 65535:
             raise ValueError("dashboard port must be between 0 and 65535")
         self.data = data
+        self.tailnet = tailnet
         super().__init__(("127.0.0.1", port), DashboardHandler)
 
 
@@ -55,11 +65,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if port == 80:
             hosts.update({"127.0.0.1", "localhost"})
         values = self.headers.get_all("Host", [])
-        if len(values) != 1 or values[0] not in hosts:
+        if len(values) != 1:
             return False
+        scheme = "http://"
+        tailnet = self.server.tailnet
+        if values[0] not in hosts:
+            # Tailnet requests arrive through tailscale serve, which names
+            # the requesting tailnet user. Only allowed logins get through.
+            if tailnet is None or values[0] not in tailnet.hosts:
+                return False
+            logins = self.headers.get_all("Tailscale-User-Login", [])
+            if len(logins) != 1 or logins[0] not in tailnet.logins:
+                return False
+            scheme = "https://"
+            origin_host = values[0]
+            if tailnet.https_port == 443:
+                origin_host = tailnet.dns_name
+        else:
+            origin_host = values[0]
         origins = self.headers.get_all("Origin", [])
         if origins and (
-            len(origins) != 1 or origins[0] != "http://" + values[0]
+            len(origins) != 1 or origins[0] != scheme + origin_host
         ):
             return False
         return self.headers.get("Sec-Fetch-Site") != "cross-site"
@@ -104,7 +130,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._trusted():
             return self._json(
-                403, {"error": "Loopback same-origin requests are required."}
+                403,
+                {
+                    "error": "Loopback or allowed tailnet same-origin "
+                    "requests are required."
+                },
             )
         try:
             parsed = urlsplit(self.path)
@@ -161,19 +191,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
     do_OPTIONS = _unsupported
 
 
-def serve(root: Path, *, extra_home: Path | None = None, port=8765):
+def serve(
+    root: Path,
+    *,
+    extra_home: Path | None = None,
+    port=8765,
+    tailscale: bool = False,
+    tailscale_port: int = 443,
+    tailscale_allow: list[str] | None = None,
+):
     if not 1 <= port <= 65535:
         raise ValueError("--port must be between 1 and 65535")
-    with DashboardServer(DashboardData(root, extra_home), port) as server:
-        print(
-            f"Factory dashboard: http://127.0.0.1:{server.server_address[1]}",
-            file=sys.stderr,
-            flush=True,
-        )
-        print(
-            "Read-only. Press Ctrl-C to stop the dashboard.",
-            file=sys.stderr,
-            flush=True,
-        )
-        server.serve_forever(poll_interval=0.25)
+    access = (
+        discover(tailscale_port, tailscale_allow or []) if tailscale else None
+    )
+    data = DashboardData(root, extra_home)
+    with DashboardServer(data, port, tailnet=access) as server:
+        proxy = None
+        if access:
+            proxy = TailnetProxy(access, server.server_address[1])
+            proxy.start()
+        try:
+            print(
+                f"Factory dashboard: http://127.0.0.1:{server.server_address[1]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if access:
+                print(
+                    f"Tailnet: {access.url} (allowed: "
+                    f"{', '.join(sorted(access.logins))})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print(
+                "Read-only. Press Ctrl-C to stop the dashboard.",
+                file=sys.stderr,
+                flush=True,
+            )
+            server.serve_forever(poll_interval=0.25)
+        finally:
+            if proxy:
+                proxy.stop()
     return {"stopped": True}

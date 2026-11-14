@@ -329,7 +329,13 @@ def test_ui_cli_wiring_inherits_global_and_local_home(monkeypatch, tmp_path):
     )
     assert calls[-1] == (
         tmp_path,
-        {"extra_home": tmp_path / "one", "port": 8900},
+        {
+            "extra_home": tmp_path / "one",
+            "port": 8900,
+            "tailscale": False,
+            "tailscale_port": 443,
+            "tailscale_allow": [],
+        },
     )
     assert (
         main(["--home", str(tmp_path / "two"), "ui", "--root", str(tmp_path)])
