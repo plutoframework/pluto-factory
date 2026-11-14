@@ -7,7 +7,11 @@ name = "pluto-factory"
 version = "0.1.0"
 description = "Local, durable prototype of the Pluto software factory"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.12,<3", "pydantic-ai-slim[openai]>=2.65,<3"]
+dependencies = [
+    "claude-agent-sdk>=0.2.182,<0.3",
+    "pydantic>=2.12,<3",
+    "pydantic-ai-slim[openai]>=2.65,<3",
+]
 
 [project.scripts]
 pluto-factory = "pluto_factory.cli:main"

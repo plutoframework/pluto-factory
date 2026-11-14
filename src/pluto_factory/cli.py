@@ -21,6 +21,7 @@ from .credentials import (
 )
 from .defaults import SecretDefaults, merge, read_defaults
 from .models import (
+    CLAUDE_COORDINATOR_MODEL,
     CLAUDE_PROFILES,
     FactoryConfig,
     ImprovementPolicy,
@@ -126,6 +127,12 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--model", default="gpt-6.1-sol")
     setup.add_argument("--provider")
     setup.add_argument("--reasoning", default="high")
+    setup.add_argument(
+        "--coordinator-runtime",
+        choices=["pydantic_ai", "claude_agent_sdk"],
+        default="pydantic_ai",
+        help="Coordinator LLM runtime; claude_agent_sdk uses your Claude login",
+    )
     setup.add_argument("--coordinator-model")
     setup.add_argument("--review-model", default="gpt-6.1-sol")
     setup.add_argument("--qa-model", default="gpt-6.1-terra")
@@ -298,6 +305,7 @@ def _apply_master(args: argparse.Namespace) -> dict:
         "api_key_env": "api_key_env",
         "herdr_space": "herdr_space",
         "slack_webhook_env": "slack_webhook_env",
+        "coordinator_runtime": "coordinator_runtime",
         "coordinator_model": "coordinator_model",
         "max_recoveries": "max_recoveries",
         "max_revisions": "max_revisions",
@@ -357,6 +365,46 @@ def _ask(label: str, default: str) -> str:
     return input(f"{label} ({default}): ").strip() or default
 
 
+def _choose(label: str, choices: list[str], default: str) -> str:
+    """Ask until the answer is one of ``choices``; blank keeps the default."""
+    while True:
+        answer = _ask(f"{label} [{'/'.join(choices)}]", default)
+        if answer in choices:
+            return answer
+        print(f"Choose one of: {', '.join(choices)}", file=sys.stderr)
+
+
+AI_ACCOUNTS = {"claude": "claude", "openai": "pi", "fixture": "fixture"}
+
+
+def _ask_ai_account(args: argparse.Namespace) -> None:
+    """Pick one AI account and align harness, coordinator and auth with it."""
+    current = {value: key for key, value in AI_ACCOUNTS.items()}
+    account = _choose(
+        "AI account that runs this factory (claude = Claude subscription or "
+        "Anthropic key; openai = ChatGPT/Codex subscription or OpenAI key)",
+        list(AI_ACCOUNTS),
+        current.get(args.harness, "openai"),
+    )
+    args.harness = AI_ACCOUNTS[account]
+    builtin = FactoryConfig.model_fields
+    if account == "openai":
+        if args.coordinator_runtime == "claude_agent_sdk":
+            args.coordinator_runtime = "pydantic_ai"
+        if args.coordinator_model == CLAUDE_COORDINATOR_MODEL:
+            args.coordinator_model = builtin["coordinator_model"].default
+        for argument, role, field in (
+            ("provider", "worker", "provider"),
+            ("model", "worker", "model"),
+            ("review_model", "reviewer", "model"),
+            ("qa_model", "qa_model", "model"),
+        ):
+            if getattr(args, argument) == CLAUDE_PROFILES[role][field]:
+                pi = builtin[role].default_factory()
+                setattr(args, argument, getattr(pi, field))
+    _harness_model_defaults(args)
+
+
 def _wizard(args: argparse.Namespace) -> bool:
     if args.interactive and args.no_input:
         raise ValueError("--interactive and --no-input cannot be combined")
@@ -394,9 +442,11 @@ def _wizard(args: argparse.Namespace) -> bool:
         ]
     if not args.qa:
         args.qa = [input("QA argv JSON: ")]
-    args.harness = _ask("Worker harness [pi/claude/fixture]", args.harness)
-    _harness_model_defaults(args)
-    args.integration = _ask("Integration [managed/github]", args.integration)
+    _ask_ai_account(args)
+    claude = args.harness == "claude"
+    args.integration = _choose(
+        "Integration", ["managed", "github"], args.integration
+    )
     if args.integration == "github":
         registered = mappings(args.github_repo)
         for value in args.repo:
@@ -430,7 +480,9 @@ def _wizard(args: argparse.Namespace) -> bool:
             ).lower()
             == "yes"
         )
-    args.isolation = _ask("Isolation [required/cooperative]", args.isolation)
+    args.isolation = _choose(
+        "Isolation", ["required", "cooperative"], args.isolation
+    )
     args.trust_repositories = (
         _ask(
             "Trust registered repository guidance for unattended runs [yes/no]",
@@ -438,17 +490,40 @@ def _wizard(args: argparse.Namespace) -> bool:
         ).lower()
         == "yes"
     )
-    args.auth = _ask("Authentication [existing/codex/api_key]", args.auth)
-    suggested = "openai" if args.auth == "api_key" else args.provider
-    args.provider = _ask("Worker provider", suggested)
+    if claude:
+        if args.auth == "codex":
+            args.auth = "existing"
+        args.auth = _choose(
+            "Claude authentication (existing = `claude auth login`)",
+            ["existing", "api_key"],
+            args.auth,
+        )
+        _harness_model_defaults(args)
+    else:
+        args.auth = _choose(
+            "Authentication", ["existing", "codex", "api_key"], args.auth
+        )
+        suggested = "openai" if args.auth == "api_key" else args.provider
+        args.provider = _ask("Worker provider", suggested)
     args.model = _ask("Implementation model", args.model)
     args.reasoning = _ask("Worker reasoning", args.reasoning)
     args.review_model = _ask("Review model", args.review_model)
     args.qa_model = _ask("QA model", args.qa_model)
-    args.coordinator = _ask("Coordinator [model/rules]", args.coordinator)
-    args.coordinator_model = _ask("Coordinator model", args.coordinator_model)
-    args.secrets_provider = _ask(
-        "fnox backend [age/1password]", args.secrets_provider
+    args.coordinator = _choose(
+        "Coordinator", ["model", "rules"], args.coordinator
+    )
+    if args.coordinator == "model":
+        args.coordinator_runtime = _choose(
+            "Coordinator runtime (claude_agent_sdk uses your Claude login)",
+            ["claude_agent_sdk", "pydantic_ai"],
+            args.coordinator_runtime,
+        )
+        _harness_model_defaults(args)
+        args.coordinator_model = _ask(
+            "Coordinator model", args.coordinator_model
+        )
+    args.secrets_provider = _choose(
+        "fnox backend", ["age", "1password"], args.secrets_provider
     )
     if args.secrets_provider == "age":
         key_path = _ask(
@@ -500,15 +575,46 @@ def _harness_model_defaults(
     Only values still equal to the built-in defaults change, so explicit
     flags and customized master defaults are preserved.
     """
+    builtin = FactoryConfig.model_fields
+    explicit = getattr(args, "_explicit", set())
+    pydantic_model = builtin["coordinator_model"].default
+    if (
+        args.harness == "claude"
+        and "--coordinator-runtime" not in explicit
+        and args.coordinator_runtime == builtin["coordinator_runtime"].default
+    ):
+        args.coordinator_runtime = "claude_agent_sdk"
+    if (
+        args.coordinator_runtime == "claude_agent_sdk"
+        and "--coordinator-model" not in explicit
+        and args.coordinator_model in (None, pydantic_model)
+    ):
+        args.coordinator_model = CLAUDE_COORDINATOR_MODEL
+    if master is not None and args.harness == "claude":
+        factory = master["factory"]
+        if (
+            factory["coordinator_runtime"]
+            == builtin["coordinator_runtime"].default
+        ):
+            factory["coordinator_runtime"] = "claude_agent_sdk"
+        if (
+            factory["coordinator_runtime"] == "claude_agent_sdk"
+            and factory["coordinator_model"] == pydantic_model
+        ):
+            factory["coordinator_model"] = CLAUDE_COORDINATOR_MODEL
     if args.harness != "claude":
         return
-    builtin = FactoryConfig.model_fields
+    if (
+        args.auth == "api_key"
+        and "--api-key-env" not in explicit
+        and args.api_key_env == builtin["api_key_env"].default
+    ):
+        args.api_key_env = "ANTHROPIC_API_KEY"
     pi = {
         "worker": builtin["worker"].default_factory().model_dump(),
         "reviewer": builtin["reviewer"].default_factory().model_dump(),
         "qa_model": builtin["qa_model"].default_factory().model_dump(),
     }
-    explicit = getattr(args, "_explicit", set())
     for argument, role, field in (
         ("provider", "worker", "provider"),
         ("model", "worker", "model"),
@@ -545,6 +651,7 @@ def _setup(args: argparse.Namespace) -> dict:
             "api_key_env": "api_key_env",
             "herdr_space": "herdr_space",
             "slack_webhook_env": "slack_webhook_env",
+            "coordinator_runtime": "coordinator_runtime",
             "coordinator_model": "coordinator_model",
             "max_recoveries": "max_recoveries",
             "max_revisions": "max_revisions",
@@ -585,13 +692,19 @@ def _setup(args: argparse.Namespace) -> dict:
             _repository(value, "write", args) for value in args.repo
         ] + [_repository(value, "read", args) for value in args.read_repo]
         provider = args.provider or ("openai")
+        default_coordinator_model = (
+            CLAUDE_COORDINATOR_MODEL
+            if args.coordinator_runtime == "claude_agent_sdk"
+            else f"{provider}:gpt-6.1-terra"
+        )
         config = FactoryConfig(
             name=args.name,
             repositories=repositories,
             harness=args.harness,
             coordinator=args.coordinator,
+            coordinator_runtime=args.coordinator_runtime,
             coordinator_model=args.coordinator_model
-            or (f"{provider}:gpt-6.1-terra"),
+            or default_coordinator_model,
             auth_mode=args.auth,
             api_key_env=args.api_key_env,
             isolation=args.isolation,
@@ -819,11 +932,19 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
                     }
                 )
     if config.coordinator == "model":
+        library = (
+            "claude_agent_sdk"
+            if config.coordinator_runtime == "claude_agent_sdk"
+            else "pydantic_ai"
+        )
         checks.append(
             {
                 "name": "model-coordinator-library",
-                "passed": importlib.util.find_spec("pydantic_ai") is not None,
-                "detail": "Does not perform an inference or verify account access.",
+                "passed": importlib.util.find_spec(library) is not None,
+                "detail": (
+                    f"{library} importable. Does not perform an inference "
+                    "or verify account access."
+                ),
             }
         )
     if config.auth_mode == "api_key":

@@ -399,3 +399,106 @@ def test_setup_claude_harness_preserves_explicit_model(tmp_path, capsys):
     config = load_config(home)
     assert config.worker.model == "claude-fable-5-2"
     assert config.reviewer.model == "claude-opus-5-5"
+
+
+def test_setup_claude_harness_uses_claude_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    args[args.index("fixture")] = "claude"
+    main(args)
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.coordinator_runtime == "claude_agent_sdk"
+    assert config.coordinator_model == "claude-sonnet-5-5"
+
+
+def test_setup_claude_harness_preserves_explicit_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    args[args.index("fixture")] = "claude"
+    main(
+        [
+            *args,
+            "--coordinator-runtime",
+            "pydantic_ai",
+            "--coordinator-model",
+            "openai:gpt-6.1-terra",
+        ]
+    )
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.coordinator_runtime == "pydantic_ai"
+    assert config.coordinator_model == "openai:gpt-6.1-terra"
+
+
+def test_setup_pi_harness_can_select_claude_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    main([*args, "--coordinator-runtime", "claude_agent_sdk"])
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.harness == "fixture"
+    assert config.coordinator_runtime == "claude_agent_sdk"
+    assert config.coordinator_model == "claude-sonnet-5-5"
+
+
+def _scripted(monkeypatch, answers):
+    replies = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda _: next(replies))
+
+
+def _setup_namespace(monkeypatch, tmp_path):
+    from pluto_factory.cli import _apply_master, parser
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    args = parser().parse_args(["setup"])
+    args._explicit = set()
+    _apply_master(args)
+    return args
+
+
+def test_choose_reprompts_until_valid(monkeypatch, capsys):
+    from pluto_factory.cli import _choose
+
+    _scripted(monkeypatch, ["bogus", "", "b"])
+    assert _choose("Pick", ["a", "b"], "a") == "a"
+    assert _choose("Pick", ["a", "b"], "a") == "b"
+    assert "Choose one of" in capsys.readouterr().err
+
+
+def test_ai_account_claude_aligns_everything(monkeypatch, tmp_path):
+    from pluto_factory.cli import _ask_ai_account
+
+    args = _setup_namespace(monkeypatch, tmp_path)
+    _scripted(monkeypatch, ["claude"])
+    _ask_ai_account(args)
+    assert args.harness == "claude"
+    assert args.coordinator_runtime == "claude_agent_sdk"
+    assert args.coordinator_model == "claude-sonnet-5-5"
+    assert args.provider == "anthropic"
+    assert args.model == "claude-opus-5-5"
+
+
+def test_ai_account_openai_reverts_claude_defaults(monkeypatch, tmp_path):
+    from pluto_factory.cli import _ask_ai_account
+
+    args = _setup_namespace(monkeypatch, tmp_path)
+    _scripted(monkeypatch, ["claude", "openai"])
+    _ask_ai_account(args)
+    _ask_ai_account(args)
+    assert args.harness == "pi"
+    assert args.coordinator_runtime == "pydantic_ai"
+    assert args.coordinator_model == "openai-codex:gpt-6.1-terra"
+    assert args.provider == "openai"
+    assert args.model == "gpt-6.1-sol"
+    assert args.qa_model == "gpt-6.1-terra"
+
+
+def test_claude_api_key_defaults_to_anthropic_env(monkeypatch, tmp_path):
+    from pluto_factory.cli import _harness_model_defaults
+
+    args = _setup_namespace(monkeypatch, tmp_path)
+    args.harness = "claude"
+    args.auth = "api_key"
+    _harness_model_defaults(args)
+    assert args.api_key_env == "ANTHROPIC_API_KEY"

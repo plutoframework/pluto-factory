@@ -5,7 +5,8 @@ package runs a durable local work loop with isolated managed Git clones,
 candidate checks, separate review and QA roles, typed worker reports, bounded
 recovery, and a notification outbox. Pi is the default interactive worker adapter; Claude Code
 is also supported (`harness = "claude"`).
-The coordinator can use Pydantic AI or deterministic rules for fixture tests.
+The coordinator can use Pydantic AI, the Claude Agent SDK, or deterministic
+rules for fixture tests.
 GitHub integration can ingest ready-labeled issues and publish validated PRs;
 managed integration keeps example work entirely local.
 
@@ -160,6 +161,13 @@ backend, Herdr mapping, notifications, and improvement permissions. It shows a
 plan and requests confirmation before creating factory files. Piped input and
 CI never silently open a wizard.
 
+The first AI question picks the account that runs the factory: `claude`
+(Claude subscription via `claude auth login`, or an Anthropic key) or `openai`
+(ChatGPT/Codex subscription, or an OpenAI key). That choice sets the worker
+harness, coordinator runtime, model defaults and authentication options, so a
+single subscription covers workers and coordinator. Choice prompts re-ask on
+invalid input.
+
 At the first repository prompt, blank selects the current directory. A path
 alone gets a logical name from its directory; `NAME=PATH` names it explicitly.
 Blank at the additional-repository prompt finishes the list. Human factory
@@ -208,7 +216,29 @@ Typed reports use a per-assignment `factory_report` MCP server and hooks from
 `--permission-mode dontAsk` and a role-scoped tool allowlist;
 `--trust-repositories` also loads project and local Claude settings. Claude
 sessions cannot rebind to a revision, so each revision starts a fresh session.
-The coordinator model is configured separately (`coordinator_model`).
+The coordinator model is configured separately (`coordinator_model`). With
+`--harness claude`, setup defaults the coordinator to the Claude Agent SDK
+runtime (below) so one Claude subscription covers the whole factory.
+
+### Coordinator runtime
+
+`coordinator_runtime` in `factory.toml` selects how the model coordinator runs:
+
+- `pydantic_ai` (default for Pi): Pydantic AI with a `provider:model` string,
+  for example `openai-codex:gpt-6.1-terra`.
+- `claude_agent_sdk`: the Claude Agent SDK, using the local Claude Code login
+  (`claude auth login`, so a Claude subscription works) or `ANTHROPIC_API_KEY`.
+  `coordinator_model` is a Claude model id such as `claude-sonnet-5-5`. The
+  session has no tools and loads no filesystem settings; it only returns a
+  typed decision.
+
+```toml
+coordinator = "model"
+coordinator_runtime = "claude_agent_sdk"
+coordinator_model = "claude-sonnet-5-5"
+```
+
+Select it at setup with `--coordinator-runtime claude_agent_sdk`.
 
 Owner-permitted prompt changes can be inspected and activated explicitly:
 
@@ -244,7 +274,8 @@ not implemented yet.
 ### Authentication and fnox
 
 The coordinator and a native harness can have distinct authentication stores.
-For subscription access, use the existing coordinator and native Pi logins.
+For subscription access, use the existing coordinator and native Pi logins, or
+the Claude login for both with `--harness claude` (Claude Agent SDK coordinator).
 Setup can run `codex login` when that method is explicitly chosen; it does not
 claim the same login automatically configures Pi. The installed Pi catalog uses
 `provider = "openai"`, including its native OAuth authentication. Pydantic AI's
