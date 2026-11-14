@@ -80,7 +80,8 @@ def test_pi_launch_runs_inside_nono_with_scoped_grants(tmp_path, ready):
     assert command[0] == "env"
     folder = str(Path(item["assignment_path"]).parent)
     assert command[1] == f"TMPDIR={folder}/tmp"
-    assert command[2:4] == ["nono", "run"]
+    assert command[2] == "GIT_CONFIG_GLOBAL=/dev/null"
+    assert command[3:5] == ["nono", "run"]
     assert flags(command, "--profile") == [str(sandbox.PROFILE)]
     native = command[command.index("--") + 1 :]
     assert native[0] == str(ready)

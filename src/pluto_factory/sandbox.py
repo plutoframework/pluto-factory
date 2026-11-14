@@ -203,6 +203,9 @@ def wrap(
     command = [
         "env",
         f"TMPDIR={private_temporary(assignment)}",
+        # Git aborts on an unreadable global config, and the user's may
+        # hold credential helpers; workers get none.
+        "GIT_CONFIG_GLOBAL=/dev/null",
         "nono",
         "run",
         "--silent",
