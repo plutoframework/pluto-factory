@@ -161,6 +161,13 @@ backend, Herdr mapping, notifications, and improvement permissions. It shows a
 plan and requests confirmation before creating factory files. Piped input and
 CI never silently open a wizard.
 
+The first AI question picks the account that runs the factory: `claude`
+(Claude subscription via `claude auth login`, or an Anthropic key) or `openai`
+(ChatGPT/Codex subscription, or an OpenAI key). That choice sets the worker
+harness, coordinator runtime, model defaults and authentication options, so a
+single subscription covers workers and coordinator. Choice prompts re-ask on
+invalid input.
+
 At the first repository prompt, blank selects the current directory. A path
 alone gets a logical name from its directory; `NAME=PATH` names it explicitly.
 Blank at the additional-repository prompt finishes the list. Human factory
