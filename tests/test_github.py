@@ -747,3 +747,29 @@ def test_empty_diff_exact_owned_merged_pr_reconciles_without_republication(
     assert not any(
         call[:3] == ["gh", "pr", "create"] for call in remote.calls[before:]
     )
+
+
+def test_source_issue_closes_when_configured_slug_has_uppercase(tmp_path):
+    integration, remote = adapter(tmp_path, close_source_issues=True)
+    # The owner configured a mixed-case slug; intake lowercases sources.
+    integration.github = {
+        name: value.replace("owner/", "Owner/")
+        for name, value in integration.github.items()
+    }
+    item = work()
+    published = integration.publish(item, entries(integration))
+    item["data"]["pull_requests"] = published
+    view = (published[0]["slug"], published[0]["number"])
+    remote.views[view]["state"] = "MERGED"
+    item["payload"]["source"] = "github:owner/core"
+    assert integration.complete_sources(item)["state"] == "closed"
+    assert remote.closed_issues == [("Owner/core", 12)]
+
+
+def test_unregistered_source_issue_is_still_denied(tmp_path):
+    integration, _remote = adapter(tmp_path, close_source_issues=True)
+    item = work()
+    item["payload"]["source"] = "github:someone/else"
+    with pytest.raises(GitHubFailure) as error:
+        integration.complete_sources(item)
+    assert error.value.code == "scope.denied"
