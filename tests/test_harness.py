@@ -134,9 +134,12 @@ def test_launch_reconciles_existing_assignment_including_finished(tmp_path):
     assert "--all" in core.calls[0]
 
 
-def test_required_isolation_is_never_silently_downgraded(tmp_path):
+def test_required_isolation_is_never_silently_downgraded(tmp_path, monkeypatch):
+    from pluto_factory import sandbox
+
+    monkeypatch.setattr(sandbox, "check", lambda _policy: "nono missing")
     core = FakeCore()
-    with pytest.raises(HarnessError, match="required isolation"):
+    with pytest.raises(HarnessError, match="Required isolation.*nono missing"):
         PiHarness(config(tmp_path, isolation="required"), core).launch(
             assignment(tmp_path)
         )

@@ -149,7 +149,12 @@ def test_command_arguments_are_json_not_shell(tmp_path, capsys):
     assert capsys.readouterr().err
 
 
-def test_doctor_reports_required_isolation_unavailable(tmp_path, capsys):
+def test_doctor_reports_required_isolation_unavailable(
+    tmp_path, capsys, monkeypatch
+):
+    from pluto_factory import sandbox
+
+    monkeypatch.setattr(sandbox, "check", lambda _policy: "nono missing")
     args = setup_args(tmp_path / "factory", repository(tmp_path / "repo"))
     args[args.index("--isolation") + 1] = "required"
     assert main(args) == 0

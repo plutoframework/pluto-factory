@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from . import sandbox
 from .config import atomic_json
 from .models import FactoryConfig, WorkerReport
 from .trace import worker_event
@@ -278,6 +279,7 @@ class PiHarness:
                 Path(assignment["role_path"]).read_bytes()
             ).hexdigest(),
             "model_profile": dict(self._profile(assignment["role"])),
+            "sandboxed": self.sandboxed,
         }
 
     def find_existing(self, assignment: dict) -> dict | None:
@@ -299,13 +301,18 @@ class PiHarness:
             )
         return self._session(matches[0], assignment) if matches else None
 
+    @property
+    def sandboxed(self) -> bool:
+        return self.config.get("isolation", "required") == "required"
+
     def launch(self, assignment: dict) -> dict:
-        if self.config.get("isolation", "required") != "cooperative":
-            raise HarnessError(
-                "config.invalid",
-                "This prototype cannot enforce a host sandbox; required "
-                "isolation was not downgraded",
-            )
+        if self.sandboxed:
+            problem = sandbox.check(self.config.get("sandbox", {}))
+            if problem:
+                raise HarnessError(
+                    "config.invalid",
+                    f"Required isolation cannot be enforced: {problem}",
+                )
         existing = self.find_existing(assignment)
         if existing:
             return existing
@@ -331,6 +338,8 @@ class PiHarness:
         }
         if self.config.get("herdr_space"):
             labels["herdr.space"] = self.config["herdr_space"]
+        if self.sandboxed:
+            labels["sandbox"] = "nono"
         args = [
             "run",
             "--json",
@@ -343,7 +352,21 @@ class PiHarness:
         ]
         for key, value in labels.items():
             args.extend(["--label", f"{key}={value}"])
-        args.extend(self._worker_command(assignment, assignment_path))
+        command = self._worker_command(assignment, assignment_path)
+        if self.sandboxed:
+            # The launcher adds credentials outside, then execs nono.
+            start = command.index("pluto_factory.worker_launcher") + 2
+            try:
+                native = sandbox.wrap(
+                    assignment,
+                    self.kind,
+                    self.config.get("sandbox", {}),
+                    command[start:],
+                )
+            except sandbox.SandboxError as error:
+                raise HarnessError("config.invalid", str(error)) from error
+            command = command[:start] + native
+        args.extend(command)
         terminal = self._hc(args, mutating=True)
         try:
             return self._session(terminal, assignment)
@@ -410,6 +433,12 @@ class PiHarness:
         """
         if not session.get("owned"):
             raise HarnessError("scope.denied", "Terminal is not factory-owned")
+        if session.get("sandboxed"):
+            # The sandbox only grants the original assignment's folders.
+            raise HarnessError(
+                "config.fresh_session_required",
+                "Sandboxed sessions cannot rebind to a new assignment",
+            )
         if (
             assignment["work_id"] != session.get("work_id")
             or assignment["role"] != session.get("role")

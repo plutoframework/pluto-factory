@@ -1,0 +1,16 @@
+{
+  "extends": ["default", "go-dev", "node-dev", "python-dev", "mise-dev"],
+  "meta": {
+    "name": "pluto-factory-sealed",
+    "description": "Read-only Go/Node/Python/mise toolchains + pathname AF_UNIX mediation: no host sockets (herdr, docker, dbus, ssh-agent...) unless granted"
+  },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  },
+  "workdir": {
+    "access": "read"
+  },
+  "network": {
+    "network_profile": null
+  }
+}

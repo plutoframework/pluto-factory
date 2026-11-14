@@ -68,6 +68,21 @@ class DebugPolicy(Contract):
     redact: bool = True
 
 
+class SandboxPolicy(Contract):
+    """nono sandbox for workers when ``isolation = "required"``.
+
+    ``profile`` is a nono profile name or path; empty uses the bundled
+    sealed profile. Any profile must block host sockets (Herdr, docker,
+    dbus) or dispatch is refused. ``read``/``write`` grant extra paths
+    (toolchains, caches); ``allow_domains`` restricts network egress.
+    """
+
+    profile: str = ""
+    read: list[str] = Field(default_factory=list)
+    write: list[str] = Field(default_factory=list)
+    allow_domains: list[str] = Field(default_factory=list)
+
+
 class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
@@ -110,6 +125,7 @@ class FactoryConfig(Contract):
         default_factory=ImprovementPolicy
     )
     debug: DebugPolicy = Field(default_factory=DebugPolicy)
+    sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
 
 
 class Finding(Contract):
