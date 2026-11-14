@@ -799,3 +799,32 @@ def test_queued_work_without_an_assignment_stays_static(tmp_path):
     assert summary["agent_state"] == "queued"
     assert summary["agent_observed_at"] is None
     state.close()
+
+
+def test_deduplicated_observations_keep_working_agent_fresh(tmp_path):
+    import time
+
+    home = registered(tmp_path)
+    state = State(home)
+    work, session = observed_agent(
+        state, observation={"state": "working"}, age=40
+    )
+    data = {"run_id": session["assignment_id"], "state": "working"}
+    with state.db:
+        state.db.execute(
+            "INSERT INTO observations VALUES (?,?,?,?)",
+            (work["id"], json.dumps(data), time.time() - 40, time.time() - 40),
+        )
+    # Unchanged within the heartbeat: no new event, but the row is fresh.
+    assert state.observe(work["id"], data) is False
+    with state.writer():
+        summary = DashboardData(tmp_path).state()["factories"][0]["work"][0]
+    assert summary["agent_state"] == "working"
+    assert summary["agent_working"] is True
+    assert (
+        state.db.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='worker.observed'"
+        ).fetchone()[0]
+        == 1
+    )
+    state.close()

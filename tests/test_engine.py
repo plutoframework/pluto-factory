@@ -927,3 +927,34 @@ def test_implementer_handoff_decision_sees_committed_worktree_head(
         assert stored["candidate"] == head
     finally:
         engine.state.close()
+
+
+def test_repeated_working_observations_append_one_event(tmp_path):
+    home, prepared = prepare_demo(tmp_path / "observe-dedup")
+    harness = ObservedHarness("working")
+    engine = Engine(home, harness=harness)
+    work_id = prepared["submitted"]["id"]
+    engine.state.update_work(work_id, phase="implementing")
+    run = engine.state.create_run(
+        work_id,
+        "implementer",
+        {"id": "run-observed", "report_path": str(home / "absent.json")},
+    )
+    engine.state.update_run(run["id"], state="running", session={"owned": True})
+    try:
+        for _ in range(5):
+            assert engine.tick()
+
+        def observed():
+            return [
+                event["data"]
+                for event in engine.state.inspect()["events"]
+                if event["kind"] == "worker.observed"
+            ]
+
+        assert observed() == [{"run_id": run["id"], "state": "working"}]
+        harness.current = "idle"
+        engine.tick()
+        assert [item["state"] for item in observed()] == ["working", "idle"]
+    finally:
+        engine.state.close()

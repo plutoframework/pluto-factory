@@ -30,6 +30,10 @@ def encode(value) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+# Seconds between worker.observed events for an unchanged observation.
+OBSERVATION_HEARTBEAT = 60.0
+
+
 class StateConflict(RuntimeError):
     """An owner changed control state while an operation was in progress."""
 
@@ -102,6 +106,10 @@ class State:
                 base_digest TEXT NOT NULL, result TEXT,
                 created REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS observations (
+                work_id TEXT PRIMARY KEY, data TEXT NOT NULL,
+                created REAL NOT NULL, recorded REAL NOT NULL
+            );
             PRAGMA user_version = 1;
         """)
         for folder in (
@@ -153,6 +161,37 @@ class State:
     def event(self, kind, subject, data, event_key=None):
         with self.db:
             self._event(kind, subject, data, event_key)
+
+    def observe(self, work_id, data, heartbeat=OBSERVATION_HEARTBEAT):
+        """Keep the latest worker observation fresh without event spam.
+
+        The observations row is refreshed on every call so liveness readers
+        stay current. A ``worker.observed`` event is appended only when the
+        payload changes or the last recorded event is ``heartbeat`` seconds
+        old. Returns True when an event was appended.
+        """
+        encoded = encode(data)
+        now = time.time()
+        with self.db:
+            row = self.db.execute(
+                "SELECT data,recorded FROM observations WHERE work_id=?",
+                (work_id,),
+            ).fetchone()
+            record = (
+                row is None
+                or row["data"] != encoded
+                or now - row["recorded"] >= heartbeat
+            )
+            if record:
+                self._event("worker.observed", work_id, data)
+            self.db.execute(
+                "INSERT INTO observations (work_id,data,created,recorded) "
+                "VALUES (?,?,?,?) ON CONFLICT(work_id) DO UPDATE SET "
+                "data=excluded.data,created=excluded.created,"
+                "recorded=excluded.recorded",
+                (work_id, encoded, now, now if record else row["recorded"]),
+            )
+        return record
 
     def _notify(self, work_id, kind, message, incident_key):
         self.db.execute(

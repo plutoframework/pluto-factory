@@ -424,14 +424,7 @@ class Engine:
             "finished",
         }:
             self.tracer.finish_run(run, work)
-        self.state.event(
-            "worker.observed",
-            work["id"],
-            {
-                "run_id": run["id"],
-                **observation,
-            },
-        )
+        self.state.observe(work["id"], {"run_id": run["id"], **observation})
         report_path = Path(assignment["report_path"])
         if report_path.exists() and run["report"] is None:
             try:
