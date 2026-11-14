@@ -92,5 +92,10 @@ def test_worker_packet_contains_exact_scoped_validation_plan(tmp_path, role):
         ]
         assert "unrelated-check" not in packet_text
         assert "unrelated-qa" not in packet_text
+        guidance = packet["execution_guidance"]
+        assert "factory commits" in guidance
+        assert "sandbox" not in guidance
+        engine.config.isolation = "required"
+        assert "nono sandbox" in engine._execution_guidance()
     finally:
         engine.state.close()

@@ -344,6 +344,7 @@ class Engine:
                 "Report unavailable prerequisites and actual command results. "
                 "The coordinator independently validates frozen candidates."
             ),
+            "execution_guidance": self._execution_guidance(),
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
@@ -358,6 +359,20 @@ class Engine:
         atomic_json(Path(assignment["assignment_path"]), run["assignment"])
         self.tracer.provenance(work, run)
         self._launch(run)
+
+    def _execution_guidance(self):
+        text = (
+            "Leave changes uncommitted in the worktree: the factory commits "
+            "and integrates them. Do not commit, push, or switch branches."
+        )
+        if self.config.isolation == "required":
+            text += (
+                " You run in a nono sandbox: only your worktrees, TMPDIR and "
+                "agent config are writable; git objects, the rest of your "
+                "home directory and host sockets are unavailable. Report a "
+                "needed but unavailable path as a prerequisite, not a failure."
+            )
+        return text
 
     def _launch(self, run):
         with self.state.dispatch_lock():
