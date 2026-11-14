@@ -391,3 +391,41 @@ def test_integration_plan_validates_mixed_candidate_prefixes(tmp_path, coupled):
         git(Path(entry["managed"]), "rev-parse", "HEAD") == entry["base"]
         for entry in entries
     )
+
+
+def _land(managed: Path, entry: dict, how: str) -> str:
+    if how == "advanced_squash":
+        (managed / "another.txt").write_text("new default\n")
+        git(managed, "add", ".")
+        git(managed, "commit", "-m", "Other work")
+    if how == "merge":
+        git(managed, "merge", "--no-ff", "-m", "Merge", entry["candidate"])
+    elif how == "unrelated":
+        (managed / "value.txt").write_text("something else\n")
+        git(managed, "add", ".")
+        git(managed, "commit", "-m", "Unrelated")
+    else:
+        git(managed, "merge", "--squash", entry["candidate"])
+        git(managed, "commit", "-m", "Squash")
+    return git(managed, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("how", ["merge", "squash", "advanced_squash"])
+def test_validate_merged_runs_on_merged_commit_containing_candidate(
+    tmp_path, how
+):
+    manager, _ = workspace(tmp_path)
+    entries = candidate(manager)
+    merged = _land(Path(entries[0]["managed"]), entries[0], how)
+    evidence = manager.validate_merged(entries, {"source": merged}, "qa")
+    assert evidence and all(row["passed"] for row in evidence)
+    assert all(row["revision"] == merged for row in evidence)
+
+
+def test_validate_merged_refuses_commit_without_candidate(tmp_path):
+    manager, _ = workspace(tmp_path)
+    entries = candidate(manager)
+    merged = _land(Path(entries[0]["managed"]), entries[0], "unrelated")
+    with pytest.raises(GitFailure) as error:
+        manager.validate_merged(entries, {"source": merged}, "checks")
+    assert error.value.code == "git.merge_provenance"

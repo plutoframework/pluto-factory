@@ -492,6 +492,58 @@ class GitWorkspace:
                     evidence.append(row)
         return evidence
 
+    def _merged_from(self, managed: Path, candidate: str, merged: str) -> bool:
+        """True for merge, rebase or squash commits that land the candidate."""
+        if self._contains(managed, candidate, merged):
+            return True
+        if self._text(managed, "rev-parse", f"{merged}^{{tree}}") == self._text(
+            managed, "rev-parse", f"{candidate}^{{tree}}"
+        ):
+            return True
+        parent = self._git(
+            managed, "rev-parse", "--verify", f"{merged}^", check=False
+        )
+        base = self._git(
+            managed, "merge-base", candidate, parent.stdout.strip(), check=False
+        )
+        if parent.returncode or base.returncode:
+            return False
+
+        def changes(start: str, end: str) -> list[str]:
+            output = self._git(managed, "diff", "--binary", start, end).stdout
+            return [
+                line
+                for line in output.splitlines()
+                if not line.startswith(("@@", "index "))
+            ]
+
+        return changes(parent.stdout.strip(), merged) == changes(
+            base.stdout.strip(), candidate
+        )
+
+    def validate_merged(
+        self, entries: list[dict], merged: dict[str, str], kind: str
+    ) -> list[dict]:
+        """Validate merged commits that provably contain each candidate."""
+        selected = {entry["name"]: entry["candidate"] for entry in entries}
+        for entry in entries:
+            name = entry["name"]
+            if name not in merged:
+                continue
+            _, managed, _ = self._entry(entry)
+            default = f"refs/heads/{entry['default_branch']}"
+            if not self._contains(
+                managed, merged[name], default
+            ) or not self._merged_from(
+                managed, entry["candidate"], merged[name]
+            ):
+                raise GitFailure(
+                    "git.merge_provenance",
+                    "Merged commit does not contain the validated candidate",
+                )
+            selected[name] = merged[name]
+        return self._validate(entries, kind, candidates=selected)
+
     def validate_integration_plan(self, entries: list[dict]) -> list[dict]:
         """Check every intermediate prefix of the actual local merge order.
 

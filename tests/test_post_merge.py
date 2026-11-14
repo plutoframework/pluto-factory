@@ -15,7 +15,11 @@ from pluto_factory.models import (
     Repository,
     Submission,
 )
-from pluto_factory.post_merge import confirm_merged, reassess_merged
+from pluto_factory.post_merge import (
+    confirm_merged,
+    reassess_merged,
+    revalidate_merged,
+)
 from pluto_factory.state import StateConflict
 
 SHA = "1" * 40
@@ -139,6 +143,7 @@ def advance(engine, work):
         engine._defer,
         reassess=lambda item: reassess_merged(engine, item),
         confirm=lambda item: confirm_merged(engine, item),
+        revalidate=lambda item: revalidate_merged(engine, item),
     )
     return engine.state.get_work(work["id"])
 
@@ -602,3 +607,75 @@ def test_deferral_with_new_reason_records_a_distinct_notice(merged):
         "Issue source is outside factory scope",
     ]
     assert len({row["incident_key"] for row in notices}) == 2
+
+
+def drift_config(engine, merged_validation):
+    remote_sha = "2" * 40
+    (engine.home / "prompts" / "orchestrator.md").write_text("Upgraded policy")
+    calls = []
+
+    def validate(entries, merged, kind):
+        calls.append((kind, merged))
+        return [
+            {
+                "kind": kind,
+                "passed": merged_validation(kind),
+                "candidate_set": {"core": merged["core"]},
+                "revision": merged["core"],
+            }
+        ]
+
+    engine.git.validate_merged = validate
+    return remote_sha, calls
+
+
+def test_config_drift_after_merge_revalidates_merged_commit_and_completes(
+    merged,
+):
+    engine, work, remote, closed = merged
+    sha, calls = drift_config(engine, lambda _: True)
+    remote.pr["merge_commit"] = sha
+    current = advance(engine, work)
+    assert [kind for kind, _ in calls] == ["checks", "qa"]
+    assert all(target == {"core": sha} for _, target in calls)
+    assert current["phase"] == "completed", current["control"]
+    assert closed == [work["id"]]
+    revision = digest(resolved_bundle(engine.home, engine.config))
+    data = current["data"]
+    assert data["acceptance_config_digest"] == revision
+    assert data["post_merge_revalidation"]["config_digest"] == revision
+    assert data["publication_acceptance"]["config_digest"] != revision
+    evidence = [
+        row["data"]
+        for row in engine.state.inspect()["evidence"]
+        if row["data"].get("merged_candidate_set")
+    ]
+    assert {row["kind"] for row in evidence} == {"checks", "qa"}
+    assert all(row["candidate_set"] == {"core": SHA} for row in evidence)
+    assert all(row["config_digest"] == revision for row in evidence)
+    kinds = [event["kind"] for event in engine.state.inspect()["events"]]
+    assert "completion.reconciliation_required" not in kinds
+    assert "validation.post_merge_revalidated" in kinds
+
+
+def test_config_drift_with_failing_merged_qa_defers_with_reason(merged):
+    engine, work, remote, closed = merged
+    sha, calls = drift_config(engine, lambda kind: kind != "qa")
+    remote.pr["merge_commit"] = sha
+    current = advance(engine, work)
+    assert current["control"] == "deferred"
+    assert not closed
+    notices = engine.state.inspect()["notifications"]
+    assert any("fails required qa" in row["message"] for row in notices)
+
+
+def test_candidate_mismatch_is_still_refused_despite_config_drift(merged):
+    engine, work, remote, closed = merged
+    sha, calls = drift_config(engine, lambda _: True)
+    remote.pr["merge_commit"] = sha
+    work["data"]["acceptance_candidate"] = {"core": "f" * 40}
+    current = advance(engine, work)
+    assert current["control"] == "deferred"
+    assert not calls and not closed
+    kinds = [event["kind"] for event in engine.state.inspect()["events"]]
+    assert "completion.reconciliation_required" in kinds

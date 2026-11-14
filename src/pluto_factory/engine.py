@@ -16,7 +16,7 @@ from .harness import HarnessError, make_harness
 from .improvements import propose
 from .models import Failure, WorkerReport
 from .notifications import flush
-from .post_merge import confirm_merged, reassess_merged
+from .post_merge import confirm_merged, reassess_merged, revalidate_merged
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
@@ -221,6 +221,7 @@ class Engine:
                 self._defer,
                 reassess=lambda item: reassess_merged(self, item),
                 confirm=lambda item: confirm_merged(self, item),
+                revalidate=lambda item: revalidate_merged(self, item),
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
