@@ -351,6 +351,26 @@ Use `--root /alternate/factories` for another registry or `--home /path/to/facto
 to additionally include a custom factory. The running coordinator and work-item
 status are shown separately, including dependency waits and blocked reasons.
 
+### Open the dashboard from your tailnet (optional)
+
+```sh
+pluto factory ui --tailscale                      # https://<machine>.<tailnet>.ts.net/
+pluto factory ui --tailscale --tailscale-port 8443
+pluto factory ui --tailscale --tailscale-allow teammate@github
+```
+
+The dashboard still binds only to loopback. `--tailscale` runs `tailscale serve`
+in the foreground as an HTTPS proxy reachable only inside your tailnet (not
+Funnel), and stopping the dashboard removes it. Only this machine's tailnet name
+is accepted, and only requests from this node's owner, plus any
+`--tailscale-allow` logins, as identified by Tailscale. Terminal captures are
+visible to those users too.
+
+Requirements: Tailscale connected, HTTPS certificates enabled for the tailnet
+(admin console, DNS > HTTPS Certificates), and permission to run
+`tailscale serve` (once: `sudo tailscale set --operator=$USER`). Setup refuses a
+port that `tailscale serve` already uses; pick another with `--tailscale-port`.
+
 ## Submit, supervise, and intervene
 
 List the factories registered on this machine:
