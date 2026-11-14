@@ -586,6 +586,49 @@ configuration. Improvement suggestions are recorded; activation must follow the
 configured area permissions and evaluation path. Changes to permissions,
 credentials, evidence, or merge authority are not worker prompt edits.
 
+## Debug trace
+
+Turn on a per-work trace to follow how a factory produced each change. It is
+meant for tracing recurring bugs or vulnerabilities back to a Pluto generator,
+library, prompt or model. It is off by default.
+
+```toml
+[debug]
+enabled = true
+level = "trace"          # "full" also copies redacted native transcripts
+max_output_bytes = 4096  # per string in tool inputs and outputs
+redact = true            # scrub configured credentials and token patterns
+```
+
+Use `pluto factory setup --debug` (or the wizard prompt) to enable it at setup.
+Each work item gets `logs/trace/<work_id>.jsonl` (owner-only), one event per
+line:
+
+- `run.provenance`: harness, role model, coordinator, config and role prompt
+  digests, tool versions (`pluto`, Pi/Claude, Go, Node) and the `pluto-*` Go
+  modules, `@plutoframework/*` packages and `pluto.toml` kind in each worktree.
+- `tool`: every worker tool call with truncated input and output, error state
+  and exit code. Shell commands that run `pluto` are flagged `generator`.
+- `phase.files`: files each phase changed, from the worktree diff. This also
+  catches edits made through shell commands or generators.
+- `assistant.message` and `run.usage`: assistant turn text (not hidden
+  reasoning) and token usage.
+- Mirrored factory events: dispatches, coordinator decisions with rationale,
+  reports, check and QA results (command, flags, outcome), failures and
+  recoveries.
+
+```sh
+pluto factory trace                 # latest traced work item
+pluto factory trace WORK --files    # timeline plus per-file attribution
+pluto factory trace WORK --json
+```
+
+`--files` attributes each changed file to a direct edit, a `pluto` generator
+command, or other shell commands in that phase. Workers write raw events to
+their assignment folder; only the factory process writes the trace, redacting
+known secrets first. Tracing failures are reported and never stop work.
+Redaction is best effort: review traces before sharing them.
+
 ## Prototype boundaries
 
 Managed integration advances the default branch in a managed clone without

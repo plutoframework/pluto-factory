@@ -59,6 +59,15 @@ class ImprovementPolicy(Contract):
     evaluations: list[list[str]] = Field(default_factory=list)
 
 
+class DebugPolicy(Contract):
+    """Opt-in trace of every worker tool call, edited file and decision."""
+
+    enabled: bool = False
+    level: Literal["trace", "full"] = "trace"
+    max_output_bytes: int = Field(default=4096, ge=256, le=1_048_576)
+    redact: bool = True
+
+
 class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
@@ -96,6 +105,7 @@ class FactoryConfig(Contract):
     self_improvement: ImprovementPolicy = Field(
         default_factory=ImprovementPolicy
     )
+    debug: DebugPolicy = Field(default_factory=DebugPolicy)
 
 
 class Finding(Contract):

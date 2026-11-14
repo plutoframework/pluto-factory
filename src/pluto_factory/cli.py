@@ -23,6 +23,7 @@ from .defaults import SecretDefaults, merge, read_defaults
 from .models import (
     CLAUDE_COORDINATOR_MODEL,
     CLAUDE_PROFILES,
+    DebugPolicy,
     FactoryConfig,
     ImprovementPolicy,
     ModelProfile,
@@ -170,6 +171,12 @@ def parser() -> argparse.ArgumentParser:
         "--flag-env", action="append", default=[], metavar="JSON"
     )
     setup.add_argument("--yes", action="store_true")
+    setup.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Trace every worker tool call, edited file and decision",
+    )
 
     submit = commands.add_parser("submit", help="Durably submit a work item")
     _common(submit)
@@ -204,6 +211,19 @@ def parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="Deliver configured outbound notifications",
             )
+
+    trace = commands.add_parser(
+        "trace", help="Show the debug trace for a work item"
+    )
+    _common(trace)
+    trace.add_argument(
+        "work", nargs="?", help="Work item ID; defaults to the latest trace"
+    )
+    trace.add_argument(
+        "--files",
+        action="store_true",
+        help="Attribute each changed file to the tool calls behind it",
+    )
 
     auth = commands.add_parser("auth", help="Run a provider's native login")
     _common(auth)
@@ -335,6 +355,8 @@ def _apply_master(args: argparse.Namespace) -> dict:
         flag = "--" + argument.replace("_", "-")
         if flag not in explicit:
             setattr(args, argument, value)
+    if "--debug" not in explicit and "--no-debug" not in explicit:
+        args.debug = values["debug"]["enabled"]
     for argument, value in defaults["secrets"].items():
         flag = (
             "--secrets-provider"
@@ -564,6 +586,13 @@ def _wizard(args: argparse.Namespace) -> bool:
     args.improvement_area = [
         part.strip() for part in areas.split(",") if part.strip()
     ]
+    args.debug = (
+        _ask(
+            "Debug trace of tool calls, edited files and decisions [yes/no]",
+            "yes" if args.debug else "no",
+        ).lower()
+        == "yes"
+    )
     return True
 
 
@@ -676,6 +705,8 @@ def _setup(args: argparse.Namespace) -> dict:
         ):
             if "--" + argument.replace("_", "-") in explicit:
                 configured[role][field] = getattr(args, argument)
+        if "--debug" in explicit or "--no-debug" in explicit:
+            configured.setdefault("debug", {})["enabled"] = args.debug
         if "--repo" in explicit or "--read-repo" in explicit:
             configured["repositories"] = [
                 _repository(value, "write", args).model_dump()
@@ -772,6 +803,9 @@ def _setup(args: argparse.Namespace) -> dict:
                         "allowed_areas": args.improvement_area,
                     },
                 )
+            ),
+            debug=DebugPolicy.model_validate(
+                merge(master["factory"]["debug"], {"enabled": args.debug})
             ),
         )
     config = resolve_repositories(config, args.github_repo)
@@ -1054,6 +1088,10 @@ def execute(args: argparse.Namespace) -> dict:
         result = subprocess.run(["codex", "login"], check=False)
         return {"provider": "codex", "authenticated": result.returncode == 0}
     home = _home(args)
+    if args.command == "trace":
+        from .trace import latest_work, render
+
+        return render(home, args.work or latest_work(home), files=args.files)
     if args.command == "doctor":
         return doctor(home, verify_auth=args.verify_auth)
     config = load_config(home)
@@ -1121,6 +1159,10 @@ def main(argv: list[str] | None = None) -> int:
             from .visibility import render_open
 
             print(render_open(result))
+        elif args.command == "trace" and not args.json:
+            from .trace import render_text
+
+            print(render_text(result))
         elif args.command == "list" and not args.json:
             from .inventory import render_inventory
 
