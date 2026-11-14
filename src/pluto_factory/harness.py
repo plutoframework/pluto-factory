@@ -632,6 +632,95 @@ class PiHarness:
         self._hc(["rm", "--json", session["address"]], mutating=True)
 
 
+def claude_config_path() -> Path:
+    """Claude Code's global config, which records workspace trust."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"
+
+
+def _git_main_root(path: str) -> str | None:
+    """Claude Code keys trust for a git worktree by its main repository."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                path,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    common = result.stdout.strip()
+    if result.returncode != 0 or not common:
+        return None
+    return str(Path(common).parent)
+
+
+def trust_claude_workspaces(paths: list[str]) -> list[str]:
+    """Pre-accept Claude Code's workspace trust dialog for these folders.
+
+    Interactive Claude Code has no flag to skip the dialog, so an unattended
+    worker would block on it. Only called when the owner registered the
+    repositories as trusted. Existing config is preserved; only
+    ``projects[path].hasTrustDialogAccepted`` is set.
+    """
+    targets: list[str] = []
+    for path in paths:
+        for candidate in (str(Path(path).resolve()), _git_main_root(path)):
+            if candidate and candidate not in targets:
+                targets.append(candidate)
+    path = claude_config_path()
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError) as error:
+        raise HarnessError(
+            "harness.trust_failed",
+            f"Cannot read Claude Code config to pre-trust workspaces: {error}",
+        ) from error
+    if not isinstance(data, dict):
+        raise HarnessError(
+            "harness.trust_failed", "Claude Code config is not a JSON object"
+        )
+    projects = data.setdefault("projects", {})
+    pending = [
+        target
+        for target in targets
+        if not (projects.get(target) or {}).get("hasTrustDialogAccepted")
+    ]
+    if not pending:
+        return targets
+    for target in pending:
+        entry = projects.get(target)
+        projects[target] = {
+            **(entry if isinstance(entry, dict) else {}),
+            "hasTrustDialogAccepted": True,
+        }
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.trust.tmp")
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise HarnessError(
+            "harness.trust_failed",
+            f"Cannot write Claude Code workspace trust: {error}",
+        ) from error
+    return targets
+
+
 class ClaudeHarness(PiHarness):
     """Run Claude Code workers in Core terminals.
 
@@ -699,6 +788,12 @@ class ClaudeHarness(PiHarness):
         sources = "user"
         if self.config.get("trust_registered_repositories"):
             sources = "user,project,local"
+            trust_claude_workspaces(
+                [
+                    assignment["directory"],
+                    *(root["path"] for root in assignment.get("roots", [])),
+                ]
+            )
         effort = (
             ["--effort", profile["reasoning"]]
             if profile["reasoning"] in self.EFFORTS
