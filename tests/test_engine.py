@@ -1,3 +1,5 @@
+import json
+
 """Full fixture work exercises real durable state, checks and Git integration."""
 
 import subprocess
@@ -691,3 +693,66 @@ def test_explicit_acceptance_veto_wins_over_all_passed_assessments(
         assert "acceptance_decision" not in current["data"]
     finally:
         engine.state.close()
+
+
+def _claude_coordinator(tmp_path, monkeypatch, result):
+    import claude_agent_sdk
+
+    home, _ = prepare_demo(tmp_path / "claude-coordinator")
+    engine = Engine(home)
+    engine.state.close()
+    engine.config.coordinator = "model"
+    engine.config.coordinator_runtime = "claude_agent_sdk"
+    engine.config.coordinator_model = "claude-sonnet-5-5"
+    seen = {}
+
+    async def query(prompt, options):
+        seen.update(prompt=prompt, options=options)
+        yield result
+
+    monkeypatch.setattr(claude_agent_sdk, "query", query)
+    return Coordinator(home, engine.config), seen
+
+
+def _result(**overrides):
+    from claude_agent_sdk import ResultMessage
+
+    values = {
+        "subtype": "success",
+        "duration_ms": 1,
+        "duration_api_ms": 1,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s",
+    }
+    return ResultMessage(**{**values, **overrides})
+
+
+def test_claude_agent_sdk_coordinator_decides(tmp_path, monkeypatch):
+    coordinator, seen = _claude_coordinator(
+        tmp_path,
+        monkeypatch,
+        _result(structured_output={"action": "advance", "rationale": "ok"}),
+    )
+    decision = coordinator.decide({"x": 1}, {"advance", "retry"}, "Role")
+    assert decision.action == "advance"
+    options = seen["options"]
+    assert options.model == "claude-sonnet-5-5"
+    assert options.system_prompt == "Role"
+    assert options.tools == [] and options.setting_sources == []
+    assert options.output_format["type"] == "json_schema"
+    assert json.loads(seen["prompt"])["allowed_actions"] == [
+        "advance",
+        "retry",
+    ]
+
+
+def test_claude_agent_sdk_coordinator_normalizes_failure(tmp_path, monkeypatch):
+    coordinator, _ = _claude_coordinator(
+        tmp_path,
+        monkeypatch,
+        _result(is_error=True, api_error_status=429),
+    )
+    with pytest.raises(CoordinatorError) as error:
+        coordinator.decide({}, {"advance"}, "Role")
+    assert error.value.failure.code == "provider.rate_limited"

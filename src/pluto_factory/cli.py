@@ -21,6 +21,7 @@ from .credentials import (
 )
 from .defaults import SecretDefaults, merge, read_defaults
 from .models import (
+    CLAUDE_COORDINATOR_MODEL,
     CLAUDE_PROFILES,
     FactoryConfig,
     ImprovementPolicy,
@@ -126,6 +127,12 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--model", default="gpt-6.1-sol")
     setup.add_argument("--provider")
     setup.add_argument("--reasoning", default="high")
+    setup.add_argument(
+        "--coordinator-runtime",
+        choices=["pydantic_ai", "claude_agent_sdk"],
+        default="pydantic_ai",
+        help="Coordinator LLM runtime; claude_agent_sdk uses your Claude login",
+    )
     setup.add_argument("--coordinator-model")
     setup.add_argument("--review-model", default="gpt-6.1-sol")
     setup.add_argument("--qa-model", default="gpt-6.1-terra")
@@ -298,6 +305,7 @@ def _apply_master(args: argparse.Namespace) -> dict:
         "api_key_env": "api_key_env",
         "herdr_space": "herdr_space",
         "slack_webhook_env": "slack_webhook_env",
+        "coordinator_runtime": "coordinator_runtime",
         "coordinator_model": "coordinator_model",
         "max_recoveries": "max_recoveries",
         "max_revisions": "max_revisions",
@@ -446,6 +454,11 @@ def _wizard(args: argparse.Namespace) -> bool:
     args.review_model = _ask("Review model", args.review_model)
     args.qa_model = _ask("QA model", args.qa_model)
     args.coordinator = _ask("Coordinator [model/rules]", args.coordinator)
+    args.coordinator_runtime = _ask(
+        "Coordinator runtime [pydantic_ai/claude_agent_sdk]",
+        args.coordinator_runtime,
+    )
+    _harness_model_defaults(args)
     args.coordinator_model = _ask("Coordinator model", args.coordinator_model)
     args.secrets_provider = _ask(
         "fnox backend [age/1password]", args.secrets_provider
@@ -500,15 +513,40 @@ def _harness_model_defaults(
     Only values still equal to the built-in defaults change, so explicit
     flags and customized master defaults are preserved.
     """
+    builtin = FactoryConfig.model_fields
+    explicit = getattr(args, "_explicit", set())
+    pydantic_model = builtin["coordinator_model"].default
+    if (
+        args.harness == "claude"
+        and "--coordinator-runtime" not in explicit
+        and args.coordinator_runtime == builtin["coordinator_runtime"].default
+    ):
+        args.coordinator_runtime = "claude_agent_sdk"
+    if (
+        args.coordinator_runtime == "claude_agent_sdk"
+        and "--coordinator-model" not in explicit
+        and args.coordinator_model in (None, pydantic_model)
+    ):
+        args.coordinator_model = CLAUDE_COORDINATOR_MODEL
+    if master is not None and args.harness == "claude":
+        factory = master["factory"]
+        if (
+            factory["coordinator_runtime"]
+            == builtin["coordinator_runtime"].default
+        ):
+            factory["coordinator_runtime"] = "claude_agent_sdk"
+        if (
+            factory["coordinator_runtime"] == "claude_agent_sdk"
+            and factory["coordinator_model"] == pydantic_model
+        ):
+            factory["coordinator_model"] = CLAUDE_COORDINATOR_MODEL
     if args.harness != "claude":
         return
-    builtin = FactoryConfig.model_fields
     pi = {
         "worker": builtin["worker"].default_factory().model_dump(),
         "reviewer": builtin["reviewer"].default_factory().model_dump(),
         "qa_model": builtin["qa_model"].default_factory().model_dump(),
     }
-    explicit = getattr(args, "_explicit", set())
     for argument, role, field in (
         ("provider", "worker", "provider"),
         ("model", "worker", "model"),
@@ -545,6 +583,7 @@ def _setup(args: argparse.Namespace) -> dict:
             "api_key_env": "api_key_env",
             "herdr_space": "herdr_space",
             "slack_webhook_env": "slack_webhook_env",
+            "coordinator_runtime": "coordinator_runtime",
             "coordinator_model": "coordinator_model",
             "max_recoveries": "max_recoveries",
             "max_revisions": "max_revisions",
@@ -585,13 +624,19 @@ def _setup(args: argparse.Namespace) -> dict:
             _repository(value, "write", args) for value in args.repo
         ] + [_repository(value, "read", args) for value in args.read_repo]
         provider = args.provider or ("openai")
+        default_coordinator_model = (
+            CLAUDE_COORDINATOR_MODEL
+            if args.coordinator_runtime == "claude_agent_sdk"
+            else f"{provider}:gpt-6.1-terra"
+        )
         config = FactoryConfig(
             name=args.name,
             repositories=repositories,
             harness=args.harness,
             coordinator=args.coordinator,
+            coordinator_runtime=args.coordinator_runtime,
             coordinator_model=args.coordinator_model
-            or (f"{provider}:gpt-6.1-terra"),
+            or default_coordinator_model,
             auth_mode=args.auth,
             api_key_env=args.api_key_env,
             isolation=args.isolation,
@@ -819,11 +864,19 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
                     }
                 )
     if config.coordinator == "model":
+        library = (
+            "claude_agent_sdk"
+            if config.coordinator_runtime == "claude_agent_sdk"
+            else "pydantic_ai"
+        )
         checks.append(
             {
                 "name": "model-coordinator-library",
-                "passed": importlib.util.find_spec("pydantic_ai") is not None,
-                "detail": "Does not perform an inference or verify account access.",
+                "passed": importlib.util.find_spec(library) is not None,
+                "detail": (
+                    f"{library} importable. Does not perform an inference "
+                    "or verify account access."
+                ),
             }
         )
     if config.auth_mode == "api_key":

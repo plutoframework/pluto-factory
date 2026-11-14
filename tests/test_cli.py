@@ -399,3 +399,44 @@ def test_setup_claude_harness_preserves_explicit_model(tmp_path, capsys):
     config = load_config(home)
     assert config.worker.model == "claude-fable-5-2"
     assert config.reviewer.model == "claude-opus-5-5"
+
+
+def test_setup_claude_harness_uses_claude_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    args[args.index("fixture")] = "claude"
+    main(args)
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.coordinator_runtime == "claude_agent_sdk"
+    assert config.coordinator_model == "claude-sonnet-5-5"
+
+
+def test_setup_claude_harness_preserves_explicit_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    args[args.index("fixture")] = "claude"
+    main(
+        [
+            *args,
+            "--coordinator-runtime",
+            "pydantic_ai",
+            "--coordinator-model",
+            "openai:gpt-6.1-terra",
+        ]
+    )
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.coordinator_runtime == "pydantic_ai"
+    assert config.coordinator_model == "openai:gpt-6.1-terra"
+
+
+def test_setup_pi_harness_can_select_claude_coordinator(tmp_path, capsys):
+    home = tmp_path / "factory"
+    args = setup_args(home, repository(tmp_path / "repo"))
+    main([*args, "--coordinator-runtime", "claude_agent_sdk"])
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.harness == "fixture"
+    assert config.coordinator_runtime == "claude_agent_sdk"
+    assert config.coordinator_model == "claude-sonnet-5-5"

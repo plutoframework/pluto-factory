@@ -48,6 +48,9 @@ CLAUDE_PROFILES = {
 }
 
 
+CLAUDE_COORDINATOR_MODEL = "claude-sonnet-5-5"
+
+
 class ImprovementPolicy(Contract):
     mode: Literal["disabled", "propose", "automatic"] = "propose"
     allowed_areas: list[str] = Field(
@@ -62,6 +65,9 @@ class FactoryConfig(Contract):
     repositories: list[Repository] = Field(min_length=1)
     harness: Literal["pi", "claude", "fixture"] = "pi"
     coordinator: Literal["model", "rules"] = "model"
+    coordinator_runtime: Literal["pydantic_ai", "claude_agent_sdk"] = (
+        "pydantic_ai"
+    )
     coordinator_model: str = "openai-codex:gpt-6.1-terra"
     auth_mode: Literal["existing", "codex", "api_key"] = "existing"
     api_key_env: str = "OPENAI_API_KEY"
