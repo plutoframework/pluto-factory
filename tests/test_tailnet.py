@@ -27,6 +27,20 @@ def server(tmp_path, access):
             thread.join(2)
 
 
+def response(live, headers):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", live.server_address[1], timeout=3
+    )
+    connection.putrequest("GET", "/api/state", skip_host=True)
+    for key, value in headers:
+        connection.putheader(key, value)
+    connection.endheaders()
+    reply = connection.getresponse()
+    body = json.loads(reply.read())
+    connection.close()
+    return reply.status, body
+
+
 def status(live, headers):
     connection = http.client.HTTPConnection(
         "127.0.0.1", live.server_address[1], timeout=3
@@ -115,3 +129,19 @@ def test_discover_refuses_used_port_and_missing_https(monkeypatch):
     fake_tailscale(monkeypatch, {**STATUS, "BackendState": "Stopped"})
     with pytest.raises(TailnetError, match="not connected"):
         discover(443, [])
+
+
+def test_refusals_name_the_failed_check(tmp_path, capsys):
+    access = TailnetAccess(NAME, 443, frozenset({OWNER}))
+    with server(tmp_path, access) as live:
+        code, body = response(
+            live, [("Host", NAME), ("Tailscale-User-Login", "x@github")]
+        )
+        assert code == 403
+        assert "'x@github' is not allowed" in body["error"]
+        assert "--tailscale-allow x@github" in body["error"]
+        _, body = response(live, [("Host", "100.1.2.3")])
+        assert "not this tailnet name" in body["error"]
+        _, body = response(live, [("Host", NAME)])
+        assert "Tailscale-User-Login" in body["error"]
+    assert "refused request" in capsys.readouterr().err
