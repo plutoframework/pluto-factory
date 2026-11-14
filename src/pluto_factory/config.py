@@ -118,10 +118,17 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "reviewer",
             "qa_model",
             "self_improvement",
+            "debug",
         }
     )
     lines = [f"{key} = {json.dumps(value)}" for key, value in scalar.items()]
-    for table in ("worker", "reviewer", "qa_model", "self_improvement"):
+    for table in (
+        "worker",
+        "reviewer",
+        "qa_model",
+        "self_improvement",
+        "debug",
+    ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():
             lines.append(f"{key} = {json.dumps(value)}")

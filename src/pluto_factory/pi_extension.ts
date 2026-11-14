@@ -36,6 +36,29 @@ function canonical(value: any): string {
   return JSON.stringify(sorted(value));
 }
 
+/** Bound every string so one tool output cannot flood the raw trace. */
+function bounded(value: any, limit: number): any {
+  if (typeof value === "string") {
+    return value.length > limit
+      ? `${value.slice(0, limit)}…[${value.length - limit} chars truncated]`
+      : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => bounded(item, limit));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, bounded(item, limit)]),
+    );
+  }
+  return value;
+}
+
+function textOf(content: any): string {
+  return Array.isArray(content)
+    ? content.filter((part: any) => part?.type === "text")
+      .map((part: any) => part.text).join("\n")
+    : "";
+}
+
 export default function (pi: ExtensionAPI): void {
   const source = process.env.PLUTO_FACTORY_ASSIGNMENT;
   if (!source) {
@@ -64,6 +87,22 @@ export default function (pi: ExtensionAPI): void {
     assignment_id: assignment.id,
     generation: assignment.generation,
   });
+  // Opt-in debug trace: raw events the factory ingests and redacts.
+  const trace = (kind: string, data: object = {}) => {
+    const settings = assignment.trace;
+    if (!settings) return;
+    try {
+      const record = bounded(
+        { ts: Date.now() / 1000, kind, ...data },
+        settings.max_output_bytes,
+      );
+      fs.appendFileSync(settings.path, JSON.stringify(record) + "\n", {
+        mode: 0o600,
+      });
+    } catch {
+      // Tracing never interferes with the assignment.
+    }
+  };
   const status = (state: string, extra: object = {}) => {
     atomicWrite(assignment.status_path, {
       ...identity(), state, has_report: reported, ...extra,
@@ -143,6 +182,10 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("tool_call", async (event) => {
     if (reported && event.toolName !== "factory_report") {
+      trace("tool.blocked", {
+        tool: event.toolName,
+        reason: "report already recorded",
+      });
       return {
         block: true,
         reason: "Assignment report is recorded; await coordinator input",
@@ -151,6 +194,27 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("tool_result", async (event: any) => {
+    trace("tool", {
+      tool: event.toolName,
+      tool_call_id: event.toolCallId,
+      parent_tool_call_id: event.parentToolCallId,
+      input: event.input,
+      output: textOf(event.content),
+      is_error: event.isError,
+      exit_code: event.details?.exitCode,
+    });
+  });
+  pi.on("message_end", async (event: any) => {
+    const message = event.message;
+    if (message?.role !== "assistant") return;
+    trace("assistant.message", {
+      text: textOf(message.content),
+      model: message.model,
+      usage: message.usage,
+      stop_reason: message.stopReason,
+    });
+  });
   pi.on("session_start", async (_event, ctx) => {
     nativeSession = ctx.sessionManager.getSessionFile();
     atomicWrite(assignment.started_path, {
@@ -182,6 +246,7 @@ export default function (pi: ExtensionAPI): void {
     }
   });
   pi.on("agent_settled", async (event) => {
+    trace("session.settled", { aborted: event.aborted });
     status("settled", { aborted: event.aborted });
   });
   pi.on("session_shutdown", async () => status("closed"));

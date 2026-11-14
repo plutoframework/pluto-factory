@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from .config import atomic_json
 from .models import WorkerReport
+from .trace import worker_event
 
 SERVER = "factory"
 TOOL = "factory_report"
@@ -165,6 +166,9 @@ def serve(stdin=sys.stdin, stdout=sys.stdout) -> None:
 
 def handle_hook(assignment: dict, event: str, payload: dict) -> dict | None:
     """Apply one Claude Code hook event; the result is printed as JSON."""
+    _trace_hook(assignment, event, payload)
+    if event in {"PostToolUse", "PostToolUseFailure"}:
+        return None
     if event == "SessionStart":
         if (
             payload.get("source", "startup") == "startup"
@@ -216,7 +220,49 @@ def handle_hook(assignment: dict, event: str, payload: dict) -> dict | None:
     return None
 
 
-def hook_settings(python: str) -> dict:
+SESSION_EVENTS = {
+    "SessionStart": "session.start",
+    "UserPromptSubmit": "session.prompt",
+    "Stop": "session.stop",
+    "SessionEnd": "session.end",
+}
+
+
+def _trace_hook(assignment: dict, event: str, payload: dict) -> None:
+    """Record hook payloads for the opt-in debug trace."""
+    if not assignment.get("trace"):
+        return
+    if event in {"PostToolUse", "PostToolUseFailure"}:
+        response = payload.get("tool_response")
+        worker_event(
+            assignment,
+            "tool",
+            tool=payload.get("tool_name"),
+            tool_call_id=payload.get("tool_use_id"),
+            input=payload.get("tool_input"),
+            output=response
+            if isinstance(response, str)
+            else json.dumps(response, default=str),
+            is_error=event == "PostToolUseFailure",
+            error=payload.get("error"),
+        )
+    elif event == "PreToolUse" and _reported(assignment):
+        worker_event(
+            assignment,
+            "tool.blocked",
+            tool=payload.get("tool_name"),
+            reason="report already recorded",
+        )
+    elif event in SESSION_EVENTS:
+        worker_event(
+            assignment,
+            SESSION_EVENTS[event],
+            session_file=payload.get("transcript_path"),
+            source=payload.get("source") or payload.get("reason"),
+        )
+
+
+def hook_settings(python: str, trace: bool = False) -> dict:
     import shlex
 
     def command(event: str) -> list[dict]:
@@ -232,6 +278,8 @@ def hook_settings(python: str) -> dict:
         "Stop",
         "SessionEnd",
     )
+    if trace:
+        events += ("PostToolUse", "PostToolUseFailure")
     return {"hooks": {event: command(event) for event in events}}
 
 
