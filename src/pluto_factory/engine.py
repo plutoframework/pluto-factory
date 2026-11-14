@@ -19,6 +19,7 @@ from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
+from .trace import Tracer
 
 
 class Engine:
@@ -29,6 +30,9 @@ class Engine:
         self.git = GitWorkspace(self.home, self.config)
         self.harness = harness or make_harness(self.config)
         self.coordinator = coordinator or Coordinator(self.home, self.config)
+        self.tracer = Tracer(self.home, self.config)
+        if self.tracer.enabled:
+            self.state.tracer = self.tracer
         self.github = None
         if self.config.integration == "github":
             from .github_flow import GitHubFlow
@@ -258,6 +262,7 @@ class Engine:
             "config": self.config.model_dump(),
             "config_digest": revision,
             "fixture_scenario": work["payload"].get("fixture_scenario"),
+            "trace": self.tracer.assignment_settings(directory),
         }
         Path(assignment["session_dir"]).mkdir(parents=True, exist_ok=True)
         Path(assignment["role_path"]).write_text(bundle["prompts"][role])
@@ -306,6 +311,7 @@ class Engine:
         )
         run = self.state.create_run(work_id, role, assignment)
         atomic_json(Path(assignment["assignment_path"]), run["assignment"])
+        self.tracer.provenance(work, run)
         self._launch(run)
 
     def _launch(self, run):
@@ -367,6 +373,12 @@ class Engine:
             self._launch(run)
             return
         observation = self.harness.observe(run["session"], assignment)
+        self.tracer.ingest(run)
+        if observation.get("failure") or observation["state"] in {
+            "settled",
+            "finished",
+        }:
+            self.tracer.finish_run(run, work)
         self.state.event(
             "worker.observed",
             work["id"],

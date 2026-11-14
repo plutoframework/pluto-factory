@@ -38,6 +38,8 @@ class State:
     def __init__(self, home: Path):
         self.home = Path(home).resolve()
         self.home.mkdir(parents=True, exist_ok=True)
+        # Optional debug Tracer; durable events are mirrored into its trace.
+        self.tracer = None
         self.db = sqlite3.connect(self.home / "state.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -145,6 +147,8 @@ class State:
             "(event_key, kind, subject, data, created) VALUES (?, ?, ?, ?, ?)",
             (event_key, kind, subject, encode(data), time.time()),
         )
+        if self.tracer is not None:
+            self.tracer.mirror(kind, subject, data)
 
     def event(self, kind, subject, data, event_key=None):
         with self.db:
@@ -461,6 +465,10 @@ class State:
             self.db.execute(
                 "INSERT INTO evidence VALUES (?,?,?,?,?)",
                 (evidence_id, work_id, run_id, encode(result), time.time()),
+            )
+        if self.tracer is not None:
+            self.tracer.write(
+                work_id, "evidence", source="state", run_id=run_id, data=result
             )
         return evidence_id
 
