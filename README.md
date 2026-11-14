@@ -301,13 +301,15 @@ fresh rather than rebinding to a new assignment.
 ```toml
 [sandbox]
 profile = ""                          # nono profile name/path; "" = bundled
-read = ["~/.local/share/mise"]        # toolchains the worker's shell needs
-write = ["~/.cache/go-build"]
+read = []                             # extra paths the worker's shell needs
+write = ["~/go/pkg/mod"]              # e.g. let workers fetch Go modules
 allow_domains = []                    # non-empty restricts network egress
 ```
 
-nono's base profile allows writes under `/tmp`; keep factory homes outside
-it. `--isolation cooperative` runs workers unsandboxed on the host, as an
+The bundled profile grants read-only Go, Node, Python and mise toolchains
+(Go's build cache is writable), open network, a private `TMPDIR` and no
+global git config. nono's base profile allows writes under `/tmp`; keep
+factory homes outside it. `--isolation cooperative` runs workers unsandboxed on the host, as an
 explicit choice for a trusted local setup.
 
 ### Authentication and fnox
