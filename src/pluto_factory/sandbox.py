@@ -143,7 +143,9 @@ def grants(assignment: dict, agent: str, policy: dict) -> dict:
     read: list[Path] = [
         Path(sys.prefix),
         Path(sys.base_prefix),
-        Path(__file__).resolve().parent,
+        # The import root (site-packages, or src/ for editable installs);
+        # hooks and the report server import pluto_factory from it.
+        Path(__file__).resolve().parent.parent,
     ]
     write: list[Path] = [
         Path(assignment["assignment_path"]).parent,
