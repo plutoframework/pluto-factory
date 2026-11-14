@@ -229,6 +229,18 @@ runs Claude workers with `--dangerously-skip-permissions` instead of
 assigned worktrees. The role's tool allowlist still limits which tools exist;
 the one-time bypass warning is pre-accepted in the worker's own settings file.
 Use it only for repositories and tasks you trust.
+
+Worker terminals (`pf-run-*`, labelled `factory=<name>`) are closed (killed
+and removed) once their run's report is recorded and evidence and any debug
+trace are captured, and after a worker is interrupted during recovery. On
+start and every five minutes the coordinator also reaps owned terminals whose
+`assignment` label is no longer the current run of an unfinished work item,
+recording a `worker.session_reaped` event for each; terminals without this
+factory's `factory` and `assignment` labels are never touched. `doctor`
+reports the count as `orphaned_sessions`. Set `keep_finished_sessions = true`
+to keep ended sessions for inspection (this also lets Pi sessions rebind to a
+revision; interrupted workers are still closed).
+
 The coordinator model is configured separately (`coordinator_model`). With
 `--harness claude`, setup defaults the coordinator to the Claude Agent SDK
 runtime (below) so one Claude subscription covers the whole factory.

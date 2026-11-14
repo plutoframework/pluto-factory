@@ -16,10 +16,34 @@ from .harness import HarnessError, make_harness
 from .improvements import propose
 from .models import Failure, WorkerReport
 from .notifications import flush
-from .post_merge import confirm_merged, reassess_merged
+from .post_merge import confirm_merged, reassess_merged, revalidate_merged
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
+
+# Sweeping Core for orphaned worker terminals lists every terminal, so it runs
+# on coordinator start and then at this interval rather than on every tick.
+REAP_INTERVAL_SECONDS = 300
+
+
+def orphaned_terminals(terminals, work_items, factory):
+    """Owned terminals whose assignment is not a current, unfinished run.
+
+    Terminals lacking this factory's ``factory`` and ``assignment`` labels are
+    never considered, whatever the adapter returned.
+    """
+    active = {
+        work["current_run"]
+        for work in work_items
+        if work["phase"] != "completed" and work["current_run"]
+    }
+    return [
+        terminal
+        for terminal in terminals
+        if terminal.get("labels", {}).get("factory") == factory
+        and terminal.get("labels", {}).get("assignment")
+        and terminal["labels"]["assignment"] not in active
+    ]
 
 
 class Engine:
@@ -33,6 +57,7 @@ class Engine:
         self.tracer = Tracer(self.home, self.config)
         if self.tracer.enabled:
             self.state.tracer = self.tracer
+        self._reaped_at = None
         self.github = None
         if self.config.integration == "github":
             from .github_flow import GitHubFlow
@@ -104,11 +129,14 @@ class Engine:
                     "coordinator": self.config.coordinator,
                 },
             )
+            self.reap_sessions()
             while not self.state.is_paused():
                 if max_seconds is not None and (
                     time.monotonic() - started >= max_seconds
                 ):
                     break
+                if time.monotonic() - self._reaped_at >= REAP_INTERVAL_SECONDS:
+                    self.reap_sessions()
                 if self.github:
                     self.github.poll(force=once)
                 progressed = self.tick()
@@ -150,6 +178,10 @@ class Engine:
         work_id = work["id"]
         data = work["data"]
         phase = work["phase"]
+        if phase in {"qa_checks", "qa"} and self._synchronize(
+            work_id, data, None
+        ):
+            return
         if phase == "queued":
             for name in work["payload"]["repositories"]:
                 repo = self.git.repositories.get(name)
@@ -197,19 +229,11 @@ class Engine:
                 data["entries"], data.get("workspace_id", work_id)
             )
             self.state.finish_operation(operation, {"entries": data["entries"]})
-            self.state.update_work(work_id, data=data)
+            if not self._synchronize(work_id, data, None):
+                self.state.update_work(work_id, data=data)
             self._validate(work_id, "checks", "reviewing")
         elif phase == "preparing":
-            if self.github:
-                self.github.adapter.refresh_defaults(data["entries"])
-            data["entries"], changed = self.git.sync(data["entries"])
-            self.state.update_work(
-                work_id,
-                data=data,
-                phase="checking" if changed else "qa_checks",
-                control="ready",
-                event="candidate.synchronized",
-            )
+            self._synchronize(work_id, data, "qa_checks")
         elif phase == "qa_checks":
             self._validate(work_id, "qa", "qa")
         elif phase == "integrating":
@@ -221,9 +245,30 @@ class Engine:
                 self._defer,
                 reassess=lambda item: reassess_merged(self, item),
                 confirm=lambda item: confirm_merged(self, item),
+                revalidate=lambda item: revalidate_merged(self, item),
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
+
+    def _synchronize(self, work_id, data, unchanged_phase):
+        """Merge an advanced default branch into the candidate.
+
+        Runs before checks and QA so validation fixes landed on the default
+        branch apply to the candidate. A changed candidate restarts at
+        checking; otherwise the work moves to ``unchanged_phase`` (if any).
+        """
+        if self.github:
+            self.github.adapter.refresh_defaults(data["entries"])
+        data["entries"], changed = self.git.sync(data["entries"])
+        if changed or unchanged_phase:
+            self.state.update_work(
+                work_id,
+                data=data,
+                phase="checking" if changed else unchanged_phase,
+                control="ready",
+                event="candidate.synchronized",
+            )
+        return changed
 
     def _dispatch(self, work, role):
         work_id = work["id"]
@@ -610,7 +655,13 @@ class Engine:
         data.setdefault("report_config_digests", {})[run["role"]] = run[
             "assignment"
         ]["config_digest"]
-        data.setdefault("sessions", {})[run["role"]] = run["session"]
+        keep = self.config.keep_finished_sessions
+        sessions = data.setdefault("sessions", {})
+        if keep:
+            sessions[run["role"]] = run["session"]
+        else:
+            # A closed session cannot be rebound; the next run starts fresh.
+            sessions.pop(run["role"], None)
         if run["role"] in {"reviewer", "qa"} and action == "advance":
             self.state.evidence(
                 work["id"],
@@ -628,6 +679,8 @@ class Engine:
             )
         self.state.update_run(run["id"], state="settled")
         work = self.state.update_work(work["id"], current_run=None, data=data)
+        if not keep:
+            self._close_session(work["id"], run, "completed")
         if action in {"revise", "retry"}:
             self._revise(work, rationale)
         elif action == "defer":
@@ -832,7 +885,12 @@ class Engine:
             notice={
                 "kind": "action_required",
                 "message": reason,
-                "incident_key": f"deferred:{work['id']}:{work['generation']}",
+                # Deferrals without a new run share a generation; key on the
+                # reason too so a different reason is never dropped.
+                "incident_key": (
+                    f"deferred:{work['id']}:{work['generation']}:"
+                    f"{digest({'reason': reason})[:16]}"
+                ),
             },
         )
 
@@ -907,6 +965,8 @@ class Engine:
             recovery = type(recovery)("defer", 0, "action_required")
         if run_id and (not failure.uncertain or exhausted):
             run = self.state.get_run(run_id)
+            ends = failure.source != "coordinator" or run["report"] is None
+            interrupted = False
             try:
                 if run["session"]:
                     observation = self.harness.observe(
@@ -914,12 +974,38 @@ class Engine:
                     )
                     if observation["state"] not in {"settled", "finished"}:
                         result = self.harness.interrupt(run["session"])
+                        interrupted = True
                         self.state.event("worker.interrupted", work_id, result)
                         observation = self.harness.observe(
                             run["session"], run["assignment"]
                         )
-                        if observation["state"] not in {"settled", "finished"}:
+                        # An interrupted worker is closed whether or not it
+                        # then reports settled; it must not idle at a prompt.
+                        self.tracer.finish_run(run, work)
+                        try:
                             self.harness.close(run["session"])
+                        except HarnessError as error:
+                            if observation["state"] not in {
+                                "settled",
+                                "finished",
+                            }:
+                                raise
+                            # Quiesced but still open: the reaper retries.
+                            self.state.event(
+                                "worker.session_close_failed",
+                                work_id,
+                                {
+                                    "run_id": run_id,
+                                    "reason": "interrupted",
+                                    **error.failure,
+                                },
+                            )
+                        else:
+                            self.state.event(
+                                "worker.session_closed",
+                                work_id,
+                                {"run_id": run_id, "reason": "interrupted"},
+                            )
             except HarnessError as error:
                 self.state.update_work(
                     work_id,
@@ -935,9 +1021,12 @@ class Engine:
                     "recovery.action_failed", work_id, error.failure
                 )
                 return
-            if failure.source != "coordinator" or run["report"] is None:
+            if ends or interrupted:
                 self.state.update_run(run_id, state="failed")
                 run_id = None
+                if not interrupted and not self.config.keep_finished_sessions:
+                    self.tracer.finish_run(run, work)
+                    self._close_session(work_id, run, "failed")
         if recovery.action == "defer":
             if run_id != work["current_run"]:
                 work = self.state.update_work(work_id, current_run=run_id)
@@ -961,6 +1050,81 @@ class Engine:
                 "incident_key": f"recovery:{work_id}:{work['generation']}:{failure.code}",
             },
         )
+
+    def _close_session(self, work_id, run, reason):
+        """Best-effort close of an ended run; the reaper retries failures."""
+        close = getattr(self.harness, "close", None)
+        if not run.get("session") or close is None:
+            return False
+        try:
+            close(run["session"])
+        except HarnessError as error:
+            self.state.event(
+                "worker.session_close_failed",
+                work_id,
+                {"run_id": run["id"], "reason": reason, **error.failure},
+            )
+            return False
+        self.state.event(
+            "worker.session_closed",
+            work_id,
+            {"run_id": run["id"], "reason": reason},
+        )
+        return True
+
+    def orphaned_sessions(self):
+        """Owned worker terminals whose run is no longer a current run."""
+        lister = getattr(self.harness, "owned_terminals", None)
+        if lister is None:
+            return []
+        terminals = lister()
+        # Runs are created (and made current) before their terminal exists,
+        # so reading current runs after listing cannot miss a fresh launch.
+        return orphaned_terminals(
+            terminals, self.state.list_work(), self.config.name
+        )
+
+    def reap_sessions(self):
+        """Close owned worker terminals left behind by ended runs."""
+        self._reaped_at = time.monotonic()
+        reaped = []
+        with self.state.dispatch_lock():
+            try:
+                orphans = self.orphaned_sessions()
+            except HarnessError as error:
+                self.state.event("reaper.unavailable", "factory", error.failure)
+                return reaped
+            for terminal in orphans:
+                labels = terminal["labels"]
+                assignment = labels["assignment"]
+                try:
+                    run_state = self.state.get_run(assignment)["state"]
+                except ValueError:
+                    run_state = None
+                if self.config.keep_finished_sessions and run_state in {
+                    "settled",
+                    "failed",
+                }:
+                    continue
+                details = {
+                    "address": terminal["address"],
+                    "assignment": assignment,
+                    "run_state": run_state,
+                    "role": labels.get("role"),
+                }
+                subject = labels.get("work") or "factory"
+                try:
+                    self.harness.close_terminal(terminal)
+                except HarnessError as error:
+                    self.state.event(
+                        "worker.session_reap_failed",
+                        subject,
+                        {**details, **error.failure},
+                    )
+                    continue
+                self.state.event("worker.session_reaped", subject, details)
+                reaped.append(details)
+        return reaped
 
     def pause(self, work_id=None):
         with self.state.dispatch_lock():

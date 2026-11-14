@@ -906,13 +906,13 @@ class GitHubAdapter:
         source = payload.get("source", "")
         if not source.startswith("github:"):
             return {"state": "not_github"}
-        slug = source.removeprefix("github:")
+        # Intake records sources lowercased; GitHub slugs are
+        # case-insensitive, so match them that way and use the configured
+        # spelling for API calls.
+        configured = {value.lower(): value for value in self.github.values()}
+        slug = configured.get(source.removeprefix("github:").lower())
         number = str(payload.get("delivery_key", ""))
-        if (
-            slug not in self.github.values()
-            or not number.isdigit()
-            or int(number) < 1
-        ):
+        if slug is None or not number.isdigit() or int(number) < 1:
             raise GitHubFailure(
                 "scope.denied", "Issue source is outside factory scope"
             )

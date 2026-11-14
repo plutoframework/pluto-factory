@@ -231,6 +231,10 @@ class ObservedHarness:
     def __init__(self, state="working"):
         self.current = state
         self.interrupted = False
+        self.closed = []
+
+    def close(self, session):
+        self.closed.append(session)
 
     def observe(self, session, assignment):
         return {"state": self.current}
@@ -262,6 +266,7 @@ def test_exhausted_recovery_quiesces_live_worker_before_deferral(tmp_path):
         )
         current = engine.state.get_work(work_id)
         assert harness.interrupted
+        assert harness.closed == [{"owned": True}]
         assert current["control"] == "deferred"
         assert current["current_run"] is None
         assert engine.state.get_run(run["id"])["state"] == "failed"
@@ -756,3 +761,84 @@ def test_claude_agent_sdk_coordinator_normalizes_failure(tmp_path, monkeypatch):
     with pytest.raises(CoordinatorError) as error:
         coordinator.decide({}, {"advance"}, "Role")
     assert error.value.failure.code == "provider.rate_limited"
+
+
+@pytest.mark.parametrize("phase", ["qa", "qa_checks"])
+def test_resumed_qa_synchronizes_candidate_with_advanced_default(
+    tmp_path, phase
+):
+    home, prepared = prepare_demo(tmp_path / "advanced")
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    try:
+        work = engine.state.get_work(work_id)
+        entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+        writable = next(
+            entry for entry in entries if entry["access"] == "write"
+        )
+        (Path(writable["worktree"]) / "feature.txt").write_text("candidate\n")
+        entries = engine.git.snapshot(entries, work_id)
+        stale = {entry["name"]: entry["candidate"] for entry in entries}
+        managed = Path(writable["managed"])
+        (managed / "validation.txt").write_text("fixed on default\n")
+        git(managed, "add", ".")
+        git(
+            managed,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@localhost",
+            "commit",
+            "-m",
+            "Fix validation on default",
+        )
+        advanced = git(managed, "rev-parse", "HEAD")
+        work = engine.state.update_work(
+            work_id,
+            phase=phase,
+            control="deferred",
+            data={"entries": entries, "workspace_id": work_id},
+        )
+        engine.state.resume(work_id)
+        engine._step(engine.state.get_work(work_id))
+        current = engine.state.get_work(work_id)
+        assert current["phase"] == "checking"
+        assert current["current_run"] is None
+        synced = next(
+            entry
+            for entry in current["data"]["entries"]
+            if entry["name"] == writable["name"]
+        )
+        assert synced["base"] == advanced
+        assert synced["candidate"] != stale[writable["name"]]
+        assert any(
+            event["kind"] == "candidate.synchronized"
+            for event in engine.state.inspect()["events"]
+        )
+        assert not engine.state.inspect()["runs"]
+    finally:
+        engine.state.close()
+
+
+def test_qa_dispatch_skips_sync_when_default_is_unchanged(tmp_path):
+    home, prepared = prepare_demo(tmp_path / "unchanged")
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    try:
+        work = engine.state.get_work(work_id)
+        entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+        entries = engine.git.snapshot(entries, work_id)
+        engine.state.update_work(
+            work_id,
+            phase="qa_checks",
+            data={"entries": entries, "workspace_id": work_id},
+        )
+        engine._step(engine.state.get_work(work_id))
+        current = engine.state.get_work(work_id)
+        assert current["phase"] == "qa"
+        assert not any(
+            event["kind"] == "candidate.synchronized"
+            for event in engine.state.inspect()["events"]
+        )
+    finally:
+        engine.state.close()

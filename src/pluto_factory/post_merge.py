@@ -398,3 +398,77 @@ def _confirm_merged(engine, work, expected_fingerprint):
         return None
     engine.github._current_work(work)
     return work
+
+
+def revalidate_merged(engine, work):
+    """Rebind unchanged merged candidates to the current configuration.
+
+    Reached only when the merged candidates still match what was validated and
+    the configuration digest alone moved. Required checks and QA rerun on the
+    merged commits under the current configuration; passing evidence rebinds
+    the validation digests and forces a fresh post-merge reassessment instead
+    of stranding completed work in a deferral.
+    """
+    engine.github._current_work(work)
+    data = work["data"]
+    current = digest(resolved_bundle(engine.home, engine.config))
+    merged = {}
+    for pr in data["pull_requests"]:
+        if not pr.get("merge_commit"):
+            engine._defer(
+                work,
+                "Merged PR commit is unknown; post-merge revalidation "
+                "under the current configuration is required",
+            )
+            return None
+        merged[pr["repository"]] = pr["merge_commit"]
+    engine.github.adapter.refresh_defaults(data["entries"])
+    candidates = {
+        entry["name"]: entry["candidate"] for entry in data["entries"]
+    }
+    evidence_ids = []
+    for kind in ("checks", "qa"):
+        evidence = engine.git.validate_merged(data["entries"], merged, kind)
+        for result in evidence:
+            result["merged_candidate_set"] = result["candidate_set"]
+            result["candidate_set"] = candidates
+            result["config_digest"] = current
+            result["scope"] = (
+                "Merged commit containing the candidate, revalidated under "
+                "the current configuration after a configuration change"
+            )
+            evidence_ids.append(engine.state.evidence(work["id"], result))
+        if not evidence or any(not result["passed"] for result in evidence):
+            work = engine.state.update_work(
+                work["id"], data=data, event="validation.post_merge.failed"
+            )
+            engine._defer(
+                work,
+                f"Merged commit fails required {kind} under the current "
+                "configuration; a corrective increment is required",
+            )
+            return None
+    if digest(resolved_bundle(engine.home, engine.config)) != current:
+        # Configuration moved again mid-validation; the next pass retries.
+        return None
+    engine.github._current_work(work)
+    previous = data["acceptance_config_digest"]
+    for kind in ("acceptance", "checks", "qa"):
+        data[f"{kind}_config_digest"] = current
+    digests = data.setdefault("report_config_digests", {})
+    for role in ("reviewer", "qa"):
+        digests[role] = current
+    data.pop("post_merge_acceptance", None)
+    data.pop("post_merge_validation", None)
+    data["post_merge_revalidation"] = {
+        "previous_config_digest": data.get("publication_acceptance", {}).get(
+            "config_digest", previous
+        ),
+        "config_digest": current,
+        "candidates": candidates,
+        "merged": merged,
+        "evidence_ids": evidence_ids,
+    }
+    return engine.state.update_work(
+        work["id"], data=data, event="validation.post_merge_revalidated"
+    )

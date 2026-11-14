@@ -1031,6 +1031,9 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
             )
     github_checks, github_status = readiness(config, verify_auth)
     checks.extend(github_checks)
+    orphaned = None
+    if native and shutil.which("hc"):
+        orphaned = _orphaned_session_count(home, config)
     return {
         "ready": all(check["passed"] for check in checks),
         "checks": checks,
@@ -1039,7 +1042,27 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
         "secrets": secrets_status,
         "native_workers": native_readiness,
         "github": github_status,
+        # Owned worker terminals whose run has ended; the coordinator's
+        # reaper closes them. None when Herdr Core could not be queried.
+        "orphaned_sessions": orphaned,
     }
+
+
+def _orphaned_session_count(home: Path, config) -> int | None:
+    from .engine import orphaned_terminals
+    from .harness import HarnessError, make_harness
+    from .state import State
+
+    try:
+        terminals = make_harness(config).owned_terminals()
+    except HarnessError:
+        return None
+    state = State(home)
+    try:
+        work_items = state.list_work()
+    finally:
+        state.close()
+    return len(orphaned_terminals(terminals, work_items, config.name))
 
 
 def _submission(args: argparse.Namespace) -> Submission:

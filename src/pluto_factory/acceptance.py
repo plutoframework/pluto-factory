@@ -5,11 +5,11 @@ import json
 from .config import digest, resolved_bundle
 
 
-def current_evidence(state, home, config, work):
+def current_evidence(state, home, config, work, config_digest=None):
     candidates = {
         entry["name"]: entry["candidate"] for entry in work["data"]["entries"]
     }
-    current_digest = digest(resolved_bundle(home, config))
+    current_digest = config_digest or digest(resolved_bundle(home, config))
     rows = state.db.execute(
         "SELECT id,data FROM evidence WHERE work_id=?", (work["id"],)
     ).fetchall()

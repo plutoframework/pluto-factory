@@ -11,6 +11,10 @@ from .models import Decision, Submission
 from .state import StateConflict
 
 
+class ConfigurationDrift(ValueError):
+    """Merged candidates are intact; only the configuration digest moved."""
+
+
 class GitHubFlow:
     def __init__(self, state, config):
         self.state = state
@@ -124,7 +128,15 @@ class GitHubFlow:
             },
         )
 
-    def advance(self, work, revise, defer, reassess=None, confirm=None):
+    def advance(
+        self,
+        work,
+        revise,
+        defer,
+        reassess=None,
+        confirm=None,
+        revalidate=None,
+    ):
         result = self.adapter.poll_pull_requests(work["data"]["pull_requests"])
         data = work["data"]
         data["pull_requests"] = result["pull_requests"]
@@ -155,6 +167,32 @@ class GitHubFlow:
             return
         try:
             decision, remaining = self._merged_intent(work, publication=True)
+        except ConfigurationDrift as error:
+            if revalidate is None:
+                self._reconcile(work, defer, error)
+                return
+            work = self.state.update_work(
+                work["id"], data=data, event="validation.configuration_drifted"
+            )
+            revalidated = revalidate(work)
+            if revalidated is None:
+                return
+            if (
+                not isinstance(revalidated, dict)
+                or revalidated.get("id") != work["id"]
+            ):
+                raise ValueError(
+                    "post-merge revalidation returned another item"
+                )
+            work = revalidated
+            data = work["data"]
+            try:
+                decision, remaining = self._merged_intent(
+                    work, publication=True
+                )
+            except (KeyError, OSError, TypeError, ValueError) as error:
+                self._reconcile(work, defer, error)
+                return
         except (KeyError, OSError, TypeError, ValueError) as error:
             self._reconcile(work, defer, error)
             return
@@ -379,40 +417,72 @@ class GitHubFlow:
                 raise ValueError(
                     "merged PR identity lacks candidate provenance"
                 )
-        current_digest = digest(resolved_bundle(self.state.home, self.config))
-        if (
-            acceptance["candidates"] != candidates
-            or acceptance["config_digest"] != current_digest
-        ):
-            raise ValueError("acceptance candidate or configuration is stale")
+        if acceptance["candidates"] != candidates:
+            raise ValueError("acceptance candidate is stale")
         for kind in ("checks", "qa"):
-            if (
-                data.get(f"{kind}_candidate") != candidates
-                or data.get(f"{kind}_config_digest") != current_digest
-            ):
-                raise ValueError(f"{kind} candidate or configuration is stale")
+            if data.get(f"{kind}_candidate") != candidates:
+                raise ValueError(f"{kind} candidate is stale")
         for role in ("reviewer", "qa"):
-            if (
-                data.get("report_config_digests", {}).get(role)
-                != current_digest
-                or data.get("reports", {}).get(role, {}).get("outcome")
-                != "ready"
-            ):
-                raise ValueError(f"{role} report is absent or stale")
+            if data.get("reports", {}).get(role, {}).get("outcome") != "ready":
+                raise ValueError(f"{role} report is absent")
+        current_digest = digest(resolved_bundle(self.state.home, self.config))
+        revalidation = data.get("post_merge_revalidation") or {}
+        rebound = (
+            publication
+            and revalidation.get("config_digest") == current_digest
+            and revalidation.get("candidates") == candidates
+            and revalidation.get("previous_config_digest")
+            == acceptance["config_digest"]
+        )
+        bound = {
+            "acceptance": current_digest
+            if rebound
+            else acceptance["config_digest"],
+            **{
+                kind: data.get(f"{kind}_config_digest")
+                for kind in ("checks", "qa")
+            },
+            **{
+                f"{role} report": data.get("report_config_digests", {}).get(
+                    role
+                )
+                for role in ("reviewer", "qa")
+            },
+        }
+        stale = sorted(
+            name for name, value in bound.items() if value != current_digest
+        )
+        if stale:
+            raise ConfigurationDrift(
+                "configuration is stale since the merged candidates were "
+                "validated (" + ", ".join(stale) + ")"
+            )
         decision = Decision.model_validate(acceptance["decision"])
         if decision.action not in {"advance", "complete"}:
             raise ValueError(
                 "recorded acceptance does not authorize integration"
             )
-        intent, remaining = acceptance_intent(
-            decision,
-            len(work["payload"]["acceptance"]),
-            {
+        evidence_ids = {
+            item["id"]
+            for item in current_evidence(
+                self.state, self.state.home, self.config, work
+            )
+        }
+        if rebound:
+            # The frozen publication decision was validated under the earlier
+            # configuration; its citations stay valid against that digest.
+            evidence_ids |= {
                 item["id"]
                 for item in current_evidence(
-                    self.state, self.state.home, self.config, work
+                    self.state,
+                    self.state.home,
+                    self.config,
+                    work,
+                    config_digest=acceptance["config_digest"],
                 )
-            },
+            }
+        intent, remaining = acceptance_intent(
+            decision, len(work["payload"]["acceptance"]), evidence_ids
         )
         if intent.action == "complete" and decision.action != "complete":
             raise ValueError("terminal acceptance intent was not recorded")
