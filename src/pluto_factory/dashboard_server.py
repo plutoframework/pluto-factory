@@ -28,6 +28,7 @@ STATIC = {
     ),
     "/fonts/ibm-plex-mono.ttf": ("fonts/ibm-plex-mono.ttf", "font/ttf"),
 }
+PAGES = {"/", "/index.html"}
 DETAIL = re.compile(
     r"^/api/factories/([a-f0-9]{20})/work/([A-Za-z0-9_-]{1,100})(/terminal)?$"
 )
@@ -103,9 +104,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             len(origins) != 1 or origins[0] != scheme + origin_host
         ):
             return f"origin {origins!r} does not match {scheme + origin_host}"
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+        if (
+            self.headers.get("Sec-Fetch-Site") == "cross-site"
+            and not self._page_navigation()
+        ):
             return "cross-site request"
         return None
+
+    def _page_navigation(self):
+        """A top-level visit to the dashboard page itself, e.g. from a link
+        in another app. Its data requests are then same-origin; cross-site
+        fetches, embeds and links to API or terminal routes stay refused."""
+        return (
+            self.headers.get("Sec-Fetch-Mode") == "navigate"
+            and self.headers.get("Sec-Fetch-Dest") == "document"
+            and self.path in PAGES
+        )
 
     def _send(
         self, status, content, content_type="application/json; charset=utf-8"

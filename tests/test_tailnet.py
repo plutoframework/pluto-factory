@@ -145,3 +145,40 @@ def test_refusals_name_the_failed_check(tmp_path, capsys):
         _, body = response(live, [("Host", NAME)])
         assert "Tailscale-User-Login" in body["error"]
     assert "refused request" in capsys.readouterr().err
+
+
+def status_of(live, headers, path):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", live.server_address[1], timeout=3
+    )
+    connection.putrequest("GET", path, skip_host=True)
+    for key, value in headers:
+        connection.putheader(key, value)
+    connection.endheaders()
+    reply = connection.getresponse()
+    reply.read()
+    connection.close()
+    return reply.status
+
+
+def test_cross_site_link_opens_page_but_not_data(tmp_path):
+    access = TailnetAccess(NAME, 443, frozenset({OWNER}))
+    tailnet = [("Host", NAME), ("Tailscale-User-Login", OWNER)]
+    link = [
+        ("Sec-Fetch-Site", "cross-site"),
+        ("Sec-Fetch-Mode", "navigate"),
+        ("Sec-Fetch-Dest", "document"),
+    ]
+    fetch = [
+        ("Sec-Fetch-Site", "cross-site"),
+        ("Sec-Fetch-Mode", "cors"),
+        ("Sec-Fetch-Dest", "empty"),
+    ]
+    with server(tmp_path, access) as live:
+        local = [("Host", f"127.0.0.1:{live.server_address[1]}")]
+        for host in (tailnet, local):
+            assert status_of(live, [*host, *link], "/") == 200
+            # Data, terminal and embedded loads stay same-site only.
+            assert status_of(live, [*host, *link], "/api/state") == 403
+            assert status_of(live, [*host, *fetch], "/api/state") == 403
+            assert status_of(live, [*host, *fetch], "/") == 403
