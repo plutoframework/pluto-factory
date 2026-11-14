@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import atomic_json
 from .models import FactoryConfig, WorkerReport
+from .trace import worker_event
 
 
 class HarnessError(RuntimeError):
@@ -687,7 +688,10 @@ class ClaudeHarness(PiHarness):
         folder = assignment_path.parent
         settings_path = folder / "claude-settings.json"
         mcp_path = folder / "claude-mcp.json"
-        atomic_json(settings_path, hook_settings(sys.executable))
+        atomic_json(
+            settings_path,
+            hook_settings(sys.executable, trace=bool(assignment.get("trace"))),
+        )
         atomic_json(mcp_path, mcp_config(sys.executable, assignment_path))
         tools = list(self.READ_TOOLS)
         if assignment["role"] == "implementer":
@@ -869,6 +873,13 @@ class FixtureHarness:
                         )
                     content = content.replace(old, new, 1)
                 path.write_text(content)
+                worker_event(
+                    assignment,
+                    "tool",
+                    tool="Edit",
+                    input={"file_path": str(path)},
+                    output="fixture recipe edit",
+                )
 
     def observe(self, session: dict, assignment: dict) -> dict:
         return {

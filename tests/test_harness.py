@@ -606,3 +606,57 @@ console.log(JSON.stringify({ first: first.id, second: next.id }));
         timeout=15,
     )
     assert json.loads(result.stdout) == {"first": "first", "second": "second"}
+
+
+def test_native_extension_records_trace_when_enabled(tmp_path):
+    traced = assignment(tmp_path, identifier="traced")
+    raw = tmp_path / "trace.raw.jsonl"
+    traced["trace"] = {"path": str(raw), "max_output_bytes": 32}
+    atomic_json(Path(traced["assignment_path"]), traced)
+    extension = Path(__file__).parents[1] / "src/pluto_factory/pi_extension.ts"
+    script = r"""
+import { pathToFileURL } from "node:url";
+const [extension, path] = process.argv.slice(1);
+process.env.PLUTO_FACTORY_ASSIGNMENT = path;
+const events = {};
+const pi = {
+  registerTool() {}, registerCommand() {},
+  on(name, callback) { events[name] = callback; },
+};
+const module = await import(pathToFileURL(extension).href);
+module.default(pi);
+const result = await events.tool_result({
+  toolName: "bash", toolCallId: "c1", isError: false,
+  input: { command: "pluto add endpoint" },
+  content: [{ type: "text", text: "x".repeat(100) }],
+  details: { exitCode: 0 },
+});
+if (result !== undefined) throw new Error("Trace must not alter results");
+await events.message_end({ message: {
+  role: "assistant", model: "m", usage: { input: 3, output: 4 },
+  content: [{ type: "text", text: "Done" }],
+} });
+await events.message_end({ message: { role: "user", content: [] } });
+"""
+    subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "-e",
+            script,
+            str(extension),
+            traced["assignment_path"],
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    events = [json.loads(line) for line in raw.read_text().splitlines()]
+    assert [event["kind"] for event in events] == ["tool", "assistant.message"]
+    tool, message = events
+    assert tool["tool"] == "bash" and tool["exit_code"] == 0
+    assert tool["input"]["command"] == "pluto add endpoint"
+    assert "truncated" in tool["output"]
+    assert message["text"] == "Done" and message["usage"]["output"] == 4
+    assert raw.stat().st_mode & 0o777 == 0o600

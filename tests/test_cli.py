@@ -502,3 +502,20 @@ def test_claude_api_key_defaults_to_anthropic_env(monkeypatch, tmp_path):
     args.auth = "api_key"
     _harness_model_defaults(args)
     assert args.api_key_env == "ANTHROPIC_API_KEY"
+
+
+def test_setup_debug_flag_enables_trace(tmp_path, capsys):
+    home = tmp_path / "factory"
+    main([*setup_args(home, repository(tmp_path / "repo")), "--debug"])
+    capsys.readouterr()
+    config = load_config(home)
+    assert config.debug.enabled
+    assert config.debug.level == "trace"
+    assert "[debug]\nenabled = true" in (home / "factory.toml").read_text()
+
+
+def test_setup_debug_defaults_off(tmp_path, capsys):
+    home = tmp_path / "factory"
+    main(setup_args(home, repository(tmp_path / "repo")))
+    capsys.readouterr()
+    assert not load_config(home).debug.enabled
