@@ -185,3 +185,34 @@ def test_concurrent_redelivery_returns_the_same_work_item(tmp_path):
     assert len(state.list_work()) == 1
     assert len(state.inspect()["events"]) == 1
     state.close()
+
+
+def test_unchanged_worker_observations_record_only_heartbeat_events(tmp_path):
+    state = State(tmp_path / "factory")
+    try:
+        work = state.submit(submission())
+
+        def observed():
+            return [
+                event["data"]
+                for event in state.inspect()["events"]
+                if event["kind"] == "worker.observed"
+            ]
+
+        working = {"run_id": "run-a", "state": "working"}
+        assert state.observe(work["id"], working) is True
+        for _ in range(20):
+            assert state.observe(work["id"], working) is False
+        assert observed() == [working]
+        latest = state.db.execute(
+            "SELECT data,created,recorded FROM observations WHERE work_id=?",
+            (work["id"],),
+        ).fetchone()
+        assert latest["created"] > latest["recorded"]
+        settled = {"run_id": "run-a", "state": "settled"}
+        assert state.observe(work["id"], settled) is True
+        assert observed() == [working, settled]
+        assert state.observe(work["id"], settled, heartbeat=0) is True
+        assert observed() == [working, settled, settled]
+    finally:
+        state.close()

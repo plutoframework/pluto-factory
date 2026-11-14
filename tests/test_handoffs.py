@@ -229,6 +229,7 @@ def test_required_implementation_finding_still_requires_a_revision(engine):
             return Decision(action="revise", rationale="Fix the edge case")
 
     engine.coordinator = RequiredCorrectionJudge()
+    engine.git.snapshot = lambda entries, work_id: entries
     engine._report(work, run)
     current = engine.state.get_work(work["id"])
     assert snapshots[0]["evaluation"] == "handoff"

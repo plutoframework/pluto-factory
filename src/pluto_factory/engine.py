@@ -424,14 +424,7 @@ class Engine:
             "finished",
         }:
             self.tracer.finish_run(run, work)
-        self.state.event(
-            "worker.observed",
-            work["id"],
-            {
-                "run_id": run["id"],
-                **observation,
-            },
-        )
+        self.state.observe(work["id"], {"run_id": run["id"], **observation})
         report_path = Path(assignment["report_path"])
         if report_path.exists() and run["report"] is None:
             try:
@@ -639,6 +632,10 @@ class Engine:
                 },
             )
         else:
+            if run["role"] == "implementer":
+                # The coordinator must judge what the implementer actually
+                # committed, not the candidate frozen at prepare time.
+                self._refresh_candidate(work)
             decision = self._decide(
                 work,
                 allowed,
@@ -698,6 +695,15 @@ class Engine:
                 wake_at=0,
                 event="work.advanced",
             )
+
+    def _refresh_candidate(self, work):
+        """Snapshot worktree HEAD into the work entries held in memory."""
+        data = work["data"]
+        operation = self.state.begin_operation(work["id"], "git.snapshot", {})
+        data["entries"] = self.git.snapshot(
+            data["entries"], data.get("workspace_id", work["id"])
+        )
+        self.state.finish_operation(operation, {"entries": data["entries"]})
 
     def _validate(self, work_id, kind, next_phase):
         work = self.state.get_work(work_id)

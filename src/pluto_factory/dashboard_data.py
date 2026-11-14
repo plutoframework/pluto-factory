@@ -149,6 +149,18 @@ def _read(database, selected=None):
                 "SELECT data,created FROM events WHERE subject=? AND kind='worker.observed' ORDER BY seq DESC LIMIT 1",
                 (item["id"],),
             ).fetchone()
+            # The observations row is refreshed every engine tick while
+            # events are only appended on change or heartbeat; prefer it
+            # unless an event is newer (or the table predates this reader).
+            try:
+                latest = connection.execute(
+                    "SELECT data,created FROM observations WHERE work_id=?",
+                    (item["id"],),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                latest = None
+            if latest and (row is None or latest["created"] >= row["created"]):
+                row = latest
             if row:
                 observations[item["id"]] = {
                     "data": _object(row["data"]),
