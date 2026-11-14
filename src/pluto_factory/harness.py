@@ -643,13 +643,18 @@ class PiHarness:
         value = self._hc(
             ["ls", "--all", "--json", "--label", f"factory={name}"]
         )
-        return [
-            terminal
-            for terminal in value.get("terminals", [])
-            if terminal.get("address")
-            and terminal.get("labels", {}).get("factory") == name
-            and terminal.get("labels", {}).get("assignment")
-        ]
+        owned = []
+        for terminal in value.get("terminals", []):
+            if not terminal.get("address"):
+                continue
+            if not isinstance(terminal.get("labels"), dict):
+                # `hc ls` filters by label but omits labels from its output;
+                # read them from `hc get` before trusting ownership.
+                terminal = self._hc(["get", "--json", terminal["address"]])
+            labels = terminal.get("labels") or {}
+            if labels.get("factory") == name and labels.get("assignment"):
+                owned.append(terminal)
+        return owned
 
     def close_terminal(self, terminal: dict) -> None:
         """Close a listed terminal after re-verifying its ownership labels."""

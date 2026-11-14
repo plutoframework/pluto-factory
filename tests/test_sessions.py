@@ -304,3 +304,36 @@ def test_doctor_reports_orphaned_session_count(tmp_path, monkeypatch, capsys):
     result = cli.doctor(home)
     assert result["orphaned_sessions"] == 2
     assert not any(call[1] in {"kill", "rm"} for call in core.calls)
+
+
+class LabellessListingCore(FakeCore):
+    """Real `hc ls` filters by --label but omits labels from its output."""
+
+    def __call__(self, args, **kwargs):
+        if args[0] == "hc" and args[1] == "ls":
+            import json
+            import subprocess
+
+            self.calls.append(args)
+            wanted = args[args.index("--label") + 1].split("=", 1)
+            listed = [
+                {k: v for k, v in terminal.items() if k != "labels"}
+                for terminal in self.terminals
+                if terminal.get("labels", {}).get(wanted[0]) == wanted[1]
+            ]
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"terminals": listed}), ""
+            )
+        return super().__call__(args, **kwargs)
+
+
+def test_reaper_reads_labels_when_listing_omits_them(tmp_path):
+    engine, core, _work_id = reaper_engine(tmp_path)
+    real = LabellessListingCore(core.terminals)
+    engine.harness = PiHarness(engine.config, real)
+    try:
+        reaped = engine.reap_sessions()
+    finally:
+        engine.state.close()
+    assert sorted(item["address"] for item in reaped) == ["t2", "t3"]
+    assert closed_addresses(real) == {"kill": ["t2", "t3"], "rm": ["t2", "t3"]}
