@@ -287,14 +287,28 @@ configuration is not a claim that account access or inference succeeded.
 
 ### Execution isolation
 
-This prototype supports explicit **cooperative host execution**. That is not an
-OS sandbox. The repository registry scopes factory Git operations and task
-assignments, but it cannot constrain an unrestricted shell process.
+The default `isolation = "required"` runs every Pi or Claude worker inside a
+[nono](https://nono.sh) sandbox, hosted in its usual Herdr terminal, so
+`hc read`/`hc send` and the dashboard work unchanged. A worker can write
+only its worktrees, its assignment and session folders and its agent's own
+config (`~/.claude`, `~/.pi/agent`); shared git objects are read-only. The
+factory commits. The bundled profile mediates Unix sockets, so the worker
+cannot reach Herdr (`hc exec` would be an escape), docker, dbus or
+ssh-agent. Any custom profile must do the same, or dispatch is refused.
+`doctor` reports whether nono is ready. Sandboxed Pi sessions always start
+fresh rather than rebinding to a new assignment.
 
-The default `isolation = "required"` refuses dispatch until a real isolation
-adapter exists. Selecting `--isolation cooperative` is an explicit choice for a
-trusted local prototype. Container packaging and enforced process isolation are
-not implemented yet.
+```toml
+[sandbox]
+profile = ""                          # nono profile name/path; "" = bundled
+read = ["~/.local/share/mise"]        # toolchains the worker's shell needs
+write = ["~/.cache/go-build"]
+allow_domains = []                    # non-empty restricts network egress
+```
+
+nono's base profile allows writes under `/tmp`; keep factory homes outside
+it. `--isolation cooperative` runs workers unsandboxed on the host, as an
+explicit choice for a trusted local setup.
 
 ### Authentication and fnox
 
