@@ -582,3 +582,23 @@ def test_check_result_order_changes_do_not_restart_acceptance(merged):
     engine.coordinator = model(effect=reorder)
     assert advance(engine, work)["phase"] == "completed"
     assert len(closed) == 1 and not engine.state.inspect()["runs"]
+
+
+def test_deferral_with_new_reason_records_a_distinct_notice(merged):
+    engine, work, _remote, _closed = merged
+    engine._defer(work, "Issue source is outside factory scope")
+    engine.state.resume(work["id"])
+    engine._defer(engine.state.get_work(work["id"]), "Configuration drifted")
+    engine.state.resume(work["id"])
+    engine._defer(engine.state.get_work(work["id"]), "Configuration drifted")
+    notices = [
+        row
+        for row in engine.state.inspect()["notifications"]
+        if row["work_id"] == work["id"]
+        and row["incident_key"].startswith("deferred:")
+    ]
+    assert sorted(row["message"] for row in notices) == [
+        "Configuration drifted",
+        "Issue source is outside factory scope",
+    ]
+    assert len({row["incident_key"] for row in notices}) == 2

@@ -832,7 +832,12 @@ class Engine:
             notice={
                 "kind": "action_required",
                 "message": reason,
-                "incident_key": f"deferred:{work['id']}:{work['generation']}",
+                # Deferrals without a new run share a generation; key on the
+                # reason too so a different reason is never dropped.
+                "incident_key": (
+                    f"deferred:{work['id']}:{work['generation']}:"
+                    f"{digest({'reason': reason})[:16]}"
+                ),
             },
         )
 
