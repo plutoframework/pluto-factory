@@ -150,6 +150,10 @@ class Engine:
         work_id = work["id"]
         data = work["data"]
         phase = work["phase"]
+        if phase in {"qa_checks", "qa"} and self._synchronize(
+            work_id, data, None
+        ):
+            return
         if phase == "queued":
             for name in work["payload"]["repositories"]:
                 repo = self.git.repositories.get(name)
@@ -197,19 +201,11 @@ class Engine:
                 data["entries"], data.get("workspace_id", work_id)
             )
             self.state.finish_operation(operation, {"entries": data["entries"]})
-            self.state.update_work(work_id, data=data)
+            if not self._synchronize(work_id, data, None):
+                self.state.update_work(work_id, data=data)
             self._validate(work_id, "checks", "reviewing")
         elif phase == "preparing":
-            if self.github:
-                self.github.adapter.refresh_defaults(data["entries"])
-            data["entries"], changed = self.git.sync(data["entries"])
-            self.state.update_work(
-                work_id,
-                data=data,
-                phase="checking" if changed else "qa_checks",
-                control="ready",
-                event="candidate.synchronized",
-            )
+            self._synchronize(work_id, data, "qa_checks")
         elif phase == "qa_checks":
             self._validate(work_id, "qa", "qa")
         elif phase == "integrating":
@@ -225,6 +221,26 @@ class Engine:
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
+
+    def _synchronize(self, work_id, data, unchanged_phase):
+        """Merge an advanced default branch into the candidate.
+
+        Runs before checks and QA so validation fixes landed on the default
+        branch apply to the candidate. A changed candidate restarts at
+        checking; otherwise the work moves to ``unchanged_phase`` (if any).
+        """
+        if self.github:
+            self.github.adapter.refresh_defaults(data["entries"])
+        data["entries"], changed = self.git.sync(data["entries"])
+        if changed or unchanged_phase:
+            self.state.update_work(
+                work_id,
+                data=data,
+                phase="checking" if changed else unchanged_phase,
+                control="ready",
+                event="candidate.synchronized",
+            )
+        return changed
 
     def _dispatch(self, work, role):
         work_id = work["id"]

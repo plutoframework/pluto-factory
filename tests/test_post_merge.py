@@ -663,6 +663,7 @@ def test_config_drift_with_failing_merged_qa_defers_with_reason(merged):
     sha, calls = drift_config(engine, lambda kind: kind != "qa")
     remote.pr["merge_commit"] = sha
     current = advance(engine, work)
+    assert [kind for kind, _ in calls] == ["checks", "qa"]
     assert current["control"] == "deferred"
     assert not closed
     notices = engine.state.inspect()["notifications"]
