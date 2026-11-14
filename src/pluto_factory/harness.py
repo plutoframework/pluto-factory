@@ -605,7 +605,7 @@ class PiHarness:
             return {"state": "settled"}
         return {"state": "unknown"}
 
-    def _verify_owned(self, session: dict) -> None:
+    def _verify_owned(self, session: dict) -> dict:
         if not session.get("owned"):
             raise HarnessError("scope.denied", "Terminal is not factory-owned")
         if session.get("core_identity") != self._core_identity():
@@ -619,6 +619,7 @@ class PiHarness:
             or labels.get("factory") != session["factory"]
         ):
             raise HarnessError("scope.denied", "Terminal ownership changed")
+        return terminal
 
     def interrupt(self, session: dict) -> dict:
         self._verify_owned(session)
@@ -627,9 +628,40 @@ class PiHarness:
         )
 
     def close(self, session: dict) -> None:
-        self._verify_owned(session)
-        self._hc(["kill", "--json", session["address"]], mutating=True)
+        terminal = self._verify_owned(session)
+        if terminal.get("state") != "finished":
+            self._hc(["kill", "--json", session["address"]], mutating=True)
         self._hc(["rm", "--json", session["address"]], mutating=True)
+
+    def owned_terminals(self) -> list[dict]:
+        """Core terminals carrying this factory's ownership labels.
+
+        Terminals without both a matching ``factory`` and an ``assignment``
+        label are never returned, so users' own sessions are untouchable.
+        """
+        name = self.config["name"]
+        value = self._hc(
+            ["ls", "--all", "--json", "--label", f"factory={name}"]
+        )
+        return [
+            terminal
+            for terminal in value.get("terminals", [])
+            if terminal.get("address")
+            and terminal.get("labels", {}).get("factory") == name
+            and terminal.get("labels", {}).get("assignment")
+        ]
+
+    def close_terminal(self, terminal: dict) -> None:
+        """Close a listed terminal after re-verifying its ownership labels."""
+        self.close(
+            {
+                "owned": True,
+                "address": terminal["address"],
+                "assignment_id": terminal["labels"]["assignment"],
+                "factory": self.config["name"],
+                "core_identity": self._core_identity(),
+            }
+        )
 
 
 def claude_config_path() -> Path:
@@ -1004,6 +1036,13 @@ class FixtureHarness:
         return {"outcome": "stopped", "fixture": True}
 
     def close(self, session: dict) -> None:
+        return None
+
+    def owned_terminals(self) -> list[dict]:
+        """Fixture sessions are simulated; there are no processes to reap."""
+        return []
+
+    def close_terminal(self, terminal: dict) -> None:
         return None
 
 

@@ -231,6 +231,10 @@ class ObservedHarness:
     def __init__(self, state="working"):
         self.current = state
         self.interrupted = False
+        self.closed = []
+
+    def close(self, session):
+        self.closed.append(session)
 
     def observe(self, session, assignment):
         return {"state": self.current}
@@ -262,6 +266,7 @@ def test_exhausted_recovery_quiesces_live_worker_before_deferral(tmp_path):
         )
         current = engine.state.get_work(work_id)
         assert harness.interrupted
+        assert harness.closed == [{"owned": True}]
         assert current["control"] == "deferred"
         assert current["current_run"] is None
         assert engine.state.get_run(run["id"])["state"] == "failed"
