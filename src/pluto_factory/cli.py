@@ -510,7 +510,9 @@ def _wizard(args: argparse.Namespace) -> bool:
             == "yes"
         )
     args.isolation = _choose(
-        "Isolation", ["required", "cooperative"], args.isolation
+        "Isolation (required = nono sandbox)",
+        ["required", "cooperative"],
+        args.isolation,
     )
     args.trust_repositories = (
         _ask(
@@ -883,7 +885,7 @@ def _setup(args: argparse.Namespace) -> dict:
         "notice": (
             "Cooperative execution does not enforce an OS sandbox."
             if config.isolation == "cooperative"
-            else "Required isolation must pass doctor before worker dispatch."
+            else "Workers run in a nono sandbox; run doctor to verify it."
         ),
     }
     close = getattr(state, "close", None)
@@ -948,15 +950,26 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
                 "passed": shutil.which(executable) is not None,
             }
         )
+    if config.isolation == "cooperative":
+        isolation = (
+            True,
+            "Explicit cooperative mode; workers are not sandboxed.",
+        )
+    else:
+        from .sandbox import check, profile_path
+
+        problem = check(config.sandbox.model_dump())
+        isolation = (
+            problem is None,
+            problem
+            or "Workers run in nono sandbox "
+            f"{profile_path(config.sandbox.model_dump())}.",
+        )
     checks.append(
         {
             "name": "execution-isolation",
-            "passed": config.isolation == "cooperative",
-            "detail": (
-                "Explicit cooperative mode; OS isolation is not implemented."
-                if config.isolation == "cooperative"
-                else "Required OS isolation is not implemented; dispatch is refused."
-            ),
+            "passed": isolation[0],
+            "detail": isolation[1],
         }
     )
     for repo in config.repositories:

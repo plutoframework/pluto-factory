@@ -1,0 +1,13 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "pluto-factory-sealed",
+    "description": "default + pathname AF_UNIX mediation: no host sockets (herdr, docker, dbus, ssh-agent...) unless granted"
+  },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  },
+  "workdir": {
+    "access": "read"
+  }
+}
