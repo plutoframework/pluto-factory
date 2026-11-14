@@ -77,15 +77,22 @@ def test_pi_launch_runs_inside_nono_with_scoped_grants(tmp_path, ready):
     # Credentials are injected outside; the launcher then execs nono.
     launcher = call.index("pluto_factory.worker_launcher")
     command = call[launcher + 2 :]
-    assert command[:2] == ["nono", "run"]
+    assert command[0] == "env"
+    folder = str(Path(item["assignment_path"]).parent)
+    assert command[1] == f"TMPDIR={folder}/tmp"
+    assert command[2:4] == ["nono", "run"]
     assert flags(command, "--profile") == [str(sandbox.PROFILE)]
     native = command[command.index("--") + 1 :]
     assert native[0] == str(ready)
     assert native[-1] == f"@{item['packet_path']}"
     write = set(flags(command, "--allow"))
     read = set(flags(command, "--read"))
-    folder = str(Path(item["assignment_path"]).parent)
-    assert {str(worktree), folder, item["session_dir"]} <= write
+    assert {
+        str(worktree),
+        folder,
+        f"{folder}/tmp",
+        item["session_dir"],
+    } <= write
     # Worktree admin folder is writable; shared git objects are read-only.
     assert str(main / ".git" / "worktrees" / "worktree") in write
     assert str(main / ".git") in read

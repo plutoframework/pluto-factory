@@ -139,6 +139,11 @@ def _pi_grants(read: list, write: list, files: list) -> None:
             read.append(Path(os.environ[key]).expanduser())
 
 
+def private_temporary(assignment: dict) -> Path:
+    """Per-worker TMPDIR: the profiles can create in /tmp but not list it."""
+    return Path(assignment["assignment_path"]).parent / "tmp"
+
+
 def grants(assignment: dict, agent: str, policy: dict) -> dict:
     read: list[Path] = [
         Path(sys.prefix),
@@ -149,6 +154,7 @@ def grants(assignment: dict, agent: str, policy: dict) -> dict:
     ]
     write: list[Path] = [
         Path(assignment["assignment_path"]).parent,
+        private_temporary(assignment),
         Path(assignment["session_dir"]),
     ]
     files: list[Path] = []
@@ -195,6 +201,8 @@ def wrap(
     """``nono run`` argv that executes ``native`` (argv[0] = agent name)."""
     allowed = grants(assignment, agent, policy)
     command = [
+        "env",
+        f"TMPDIR={private_temporary(assignment)}",
         "nono",
         "run",
         "--silent",
