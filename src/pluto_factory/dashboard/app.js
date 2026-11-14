@@ -36,7 +36,8 @@
     return parent;
   }
   function human(value) {
-    return String(value || "Unknown").replaceAll("_", " ").replace(/^./, c => c.toUpperCase());
+    const text = String(value || "Unknown").replaceAll("_", " ");
+    return text === "qa" ? "QA" : text.replace(/^./, c => c.toUpperCase());
   }
   function roleName(value) {
     return { implementer: "Implementation agent", reviewer: "Review agent", qa: "QA agent" }[value] || human(value);
@@ -388,7 +389,7 @@
       if (item.source_url) meta.append(node("span", "", "From issue"));
       if (item.pr_links?.length) meta.append(node("span", "", `${item.pr_links.length} pull ${item.pr_links.length === 1 ? "request" : "requests"}`));
       if (meta.childNodes.length) button.append(meta);
-      button.addEventListener("click", () => selectWork(item.id));
+      button.addEventListener("click", () => { selectWork(item.id); revealDetail(); });
       button.addEventListener("keydown", queueKeyboard);
       const wrapper = node("div", "work-list-item");
       wrapper.setAttribute("role", "listitem");
@@ -660,7 +661,11 @@
       select.id = "output-selection";
       select.dataset.focusKey = "output-selection";
       evidence.forEach(item => {
-        const option = node("option", "", `${item.repository || human(item.kind)}: ${commandText(item)}`);
+        // Short labels fit phones; the full command is shown under Checks.
+        const label = [item.repository, item.kind && human(item.kind), profileText(item.environment)]
+          .filter(Boolean).join(" · ");
+        const option = node("option", "", label || commandText(item));
+        option.title = commandText(item);
         option.value = item.id;
         option.selected = item.id === selected.id;
         select.append(option);
@@ -672,6 +677,7 @@
       if (selected.stderr) content.push(logBlock("Standard error", selected.stderr, `${selected.id}:stderr`, "stderr"));
     } else content.push(node("p", "body-copy", "No command output has been recorded for this task."));
     const terminal = section("Worker terminal");
+    terminal.classList.add("terminal-section");
     const capture = node("button", "button button-small", state.terminalPending.has(key) ? "Capturing…" : "Capture terminal");
     capture.type = "button";
     capture.setAttribute("aria-disabled", String(state.terminalPending.has(key)));
@@ -750,7 +756,11 @@
         ? "The selected task changed. Its current state will be loaded on the next refresh."
         : error.message;
     } finally {
-      if (sequence === state.detailSequence) { state.detailPending = false; renderDetail(); }
+      if (sequence === state.detailSequence) {
+        state.detailPending = false; renderDetail();
+        // Re-align once loaded content settles the layout.
+        if (state.revealPending) { state.revealPending = false; revealDetail("auto"); }
+      }
     }
   }
   function selectFactory(id) {
@@ -765,6 +775,20 @@
     state.workId = id; state.detail = null; state.detailError = null;
     state.lastPanelSignature = null;
     renderQueue(); renderPipeline(); renderDetail(true); loadDetail();
+  }
+  // On narrow screens the detail renders below the queue; follow the tap.
+  const compactLayout = window.matchMedia("(max-width: 680px)");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  function scrollBehavior() { return reducedMotion.matches ? "auto" : "smooth"; }
+  function revealDetail(behavior = scrollBehavior()) {
+    if (!compactLayout.matches || state.expanded) return;
+    state.revealPending = state.detailPending;
+    $("#detail-pane").scrollIntoView({ behavior, block: "start" });
+  }
+  function returnToQueue() {
+    const row = $('.work-row[aria-current="true"]') || $("#work-list");
+    row.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
+    if (row.matches(".work-row")) row.focus({ preventScroll: true });
   }
   function changeTab(tab, focus = false) {
     if (tab === state.tab) return;
@@ -819,6 +843,7 @@
     });
   });
   $("#expand-task").addEventListener("click", () => setTaskExpanded(!state.expanded));
+  $("#back-to-queue").addEventListener("click", returnToQueue);
   document.addEventListener("keydown", event => {
     if (event.key === "Escape" && state.expanded) {
       event.preventDefault();
