@@ -110,6 +110,12 @@ def parser() -> argparse.ArgumentParser:
         help="Trust project guidance in registered repositories for each run",
     )
     setup.add_argument(
+        "--dangerously-skip-permissions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Claude workers bypass all permission checks",
+    )
+    setup.add_argument(
         "--integration", choices=["managed", "github"], default="managed"
     )
     setup.add_argument(
@@ -321,6 +327,7 @@ def _apply_master(args: argparse.Namespace) -> dict:
         "coordinator": "coordinator",
         "isolation": "isolation",
         "trust_repositories": "trust_registered_repositories",
+        "dangerously_skip_permissions": "dangerously_skip_permissions",
         "auth": "auth_mode",
         "api_key_env": "api_key_env",
         "herdr_space": "herdr_space",
@@ -513,6 +520,14 @@ def _wizard(args: argparse.Namespace) -> bool:
         == "yes"
     )
     if claude:
+        args.dangerously_skip_permissions = (
+            _ask(
+                "Let Claude workers skip all permission checks "
+                "(dangerous) [yes/no]",
+                "yes" if args.dangerously_skip_permissions else "no",
+            ).lower()
+            == "yes"
+        )
         if args.auth == "codex":
             args.auth = "existing"
         args.auth = _choose(
@@ -676,6 +691,7 @@ def _setup(args: argparse.Namespace) -> dict:
             "coordinator": "coordinator",
             "isolation": "isolation",
             "trust_repositories": "trust_registered_repositories",
+            "dangerously_skip_permissions": "dangerously_skip_permissions",
             "auth": "auth_mode",
             "api_key_env": "api_key_env",
             "herdr_space": "herdr_space",
@@ -740,6 +756,7 @@ def _setup(args: argparse.Namespace) -> dict:
             api_key_env=args.api_key_env,
             isolation=args.isolation,
             trust_registered_repositories=args.trust_repositories,
+            dangerously_skip_permissions=args.dangerously_skip_permissions,
             herdr_space=args.herdr_space,
             slack_webhook_env=args.slack_webhook_env,
             max_recoveries=args.max_recoveries,

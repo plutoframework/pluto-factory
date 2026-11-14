@@ -216,6 +216,19 @@ Typed reports use a per-assignment `factory_report` MCP server and hooks from
 `--permission-mode dontAsk` and a role-scoped tool allowlist;
 `--trust-repositories` also loads project and local Claude settings. Claude
 sessions cannot rebind to a revision, so each revision starts a fresh session.
+
+New worktrees never stop at Claude's "trust this folder" dialog: the factory
+pre-accepts it in Claude's config (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR`),
+keyed by each repository's main checkout so one entry covers all of its
+worktrees. Accepting the dialog loads no project settings by itself; those
+still need `--trust-repositories`.
+
+`dangerously_skip_permissions = true` (setup `--dangerously-skip-permissions`)
+runs Claude workers with `--dangerously-skip-permissions` instead of
+`dontAsk`, so no tool call is denied or prompted, including edits in other
+assigned worktrees. The role's tool allowlist still limits which tools exist;
+the one-time bypass warning is pre-accepted in the worker's own settings file.
+Use it only for repositories and tasks you trust.
 The coordinator model is configured separately (`coordinator_model`). With
 `--harness claude`, setup defaults the coordinator to the Claude Agent SDK
 runtime (below) so one Claude subscription covers the whole factory.

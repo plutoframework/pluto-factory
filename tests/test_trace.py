@@ -181,3 +181,37 @@ def test_trace_without_debug_is_actionable(tmp_path, capsys):
     home, _ = prepare_demo(tmp_path / "none")
     assert main(["trace", "--home", str(home)]) == 1
     assert "[debug]" in capsys.readouterr().err
+
+
+def test_ingest_namespaces_worker_fields_that_collide(tmp_path):
+    config = FactoryConfig(
+        name="t",
+        repositories=[Repository(name="a", path=str(tmp_path))],
+        debug=DebugPolicy(enabled=True),
+    )
+    tracer = Tracer(tmp_path, config)
+    raw = tmp_path / "trace.raw.jsonl"
+    events = [
+        {"ts": 1.0, "kind": "session.start", "source": "startup"},
+        {"ts": 2.0, "kind": "tool", "tool": "Bash", "role": "x", "run_id": "y"},
+    ]
+    raw.write_text("".join(json.dumps(event) + "\n" for event in events))
+    run = {
+        "id": "run-1",
+        "work_id": "work-1",
+        "role": "implementer",
+        "assignment": {"trace": {"path": str(raw)}},
+    }
+    tracer.ingest(run)
+    records = [
+        json.loads(line)
+        for line in trace_path(tmp_path, "work-1").read_text().splitlines()
+    ]
+    start = next(r for r in records if r["kind"] == "session.start")
+    assert start["source"] == "worker"
+    assert start["event_source"] == "startup"
+    tool = next(r for r in records if r["kind"] == "tool")
+    assert (tool["role"], tool["run_id"]) == ("implementer", "run-1")
+    assert (tool["event_role"], tool["event_run_id"]) == ("x", "y")
+    tracer.ingest(run)
+    assert len(trace_path(tmp_path, "work-1").read_text().splitlines()) == 2

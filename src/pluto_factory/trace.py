@@ -75,6 +75,9 @@ def trace_path(home: Path, work_id: str) -> Path:
     return home / "logs" / "trace" / f"{safe}.jsonl"
 
 
+RESERVED_FIELDS = ("work_id", "source", "run_id", "role")
+
+
 def worker_event(assignment: dict, kind: str, **data) -> None:
     """Append a raw worker event when the assignment enables tracing."""
     settings = assignment.get("trace")
@@ -346,6 +349,11 @@ class Tracer:
             except ValueError:
                 continue
             kind = event.pop("kind", "worker.event")
+            # Worker payloads may carry their own envelope-like fields (for
+            # example Claude hooks' session "source"); keep them namespaced.
+            for reserved in RESERVED_FIELDS:
+                if reserved in event:
+                    event[f"event_{reserved}"] = event.pop(reserved)
             self.write(
                 run["work_id"],
                 kind,

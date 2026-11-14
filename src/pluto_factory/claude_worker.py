@@ -262,7 +262,9 @@ def _trace_hook(assignment: dict, event: str, payload: dict) -> None:
         )
 
 
-def hook_settings(python: str, trace: bool = False) -> dict:
+def hook_settings(
+    python: str, trace: bool = False, skip_permissions: bool = False
+) -> dict:
     import shlex
 
     def command(event: str) -> list[dict]:
@@ -280,7 +282,11 @@ def hook_settings(python: str, trace: bool = False) -> dict:
     )
     if trace:
         events += ("PostToolUse", "PostToolUseFailure")
-    return {"hooks": {event: command(event) for event in events}}
+    settings = {"hooks": {event: command(event) for event in events}}
+    if skip_permissions:
+        # Pre-accept the one-time bypass warning that would block a worker.
+        settings["skipDangerousModePermissionPrompt"] = True
+    return settings
 
 
 def mcp_config(python: str, assignment_path: Path) -> dict:

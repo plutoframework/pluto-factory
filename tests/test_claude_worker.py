@@ -205,3 +205,102 @@ def test_hooks_track_start_and_require_report(tmp_path):
     assert hook(item, "Stop", {}) is None
     status = json.loads(Path(item["status_path"]).read_text())
     assert status["state"] == "settled"
+
+
+def _claude_config(folder):
+    return json.loads((folder / ".claude.json").read_text())
+
+
+def test_trusted_launch_pre_accepts_workspace_trust(
+    tmp_path, isolated_claude_config
+):
+    path = isolated_claude_config / ".claude.json"
+    path.write_text(
+        json.dumps({"keep": 1, "projects": {"/other": {"x": True}}})
+    )
+    path.chmod(0o600)
+    item, _session, _call = launch(tmp_path, trust_registered_repositories=True)
+    data = _claude_config(isolated_claude_config)
+    directory = str(Path(item["directory"]).resolve())
+    assert data["projects"][directory]["hasTrustDialogAccepted"] is True
+    assert data["keep"] == 1
+    assert data["projects"]["/other"] == {"x": True}
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_default_launch_trusts_folder_without_project_settings(
+    tmp_path, isolated_claude_config
+):
+    item, _, call = launch(tmp_path)
+    projects = _claude_config(isolated_claude_config)["projects"]
+    target = str(Path(item["directory"]).resolve())
+    assert projects[target]["hasTrustDialogAccepted"] is True
+    native = call[call.index("claude") :]
+    assert native[native.index("--setting-sources") + 1] == "user"
+    assert native[native.index("--permission-mode") + 1] == "dontAsk"
+    assert "--dangerously-skip-permissions" not in native
+
+
+def test_skip_permissions_bypasses_checks_and_preaccepts_warning(
+    tmp_path, isolated_claude_config
+):
+    item, _, call = launch(tmp_path, dangerously_skip_permissions=True)
+    native = call[call.index("claude") :]
+    assert "--dangerously-skip-permissions" in native
+    assert "--permission-mode" not in native
+    # The tool set stays restricted even when checks are bypassed.
+    assert "--tools" in native
+    settings = json.loads(
+        (
+            Path(item["assignment_path"]).parent / "claude-settings.json"
+        ).read_text()
+    )
+    assert settings["skipDangerousModePermissionPrompt"] is True
+    assert "PreToolUse" in settings["hooks"]
+
+
+def test_default_settings_keep_bypass_warning():
+    settings = claude_worker.hook_settings("python")
+    assert "skipDangerousModePermissionPrompt" not in settings
+
+
+def test_trust_covers_git_worktree_main_repository(
+    tmp_path, isolated_claude_config
+):
+    import subprocess
+
+    from pluto_factory.harness import trust_claude_workspaces
+
+    main = tmp_path / "managed"
+    main.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "-C", str(main), "init", "-q"], check=True)
+    subprocess.run(
+        [*git, "-C", str(main), "commit", "-q", "--allow-empty", "-m", "i"],
+        check=True,
+    )
+    worktree = tmp_path / "worktree"
+    subprocess.run(
+        [*git, "-C", str(main), "worktree", "add", "-q", str(worktree)],
+        check=True,
+    )
+    trust_claude_workspaces([str(worktree)])
+    projects = _claude_config(isolated_claude_config)["projects"]
+    # Trusting the main repository covers all of its worktrees, so new
+    # worktrees add no config entries.
+    assert projects[str(main.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(worktree.resolve()) not in projects
+    before = (isolated_claude_config / ".claude.json").stat().st_mtime_ns
+    trust_claude_workspaces([str(worktree)])
+    after = (isolated_claude_config / ".claude.json").stat().st_mtime_ns
+    assert before == after
+
+
+def test_unreadable_claude_config_blocks_launch(
+    tmp_path, isolated_claude_config
+):
+    (isolated_claude_config / ".claude.json").write_text("{not json")
+    with pytest.raises(HarnessError) as error:
+        launch(tmp_path, trust_registered_repositories=True)
+    assert error.value.failure["code"] == "harness.trust_failed"
+    assert (isolated_claude_config / ".claude.json").read_text() == "{not json"
