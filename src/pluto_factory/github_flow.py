@@ -20,6 +20,7 @@ class GitHubFlow:
         self.state = state
         self.config = config
         self.adapter = GitHubAdapter(state.home, config)
+        self.adapter._state = state
 
     def poll(self, *, force=False):
         row = self.state.db.execute(
@@ -191,8 +192,22 @@ class GitHubFlow:
             return
         status = result["state"]
         if status == "changes_requested":
+            reviewed = any(
+                pr.get("review_decision") == "CHANGES_REQUESTED"
+                for pr in result["pull_requests"]
+            )
+            if not reviewed:
+                # Failing checks only: the PR tracker owns CI repair (bounded
+                # per head SHA, with the failure log) and revises this work.
+                self.state.update_work(
+                    work["id"],
+                    data=data,
+                    control="backoff",
+                    wake_at=time.time() + self.config.github_poll_seconds,
+                )
+                return
             work = self.state.update_work(work["id"], data=data)
-            revise(work, "GitHub review or checks require changes")
+            revise(work, "GitHub review requires changes")
             return
         if status == "closed":
             defer(work, "A required pull request was closed without merging")

@@ -262,6 +262,7 @@ def test_pr_adapter_propagates_typed_no_changes_without_runtime_side_effects(
         ),
         runner=rejected,
     )
+    adapter._creating = True  # only the tracked publication path sets this
     with pytest.raises(GitHubFailure) as error:
         adapter._run(["gh", "pr", "create"], mutating=True)
     assert error.value.code == "github.no_changes"

@@ -11,6 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from .attention import fill_number, record_intent
 from .config import atomic_json
 from .dependencies import DependencyError, source_key
 from .github_checks import merge_check_status
@@ -40,6 +41,7 @@ class GitHubAdapter:
         repositories = workable_repositories(config)
         self.repositories = {repo.name: repo for repo in repositories}
         self._state = None
+        self._creating = False
         self.github = {}
         for repo in repositories:
             slug = getattr(repo, "github", "")
@@ -49,6 +51,11 @@ class GitHubAdapter:
                 self.github[repo.name] = slug
 
     def _run(self, argv, *, cwd=None, mutating=False, acceptable=(0,)):
+        if list(argv[:3]) == ["gh", "pr", "create"] and not self._creating:
+            raise GitHubFailure(
+                "tracking.required",
+                "PRs open only through the tracked publication path",
+            )
         environment = os.environ.copy()
         environment.update(
             {
@@ -591,13 +598,30 @@ class GitHubAdapter:
             existing = self._discover(
                 slug, branch, entry["default_branch"], marker
             )
+            # The tracker row is written before any PR can exist; the number
+            # and URL are filled in afterwards (or adopted after a crash).
+            intent = record_intent(
+                self.ledger,
+                slug,
+                branch,
+                entry["default_branch"],
+                candidate,
+                work["id"],
+                entry["name"],
+                work.get("title") or "",
+            )
             if (
                 existing
                 and existing.get("merged_at")
                 and existing["head"]["sha"] == candidate
             ):
                 published.append(
-                    self._pr_record(entry["name"], slug, existing, candidate)
+                    self._track(
+                        intent,
+                        self._pr_record(
+                            entry["name"], slug, existing, candidate
+                        ),
+                    )
                 )
                 continue
             if (
@@ -706,25 +730,36 @@ class GitHubAdapter:
                     entry["name"], slug, existing, candidate
                 )
             else:
-                result = self._run(
-                    [
-                        "gh",
-                        "pr",
-                        "create",
-                        "--repo",
-                        slug,
-                        "--base",
-                        entry["default_branch"],
-                        "--head",
-                        branch,
-                        "--title",
-                        title,
-                        "--body-file",
-                        str(body),
-                        "--no-maintainer-edit",
-                    ],
-                    mutating=True,
-                )
+                if not self.ledger.db.execute(
+                    "SELECT 1 FROM pull_requests WHERE id=?", (intent,)
+                ).fetchone():
+                    raise GitHubFailure(
+                        "tracking.required",
+                        "Refusing to open a PR without a tracker row",
+                    )
+                self._creating = True
+                try:
+                    result = self._run(
+                        [
+                            "gh",
+                            "pr",
+                            "create",
+                            "--repo",
+                            slug,
+                            "--base",
+                            entry["default_branch"],
+                            "--head",
+                            branch,
+                            "--title",
+                            title,
+                            "--body-file",
+                            str(body),
+                            "--no-maintainer-edit",
+                        ],
+                        mutating=True,
+                    )
+                finally:
+                    self._creating = False
                 match = re.fullmatch(
                     rf"https://github\.com/{re.escape(slug)}/pull/(\d+)",
                     result.stdout.strip(),
@@ -745,6 +780,7 @@ class GitHubAdapter:
                     "base": entry["default_branch"],
                     "state": "open",
                 }
+            pull_request = self._track(intent, pull_request)
             record["repositories"][entry["name"]].update(
                 {
                     "state": "published",
@@ -754,6 +790,86 @@ class GitHubAdapter:
             atomic_json(path, record)
             published.append(pull_request)
         return published
+
+    def fetch_pr_head(self, entry, slug, branch, number):
+        """Fetch a PR branch into the managed clone; returns its tip."""
+        _, managed, _ = self._entry(entry)
+        ref = f"refs/remotes/factory/pr-{number}"
+        self._git(
+            managed,
+            "fetch",
+            "--no-tags",
+            "--",
+            f"https://github.com/{slug}.git",
+            f"+refs/heads/{branch}:{ref}",
+            mutating=True,
+        )
+        return self._text(managed, "rev-parse", ref)
+
+    def push_repair(self, entry, slug, branch, expected_head):
+        """Fast-forward a PR branch to the repaired candidate.
+
+        Only the factory pushes. The remote must still be at the head the
+        repair started from (lease), and the candidate must descend from it.
+        """
+        _, managed, _ = self._entry(entry)
+        candidate = entry["candidate"]
+        if not REVISION.fullmatch(candidate) or not REVISION.fullmatch(
+            expected_head
+        ):
+            raise GitHubFailure("scope.denied", "Invalid repair identity")
+        self._git(managed, "check-ref-format", "--branch", branch)
+        remote = f"https://github.com/{slug}.git"
+        ref = f"refs/heads/{branch}"
+        observed = self._text(managed, "ls-remote", "--heads", remote, ref)
+        remote_head = observed.split()[0] if observed else ""
+        if remote_head != expected_head:
+            raise GitHubFailure(
+                "github.head_changed",
+                "PR branch moved while it was being repaired",
+            )
+        ancestor = self._git(
+            managed,
+            "merge-base",
+            "--is-ancestor",
+            expected_head,
+            candidate,
+            acceptable=(0, 1),
+        )
+        if ancestor.returncode:
+            raise GitHubFailure(
+                "github.head_changed", "Repair does not extend the PR head"
+            )
+        self._git(
+            managed,
+            "push",
+            f"--force-with-lease={ref}:{expected_head}",
+            "--",
+            remote,
+            f"{candidate}:{ref}",
+            mutating=True,
+        )
+        return candidate
+
+    @property
+    def ledger(self):
+        """The factory ledger that holds tracker rows (opened on demand)."""
+        if self._state is None:
+            from .state import State
+
+            self._state = State(self.home)
+        return self._state
+
+    def _track(self, intent, pull_request):
+        """Complete the tracker row for an opened or adopted PR."""
+        fill_number(
+            self.ledger,
+            intent,
+            pull_request["number"],
+            pull_request["url"],
+            pull_request.get("head"),
+        )
+        return pull_request
 
     def _pr_scope(self, pull_request):
         name = pull_request.get("repository")
