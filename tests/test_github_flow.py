@@ -811,3 +811,60 @@ def test_watcher_stays_available_with_empty_queue(tmp_path):
     assert time.monotonic() - started >= 0.02
     assert result["work"] == []
     engine.state.close()
+
+
+def test_issue_edit_is_recorded_once_and_surfaced_once(tmp_path):
+    _, state, config = setup(tmp_path)
+    flow = GitHubFlow(state, config)
+    flow.adapter = SimpleNamespace(poll=lambda: [submission()])
+    flow.poll(force=True)
+    edited = submission().model_copy(
+        update={"title": "Renamed", "acceptance": ["Other"]}
+    )
+    flow.adapter = SimpleNamespace(poll=lambda: [edited])
+    for _ in range(5):
+        flow.poll(force=True)
+    kinds = [e["kind"] for e in state.inspect()["events"]]
+    assert kinds.count("intake.issue_changed") == 1
+    work = state.list_work()[0]
+    assert work["payload"]["title"] == "Issue"
+    change = work["data"]["issue_change"]
+    assert set(change["changed"]) == {"title", "acceptance"}
+    assert change["observed"]["title"] == "Renamed"
+    # a further distinct edit fires again
+    edited2 = edited.model_copy(update={"title": "Renamed again"})
+    flow.adapter = SimpleNamespace(poll=lambda: [edited2])
+    flow.poll(force=True)
+    flow.poll(force=True)
+    kinds = [e["kind"] for e in state.inspect()["events"]]
+    assert kinds.count("intake.issue_changed") == 2
+    state.close()
+
+
+@pytest.mark.parametrize(
+    ("merge_state", "require", "resyncs"),
+    [("DIRTY", False, 1), ("BEHIND", False, 0), ("BEHIND", True, 1)],
+)
+def test_dirty_or_behind_pr_triggers_resync(
+    tmp_path, merge_state, require, resyncs
+):
+    _, state, config = setup(tmp_path)
+    config.github_require_up_to_date = require
+    work = merged_work(state, config)
+    flow = GitHubFlow(state, config)
+    pr = {"repository": "core", "state": "open", "merge_state": merge_state}
+    flow.adapter = SimpleNamespace(
+        poll_pull_requests=lambda _prs: {
+            "state": "open",
+            "pull_requests": [pr],
+        }
+    )
+    calls = []
+    flow.advance(
+        work,
+        lambda *_: None,
+        lambda *_: None,
+        resync=lambda item, stale: calls.append(stale),
+    )
+    assert len(calls) == resyncs
+    state.close()

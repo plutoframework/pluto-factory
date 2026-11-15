@@ -7,7 +7,12 @@ from threading import Event
 
 from pydantic import ValidationError
 
-from .acceptance import acceptance_intent, current_evidence
+from .acceptance import (
+    AcceptanceContractError,
+    acceptance_intent,
+    citable_ids,
+    current_evidence,
+)
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
 from .git import GitFailure, GitWorkspace
@@ -17,6 +22,7 @@ from .improvements import propose
 from .models import Failure, WorkerReport
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
+from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
@@ -24,6 +30,8 @@ from .trace import Tracer
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
 REAP_INTERVAL_SECONDS = 300
+# Times the coordinator is re-asked with the validation error before deferring.
+CONTRACT_RETRIES = 2
 GUIDANCE_AUTHORITY = (
     "AUTHORITATIVE human decision. It overrides prior conclusions, "
     "reports and deferrals. Follow it, or report precisely why it cannot "
@@ -49,6 +57,56 @@ def orphaned_terminals(terminals, work_items, factory):
         and terminal.get("labels", {}).get("assignment")
         and terminal["labels"]["assignment"] not in active
     ]
+
+
+EVIDENCE_FULL = 3
+EVIDENCE_TEXT_LIMIT = 2000
+EVIDENCE_SUMMARY_KEYS = (
+    "kind",
+    "passed",
+    "exit_code",
+    "command",
+    "repository",
+    "seconds",
+    "timed_out",
+    "artifact",
+)
+
+
+def _clip(text, limit=EVIDENCE_TEXT_LIMIT):
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    return f"[{len(text) - limit} earlier chars omitted]\n" + text[-limit:]
+
+
+def bound_evidence(items):
+    """Keep the newest evidence in full and older rows as pointers.
+
+    Items arrive newest first. Full rows clip large output text to its tail;
+    older rows keep only identifying fields plus their ``artifact`` path, so
+    the packet stops growing with every revision.
+    """
+    bounded = []
+    for index, item in enumerate(items):
+        if index < EVIDENCE_FULL:
+            row = {
+                key: _clip(value) if key in {"stdout", "stderr"} else value
+                for key, value in item.items()
+            }
+        else:
+            row = {k: item[k] for k in EVIDENCE_SUMMARY_KEYS if k in item}
+            if "report" in item:
+                report = item["report"]
+                row["report_summary"] = (
+                    {k: report[k] for k in ("status", "summary") if k in report}
+                    if isinstance(report, dict)
+                    else None
+                )
+            row["summarized"] = (
+                "Older evidence; full output is in the artifact file."
+            )
+        bounded.append(row)
+    return bounded
 
 
 class Engine:
@@ -80,6 +138,16 @@ class Engine:
             return False
         return self.state.dependency_status(work["id"])["ready"]
 
+    def _limited(self):
+        """True while a provider limit holds back new dispatches."""
+        until = self.state.rate_limited_until()
+        if not until:
+            return False
+        if until > time.time():
+            return True
+        self.state.clear_rate_limit()
+        return False
+
     def tick(self):
         if self.state.is_paused():
             return False
@@ -89,7 +157,10 @@ class Engine:
             for work in work_items
             if self._ready(work) and work["current_run"]
         ]
-        ready = active or [work for work in work_items if self._ready(work)]
+        if self._limited():
+            ready = active
+        else:
+            ready = active or [work for work in work_items if self._ready(work)]
         if not ready:
             return False
         work = ready[0]
@@ -102,6 +173,8 @@ class Engine:
         except HarnessError as error:
             self._failure(work["id"], Failure.model_validate(error.failure))
         except (GitFailure, GitHubFailure) as error:
+            if self._conflict_revision(work, error):
+                return True
             self._failure(
                 work["id"],
                 Failure(
@@ -167,6 +240,9 @@ class Engine:
                         for item in pending
                         if item["wake_at"] > time.time()
                     ]
+                    until = self.state.rate_limited_until()
+                    if until > time.time():
+                        future.append(until)
                     if not future and not watching:
                         break
                     delay = (
@@ -231,6 +307,18 @@ class Engine:
             if role == "implementer":
                 notes = self._synchronize_for_dispatch(work)
                 work = self.state.get_work(work["id"])
+                pending = work["data"].get("conflict_revision")
+                if notes is None and pending:
+                    # The merge is already prepared in the worktree.
+                    notes = {
+                        "default_branch_merged": [],
+                        "merge_conflict": pending["summary"],
+                        "guidance": (
+                            "This is a conflict-only revision: resolve the "
+                            "prepared merge with the new default branch and "
+                            "change nothing else."
+                        ),
+                    }
             self._dispatch(work, role, notes)
         elif phase == "checking":
             operation = self.state.begin_operation(work_id, "git.snapshot", {})
@@ -238,6 +326,9 @@ class Engine:
                 data["entries"], data.get("workspace_id", work_id)
             )
             self.state.finish_operation(operation, {"entries": data["entries"]})
+            # Persist the snapshot (the factory's merge commit) before
+            # synchronizing: a new conflict must not lose it.
+            self.state.update_work(work_id, data=data)
             if not self._synchronize(work_id, data, None):
                 self.state.update_work(work_id, data=data)
             self._validate(work_id, "checks", "reviewing")
@@ -255,9 +346,66 @@ class Engine:
                 reassess=lambda item: reassess_merged(self, item),
                 confirm=lambda item: confirm_merged(self, item),
                 revalidate=lambda item: revalidate_merged(self, item),
+                resync=self._resync_pull_requests,
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
+
+    def _resync_pull_requests(self, work, stale):
+        """Bring a published candidate up to date with the default branch.
+
+        A PR GitHub reports as DIRTY (or BEHIND where up-to-date branches are
+        required) never gets checks. Merge the default branch into the
+        candidate: a conflict raises ``git.conflict`` (routed to a conflict
+        revision by ``tick``); a clean merge restarts validation and the
+        republish pushes the new head to the PR branch. Bounded per item.
+        """
+        work_id = work["id"]
+        data = work["data"]
+        states = {pr["repository"]: pr.get("merge_state") for pr in stale}
+        used = data.get("pr_resyncs", 0)
+        if used >= self.config.github_max_resyncs:
+            self._defer(
+                work,
+                f"Pull request still {states} after {used} default-branch "
+                "syncs; manual resolution needed",
+            )
+            return
+        self.github.adapter.refresh_defaults(data["entries"])
+        try:
+            entries, changed = self.git.sync(data["entries"], strict=True)
+        except GitFailure as error:
+            if error.code == "git.conflict":
+                data["pr_resyncs"] = used + 1
+                self.state.update_work(
+                    work_id,
+                    data=data,
+                    event="pull_requests.resync_conflict",
+                )
+            raise
+        if not changed:
+            # The candidate already contains the default branch; GitHub's
+            # mergeability is stale or needs a human. Keep polling.
+            self.state.update_work(
+                work_id,
+                data=data,
+                control="backoff",
+                wake_at=time.time() + self.config.github_poll_seconds,
+                event="pull_requests.resync_noop",
+            )
+            return
+        data["entries"] = entries
+        data["pr_resyncs"] = used + 1
+        data.pop("checks_candidate", None)
+        data.pop("qa_candidate", None)
+        self.state.update_work(
+            work_id,
+            phase="checking",
+            control="ready",
+            wake_at=0,
+            data=data,
+            event="pull_requests.resynced",
+        )
 
     def _synchronize(self, work_id, data, unchanged_phase):
         """Merge an advanced default branch into the candidate.
@@ -279,6 +427,85 @@ class Engine:
             )
         return changed
 
+    def _reconcile_worktree(self, work):
+        """Commit partial edits an interrupted run left in the worktree.
+
+        Retrying cannot change a dirty candidate, so the factory records the
+        edits as an increment before the next implementer starts. Returns the
+        repository names that were snapshotted.
+        """
+        data = work["data"]
+        pending = self.git.unrecorded(data["entries"])
+        if not pending:
+            return []
+        try:
+            self._refresh_candidate(work)
+        except GitFailure as error:
+            if error.code != "git.conflict":
+                raise
+            # Unresolved merge: the next implementer resolves it.
+            return []
+        self.state.update_work(
+            work["id"], data=data, event="candidate.reconciled"
+        )
+        return pending
+
+    def _conflict_revision(self, work, error):
+        """Route a default-branch merge conflict in any phase to a revision.
+
+        Finished work must not be deferred because the default branch moved:
+        the merge is already prepared in the worktree, so the implementer
+        resolves it and the candidate is re-validated. Accepted evidence and
+        reports stay; the revision is flagged so reviewers focus on the merge.
+        Conflict revisions do not consume the revision budget.
+        """
+        if (
+            not isinstance(error, GitFailure)
+            or error.code != "git.conflict"
+            or not error.paths
+            or work["phase"] in {"queued", "implementing"}
+            or work["current_run"]
+        ):
+            return False
+        try:
+            fresh = self.state.get_work(work["id"])
+            data = fresh["data"]
+            data["revision_reason"] = (
+                "Resolve merge conflicts with the new default branch: "
+                + ", ".join(error.paths)
+            )
+            data["conflict_revision"] = {
+                "paths": error.paths,
+                "summary": error.summary,
+                "from_phase": work["phase"],
+            }
+            data.pop("checks_candidate", None)
+            data.pop("qa_candidate", None)
+            # The resolved candidate is new: earlier acceptance and
+            # publication describe the old one and must be earned again.
+            for key in (
+                "acceptance_decision",
+                "acceptance_candidate",
+                "acceptance_config_digest",
+            ):
+                data.pop(key, None)
+            if not any(
+                pr.get("state") == "merged"
+                for pr in data.get("pull_requests", [])
+            ):
+                data.pop("publication_acceptance", None)
+            self.state.update_work(
+                work["id"],
+                phase="implementing",
+                control="ready",
+                current_run=None,
+                data=data,
+                event="work.conflict_revision_requested",
+            )
+        except StateConflict:
+            self.state.event("operation.superseded", work["id"], {})
+        return True
+
     def _synchronize_for_dispatch(self, work):
         """Merge the latest default branch before an implementer starts.
 
@@ -289,6 +516,7 @@ class Engine:
         work_id = work["id"]
         data = work["data"]
         before = {entry["name"]: entry["base"] for entry in data["entries"]}
+        salvaged = self._reconcile_worktree(work)
         if self.github:
             self.github.adapter.refresh_defaults(data["entries"])
         conflict = None
@@ -307,18 +535,29 @@ class Engine:
             for entry in data["entries"]
             if entry["base"] != before[entry["name"]]
         ]
-        if not (merged or conflict):
+        if not (merged or conflict or salvaged):
             return None
-        notes = {
-            "default_branch_merged": merged,
-            "guidance": (
+        notes = {}
+        if salvaged:
+            notes["previous_run_interrupted"] = {
+                "committed_partial_work": salvaged,
+                "guidance": (
+                    "The previous implementer run was interrupted or failed "
+                    "and left edits in the worktree. The factory committed "
+                    "them as an increment in the listed repositories. They "
+                    "may be incomplete or broken: review the committed "
+                    "diff, continue from it, and do not start over."
+                ),
+            }
+        if merged or conflict:
+            notes["default_branch_merged"] = merged
+            notes["guidance"] = (
                 "The latest default branch was merged into your candidate "
                 "worktree since earlier work or runs. Repository docs "
                 "(AGENTS.md, README, contributing guides) and code may have "
                 "changed: re-read them before continuing, and re-check "
                 "earlier conclusions, since problems may already be fixed."
-            ),
-        }
+            )
         if conflict:
             notes["merge_conflict"] = conflict
         return notes
@@ -403,7 +642,10 @@ class Engine:
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
-            "evidence": [json.loads(row["data"]) for row in evidence],
+            "conflict_revision": work["data"].get("conflict_revision"),
+            "evidence": bound_evidence(
+                [json.loads(row["data"]) for row in evidence]
+            ),
             "qa_guidance": bundle["qa_guidance"],
             "report_contract": WorkerReport.model_json_schema(),
         }
@@ -531,6 +773,13 @@ class Engine:
             return
         self._service_checks(work, run)
         observation = self.harness.observe(run["session"], assignment)
+        if (observation.get("failure") or {}).get("code") in {
+            "harness.error",
+            "harness.exited",
+        }:
+            limited = self._worker_limit(run)
+            if limited:
+                observation["failure"] = limited.model_dump()
         self.tracer.ingest(run)
         if observation.get("failure") or observation["state"] in {
             "settled",
@@ -568,13 +817,14 @@ class Engine:
             ):
                 self._failure(
                     work["id"],
-                    Failure(
+                    self._worker_limit(run)
+                    or Failure(
                         code="report.missing",
                         summary="Worker settled without a valid report",
                         source="runtime",
                     ),
                 )
-        elif time.time() - run["created"] > self.config.phase_timeout_seconds:
+        elif time.time() - run["created"] > self._phase_timeout(work):
             self._failure(
                 work["id"],
                 Failure(
@@ -584,7 +834,34 @@ class Engine:
                 ),
             )
 
-    def _decide(self, work, allowed, preferred, report=None, evaluation=None):
+    def _worker_limit(self, run):
+        """A provider limit recorded at the end of the worker transcript."""
+        try:
+            started = json.loads(
+                Path(run["assignment"]["started_path"]).read_text()
+            )
+        except (OSError, ValueError):
+            return None
+        return transcript_failure(started.get("session_file"))
+
+    def _phase_timeout(self, work):
+        run = self.state.get_run(work["current_run"])
+        if run["role"] == "implementer":
+            return (
+                self.config.implementer_phase_timeout_seconds
+                or self.config.phase_timeout_seconds
+            )
+        return self.config.phase_timeout_seconds
+
+    def _decide(
+        self,
+        work,
+        allowed,
+        preferred,
+        report=None,
+        evaluation=None,
+        contract_error=None,
+    ):
         bundle = resolved_bundle(self.home, self.config)
         snapshot = {
             "work": work["payload"],
@@ -594,9 +871,31 @@ class Engine:
             "recoveries": work["recoveries"],
             "revisions": work["revisions"],
             "candidate": work["data"].get("entries"),
+            "conflict_revision": work["data"].get("conflict_revision"),
             "evaluation": evaluation,
             "human_guidance": self._guidance(work["id"]),
         }
+        change = work["data"].get("issue_change")
+        if change and not change.get("surfaced"):
+            snapshot["issue_change"] = {
+                "note": (
+                    "The source issue was edited after acceptance; accepted "
+                    "scope above is unchanged. Judge whether the edit "
+                    "(e.g. a moved criterion) matters; this is shown once."
+                ),
+                "changed": change["changed"],
+                "observed": change["observed"],
+            }
+            data = {
+                **work["data"],
+                "issue_change": {**change, "surfaced": True},
+            }
+            try:
+                self.state.update_work(
+                    work["id"], data=data, event="intake.issue_surfaced"
+                )
+            except StateConflict:
+                pass
         snapshot["verification_policy"] = (
             "Workers run in a sandbox that cannot reach Docker, databases or "
             "other host services, so missing worker-side verification of "
@@ -610,6 +909,17 @@ class Engine:
         )
         if evaluation in {"acceptance", "handoff"}:
             snapshot["evidence"] = self._current_evidence(work)
+            snapshot["citable_evidence_ids"] = sorted(
+                citable_ids(snapshot["evidence"])
+            )
+            snapshot["evidence_citation_rules"] = (
+                "evidence_refs may contain ONLY ids listed in "
+                "citable_evidence_ids. Rows with citable=false (worker_check "
+                "snapshots) and ids from earlier reports or candidates are "
+                "rejected. A 'passed' criterion needs at least one ref."
+            )
+        if contract_error:
+            snapshot["contract_error"] = contract_error
         if evaluation == "handoff":
             next_phase = {
                 "implementing": "checking",
@@ -661,7 +971,8 @@ class Engine:
                 if work["phase"] == "awaiting_merge"
                 else "pre_publication",
                 "complete": "All product criteria pass with current evidence; publish and confirm merges before closing the issue.",
-                "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete.",
+                "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete or unverifiable.",
+                "criterion_results": "passed (needs citable evidence_refs); incomplete; unverifiable (no configured check can prove it; needs no refs, blocks complete, allows advance); waived (satisfied by authoritative human_guidance; no refs); failed.",
                 "worker_remaining_work": work["data"]
                 .get("reports", {})
                 .get("implementer", {})
@@ -697,6 +1008,21 @@ class Engine:
             if evaluation in {"acceptance", "handoff"}
             else decision.action
         )
+
+    def _acceptance_intent(self, work, decision):
+        intent, remaining = acceptance_intent(
+            decision,
+            len(work["payload"]["acceptance"]),
+            citable_ids(self._current_evidence(work)),
+        )
+        if any(a.result == "waived" for a in decision.acceptance) and not (
+            self._guidance(work["id"])
+        ):
+            raise AcceptanceContractError(
+                ["'waived' requires authoritative human_guidance, none exists"],
+                citable_ids(self._current_evidence(work)),
+            )
+        return intent, remaining
 
     def _current_evidence(self, work):
         return current_evidence(self.state, self.home, self.config, work)
@@ -880,7 +1206,9 @@ class Engine:
                 event="validation.configuration_changed",
             )
             return
-        entries, changed = self.git.sync(data["entries"])
+        # Strict: an unresolved merge left by a deferral or resume must route
+        # to the conflict revision, never publish the stale candidate.
+        entries, changed = self.git.sync(data["entries"], strict=True)
         if changed:
             data["entries"] = entries
             self.state.update_work(work_id, phase="checking", data=data)
@@ -905,30 +1233,62 @@ class Engine:
             self._revise(work, "Intermediate repository compatibility failed")
             return
         remaining = reports.get("implementer", {}).get("remaining_work", [])
-        decision = self._decide(
-            work,
-            {"advance", "complete", "revise", "defer"},
-            "advance" if remaining else "complete",
-            evaluation="acceptance",
-        )
-        if decision.action == "revise":
-            self._revise(work, decision.rationale)
-            return
-        if decision.action == "defer":
-            self._defer(work, decision.rationale)
-            return
-        if digest(resolved_bundle(self.home, self.config)) != current_digest:
-            self.state.update_work(
-                work_id,
-                phase="checking",
-                control="ready",
-                event="validation.configuration_changed",
+        allowed = {"advance", "complete", "revise", "defer"}
+        preferred = "advance" if remaining else "complete"
+        contract_error = None
+        for attempt in range(CONTRACT_RETRIES + 1):
+            decision = self._decide(
+                work,
+                allowed,
+                preferred,
+                evaluation="acceptance",
+                contract_error=contract_error,
             )
-            return
-        evidence_ids = {item["id"] for item in self._current_evidence(work)}
-        intent, remaining = acceptance_intent(
-            decision, len(work["payload"]["acceptance"]), evidence_ids
-        )
+            if decision.action == "revise":
+                self._revise(work, decision.rationale)
+                return
+            if decision.action == "defer":
+                self._defer(work, decision.rationale)
+                return
+            if (
+                digest(resolved_bundle(self.home, self.config))
+                != current_digest
+            ):
+                self.state.update_work(
+                    work_id,
+                    phase="checking",
+                    control="ready",
+                    event="validation.configuration_changed",
+                )
+                return
+            try:
+                intent, remaining = self._acceptance_intent(work, decision)
+                break
+            except AcceptanceContractError as error:
+                # A reasonable decision with a fixable citation mistake must
+                # not park the item: tell the coordinator exactly what failed.
+                self.state.event(
+                    "coordinator.decision_rejected",
+                    work_id,
+                    {
+                        "attempt": attempt + 1,
+                        "retries_allowed": CONTRACT_RETRIES,
+                        "problems": error.problems,
+                        "citable_evidence_ids": error.citable,
+                        "will_retry": attempt < CONTRACT_RETRIES,
+                    },
+                )
+                if attempt == CONTRACT_RETRIES:
+                    raise ValueError(
+                        f"{error} (after {attempt + 1} attempts)"
+                    ) from error
+                contract_error = {
+                    "message": "Your previous decision was rejected. Fix it "
+                    "and decide again.",
+                    "problems": error.problems,
+                    "citable_evidence_ids": error.citable,
+                    "previous_decision": decision.model_dump(),
+                }
         if intent.action != decision.action:
             self.state.event(
                 "acceptance.intent_normalized",
@@ -963,6 +1323,7 @@ class Engine:
         self.state.finish_operation(operation, {"repositories": result})
         data["integration"] = result
         if remaining:
+            data.pop("conflict_revision", None)
             data["revision_reason"] = "Continue remaining scope: " + "; ".join(
                 remaining
             )
@@ -996,6 +1357,7 @@ class Engine:
             return
         data = work["data"]
         data["revision_reason"] = reason
+        data.pop("conflict_revision", None)
         data.pop("checks_candidate", None)
         data.pop("qa_candidate", None)
         self.state.update_work(
@@ -1056,6 +1418,7 @@ class Engine:
             "phase.timeout",
             "coordinator.failed",
             "github.no_changes",
+            "git.candidate_changed",
         }
         if (
             failure.code not in known_codes
@@ -1167,6 +1530,25 @@ class Engine:
             if run_id != work["current_run"]:
                 work = self.state.update_work(work_id, current_run=run_id)
             self._revise(work, failure.summary)
+            return
+        if recovery.action == "rate_limit":
+            until = self.state.set_rate_limit(time.time() + recovery.delay)
+            reset = time.strftime("%H:%M", time.localtime(until))
+            self.state.update_work(
+                work_id,
+                current_run=run_id,
+                control="backoff",
+                wake_at=until,
+                event="recovery.rate_limited",
+                notice={
+                    "kind": recovery.notify,
+                    "message": (
+                        f"{failure.summary}; dispatch paused until {reset}, "
+                        "then resumes automatically"
+                    ),
+                    "incident_key": f"ratelimit:{int(until)}",
+                },
+            )
             return
         self.state.update_work(
             work_id,

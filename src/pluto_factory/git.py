@@ -22,9 +22,15 @@ from .models import FactoryConfig, Repository
 
 class GitFailure(RuntimeError):
     def __init__(
-        self, code: str, summary: str, uncertain: bool = False
+        self,
+        code: str,
+        summary: str,
+        uncertain: bool = False,
+        paths: list[str] | None = None,
     ) -> None:
         super().__init__(summary)
+        # Conflicted paths of a merge left prepared in the worktree.
+        self.paths = paths
         self.code = code
         self.summary = summary
         self.uncertain = uncertain
@@ -405,13 +411,28 @@ class GitWorkspace:
                 found.append(name)
         return found
 
-    def _candidate(self, entry: dict) -> None:
+    def unrecorded(self, entries: list[dict]) -> list[str]:
+        """Names of repositories whose worktree differs from the record.
+
+        Left by an interrupted or failed worker: uncommitted edits, or a HEAD
+        that moved past the recorded candidate.
+        """
+        names = []
+        for entry in entries:
+            _, _, worktree = self._entry(entry)
+            if self._text(worktree, "rev-parse", "HEAD") != entry[
+                "candidate"
+            ] or self._text(worktree, "status", "--porcelain"):
+                names.append(entry["name"])
+        return names
+
+    def _candidate(self, entry: dict, *, clean: bool = True) -> None:
         _, _, worktree = self._entry(entry)
         if self._text(worktree, "rev-parse", "HEAD") != entry["candidate"]:
             raise GitFailure(
                 "git.candidate_changed", "Candidate revision moved"
             )
-        if self._text(worktree, "status", "--porcelain"):
+        if clean and self._text(worktree, "status", "--porcelain"):
             raise GitFailure(
                 "git.candidate_changed", "Candidate has new changes"
             )
@@ -679,15 +700,59 @@ class GitWorkspace:
                 evidence.extend(self._validate(entries, kind, selected, plan))
         return evidence
 
-    def sync(self, entries: list[dict]) -> tuple[list[dict], bool]:
+    def _merge_conflict(self, repo, entry, paths: list[str]) -> GitFailure:
+        return GitFailure(
+            "git.conflict",
+            "Merging the new default branch "
+            f"({entry['default_branch']}) into "
+            f"{repo.name} conflicts in: "
+            + ", ".join(paths)
+            + ". The merge is prepared in the worktree with "
+            "conflict markers. Edit those files to the "
+            "correct combined content and remove every "
+            "<<<<<<<, =======, >>>>>>> marker. Do not run "
+            "git add, commit or merge --abort: the factory "
+            "stages and commits the merge after you report.",
+            paths=paths,
+        )
+
+    def sync(
+        self, entries: list[dict], *, strict: bool = False
+    ) -> tuple[list[dict], bool]:
+        """Merge the latest default branch into each candidate.
+
+        A merge already awaiting resolution is kept intact for the worker,
+        unless ``strict``: callers about to publish must not treat an
+        unresolved merge as a synchronized candidate, so it raises the
+        conflict again.
+        """
         changed = False
         result = []
         for original in entries:
             entry = dict(original)
             repo, managed, worktree = self._entry(entry)
-            self._candidate(entry)
+            # A merge awaiting resolution is legitimately dirty.
+            if self._merging(worktree):
+                # The factory's own merge commit (made at snapshot) may sit
+                # under a newly prepared merge; that movement is expected.
+                head = self._text(worktree, "rev-parse", "HEAD")
+                if head != entry["candidate"] and self._contains(
+                    managed, entry["candidate"], head
+                ):
+                    entry["candidate"] = head
+                    entry["tree"] = self._text(
+                        worktree, "rev-parse", "HEAD^{tree}"
+                    )
+            self._candidate(entry, clean=not self._merging(worktree))
             if self._merging(worktree):
                 # A merge awaits the worker's resolution; keep it intact.
+                if strict:
+                    raise self._merge_conflict(
+                        repo,
+                        entry,
+                        self._conflict_paths(worktree)
+                        or ["(merge in progress)"],
+                    )
                 result.append(entry)
                 continue
             latest = self._text(
@@ -705,19 +770,7 @@ class GitWorkspace:
                             raise GitFailure(
                                 "git.conflict", merge.stderr or merge.stdout
                             )
-                        raise GitFailure(
-                            "git.conflict",
-                            "Merging the new default branch "
-                            f"({entry['default_branch']}) into "
-                            f"{repo.name} conflicts in: "
-                            + ", ".join(paths)
-                            + ". The merge is prepared in the worktree with "
-                            "conflict markers. Edit those files to the "
-                            "correct combined content and remove every "
-                            "<<<<<<<, =======, >>>>>>> marker. Do not run "
-                            "git add, commit or merge --abort: the factory "
-                            "stages and commits the merge after you report.",
-                        )
+                        raise self._merge_conflict(repo, entry, paths)
                 else:
                     self._git(worktree, "checkout", "--detach", latest)
                 entry["base"] = latest

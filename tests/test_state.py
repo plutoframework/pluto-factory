@@ -119,7 +119,6 @@ def test_schema_and_missing_dependency_fail_explicitly(tmp_path):
 @pytest.mark.parametrize(
     "code",
     [
-        "provider.rate_limited",
         "harness.exited",
         "report.invalid",
         "unknown",

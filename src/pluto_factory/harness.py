@@ -1,5 +1,6 @@
 """Interactive worker adapters and an explicitly simulated fixture adapter."""
 
+import errno
 import hashlib
 import json
 import os
@@ -29,6 +30,18 @@ class HarnessError(RuntimeError):
             "source": "adapter",
             "uncertain": uncertain,
         }
+
+
+def packet_prompt(packet_path: str | Path) -> str:
+    """Short launch prompt; packet content never travels through argv.
+
+    Linux caps one argv string at 128 KiB, and packets can exceed that.
+    """
+    return (
+        f"Your task packet is the file {Path(packet_path).resolve()}. "
+        "Read it in full with the Read tool, then carry out the task it "
+        "describes."
+    )
 
 
 def _config(value: FactoryConfig | dict) -> dict:
@@ -191,6 +204,13 @@ class PiHarness:
                 uncertain=mutating,
             ) from error
         except OSError as error:
+            if error.errno in (errno.E2BIG, errno.ENAMETOOLONG):
+                raise HarnessError(
+                    "config.invalid",
+                    "Herdr Core command exceeds the OS argument size limit "
+                    f"({errno.errorcode[error.errno]}); a launch argument "
+                    "or packet is too large and retrying cannot help",
+                ) from error
             raise HarnessError(
                 "transport.unavailable",
                 "Herdr Core operation could not be executed "
@@ -932,9 +952,9 @@ class ClaudeHarness(PiHarness):
             *effort,
             "--name",
             f"{self.config['name']}: {assignment['role']}",
-            "--append-system-prompt",
-            Path(assignment["role_path"]).read_text(),
-            Path(assignment["packet_path"]).read_text(),
+            "--append-system-prompt-file",
+            assignment["role_path"],
+            packet_prompt(assignment["packet_path"]),
         ]
 
     def reassign(self, session: dict, assignment: dict) -> dict:

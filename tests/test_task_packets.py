@@ -101,3 +101,24 @@ def test_worker_packet_contains_exact_scoped_validation_plan(tmp_path, role):
         assert "nono sandbox" in engine._execution_guidance()
     finally:
         engine.state.close()
+
+
+def test_bound_evidence_keeps_newest_and_summarizes_older():
+    from pluto_factory.engine import bound_evidence
+
+    items = [
+        {
+            "kind": "check",
+            "passed": False,
+            "stdout": "o" * 9000,
+            "artifact": f"/a/{i}",
+        }
+        for i in range(10)
+    ]
+    bounded = bound_evidence(items)
+    assert len(bounded) == 10
+    assert len(bounded[0]["stdout"]) < 2200
+    assert bounded[0]["stdout"].endswith("o")
+    assert "stdout" not in bounded[5]
+    assert bounded[5]["artifact"] == "/a/5"
+    assert len(json.dumps(bounded)) < 20000

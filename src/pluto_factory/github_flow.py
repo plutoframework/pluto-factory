@@ -4,7 +4,7 @@ import copy
 import json
 import time
 
-from .acceptance import acceptance_intent, current_evidence
+from .acceptance import acceptance_intent, citable_ids, current_evidence
 from .config import digest, resolved_bundle
 from .github import GitHubAdapter, GitHubFailure
 from .models import Decision, Submission
@@ -58,22 +58,63 @@ class GitHubFlow:
                 "SELECT id,payload FROM work WHERE source_key=?", (source_key,)
             ).fetchone()
             if existing:
-                accepted = Submission.model_validate(
-                    json.loads(existing["payload"])
-                ).model_dump()
-                if accepted != submission.model_dump():
-                    self.state.event(
-                        "intake.issue_changed",
-                        existing["id"],
-                        {
-                            "note": "Existing accepted scope was preserved",
-                        },
-                    )
+                self._observe_change(existing, submission)
                 continue
             try:
                 self.state.submit(submission)
             except ValueError as error:
                 self._reject(source_key, str(error))
+
+    def _observe_change(self, existing, submission):
+        """Record each distinct edited issue state once; scope stays frozen."""
+        accepted = Submission.model_validate(
+            json.loads(existing["payload"])
+        ).model_dump()
+        observed = submission.model_dump()
+        if accepted == observed:
+            return
+        observed_digest = digest(observed)
+        work = self.state.get_work(existing["id"])
+        data = work["data"]
+        if data.get("observed_issue_digest") == observed_digest:
+            return
+        changed = {
+            field: {
+                "accepted": digest({"v": accepted[field]})[:12],
+                "observed": digest({"v": observed[field]})[:12],
+            }
+            for field in observed
+            if accepted.get(field) != observed[field]
+        }
+        change = {
+            "digest": observed_digest,
+            "changed": changed,
+            "observed": {
+                key: observed[key]
+                for key in ("title", "instruction", "acceptance")
+                if key in changed
+            },
+            "surfaced": False,
+        }
+        data["observed_issue_digest"] = observed_digest
+        data["issue_change"] = change
+        try:
+            self.state.update_work(
+                existing["id"],
+                data=data,
+                event="intake.issue_observed",
+            )
+        except StateConflict:
+            return  # paused; recorded on a later poll
+        self.state.event(
+            "intake.issue_changed",
+            existing["id"],
+            {
+                "note": "Existing accepted scope was preserved",
+                "changed": sorted(changed),
+                "digest": observed_digest,
+            },
+        )
 
     def _reject(self, source_key, reason):
         self.state.event(
@@ -136,6 +177,7 @@ class GitHubFlow:
         reassess=None,
         confirm=None,
         revalidate=None,
+        resync=None,
     ):
         result = self.adapter.poll_pull_requests(work["data"]["pull_requests"])
         data = work["data"]
@@ -156,6 +198,22 @@ class GitHubFlow:
             defer(work, "A required pull request was closed without merging")
             return
         if status != "merged":
+            stale = [
+                pr
+                for pr in result["pull_requests"]
+                if pr.get("state") == "open"
+                and (
+                    pr.get("merge_state") == "DIRTY"
+                    or (
+                        self.config.github_require_up_to_date
+                        and pr.get("merge_state") == "BEHIND"
+                    )
+                )
+            ]
+            if stale and resync is not None:
+                work = self.state.update_work(work["id"], data=data)
+                resync(work, stale)
+                return
             if self.config.github_auto_merge:
                 self.adapter.request_merge(result["pull_requests"])
             self.state.update_work(
@@ -329,10 +387,12 @@ class GitHubFlow:
             max(increment, *(item["increment"] for item in history)) + 1
         )
         data["revision_reason"] = "; ".join(remaining)
+        data.pop("conflict_revision", None)
         for key in (
             "entries",
             "reports",
             "pull_requests",
+            "pr_resyncs",
             "publication_acceptance",
             "post_merge_acceptance",
             "post_merge_validation",
@@ -462,25 +522,21 @@ class GitHubFlow:
             raise ValueError(
                 "recorded acceptance does not authorize integration"
             )
-        evidence_ids = {
-            item["id"]
-            for item in current_evidence(
-                self.state, self.state.home, self.config, work
-            )
-        }
+        evidence_ids = citable_ids(
+            current_evidence(self.state, self.state.home, self.config, work)
+        )
         if rebound:
             # The frozen publication decision was validated under the earlier
             # configuration; its citations stay valid against that digest.
-            evidence_ids |= {
-                item["id"]
-                for item in current_evidence(
+            evidence_ids |= citable_ids(
+                current_evidence(
                     self.state,
                     self.state.home,
                     self.config,
                     work,
                     config_digest=acceptance["config_digest"],
                 )
-            }
+            )
         intent, remaining = acceptance_intent(
             decision, len(work["payload"]["acceptance"]), evidence_ids
         )

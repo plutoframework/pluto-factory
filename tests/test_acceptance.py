@@ -82,3 +82,70 @@ def test_empty_publication_is_not_a_blind_retry():
     )
     assert recovery.action == "defer"
     assert recovery.notify == "action_required"
+
+
+def gryt_decision():
+    """gryt #9 event 6656: criterion 3 'passed' by owner decision, no refs."""
+    refs = ["evidence-813f", "evidence-d3a4"]
+    return Decision(
+        action="advance",
+        rationale="Advance as safe increment",
+        acceptance=[
+            assessment(0, "incomplete", refs),
+            assessment(1, refs=refs + ["evidence-bdd0"]),
+            assessment(2, refs=["evidence-bdd0"]),
+            assessment(3, refs=[]),
+        ],
+    )
+
+
+GRYT_CITABLE = {"evidence-813f", "evidence-d3a4", "evidence-bdd0"}
+
+
+def test_gryt_empty_refs_error_names_criterion_and_citable_ids():
+    from pluto_factory.acceptance import AcceptanceContractError
+
+    with pytest.raises(AcceptanceContractError) as caught:
+        acceptance_intent(gryt_decision(), 4, GRYT_CITABLE)
+    assert (
+        caught.value.problems == [caught.value.problems[0]]
+        and "criterion 3" in caught.value.problems[0]
+    )
+    assert "evidence-bdd0" in str(caught.value)
+
+
+def test_worker_check_ref_is_reported_as_not_citable():
+    from pluto_factory.acceptance import AcceptanceContractError
+
+    decision = Decision(
+        action="advance",
+        rationale="x",
+        acceptance=[assessment(refs=["evidence-wc"])],
+    )
+    with pytest.raises(AcceptanceContractError, match="evidence-wc"):
+        acceptance_intent(decision, 1, {"evidence-ok"})
+
+
+def test_unverifiable_and_waived_allow_increment_without_refs():
+    decision = Decision(
+        action="advance",
+        rationale="Safe increment",
+        acceptance=[
+            assessment(0, "unverifiable", []),
+            assessment(1, "waived", []),
+            assessment(2),
+        ],
+    )
+    intent, remaining = acceptance_intent(decision, 3, {"current"})
+    assert intent.action == "advance"
+    assert remaining == ["Validated criterion"]
+
+
+def test_unverifiable_cannot_complete():
+    decision = Decision(
+        action="complete",
+        rationale="x",
+        acceptance=[assessment(0, "unverifiable", [])],
+    )
+    with pytest.raises(ValueError, match="incomplete"):
+        acceptance_intent(decision, 1, {"current"})

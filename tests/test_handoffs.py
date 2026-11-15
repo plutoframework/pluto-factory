@@ -194,7 +194,7 @@ def test_ready_implementation_cannot_bypass_independent_integration_gates(
     engine._report(work, run)
 
     class NoUncheckedIntegration:
-        def sync(self, entries):
+        def sync(self, entries, **_):
             raise AssertionError(
                 "Unvalidated implementation reached integration"
             )

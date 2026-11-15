@@ -181,6 +181,8 @@ class FactoryConfig(Contract):
     github_issue_label: str = Field(default="factory:ready", min_length=1)
     github_poll_seconds: int = Field(default=30, ge=1)
     github_auto_merge: bool = False
+    github_require_up_to_date: bool = False
+    github_max_resyncs: int = Field(default=3, ge=0, le=20)
     github_required_checks: list[str] = Field(default_factory=list)
     close_source_issues: bool = True
     herdr_space: str = ""
@@ -188,6 +190,8 @@ class FactoryConfig(Contract):
     max_recoveries: int = Field(default=3, ge=0, le=20)
     max_revisions: int = Field(default=5, ge=0, le=100)
     phase_timeout_seconds: int = Field(default=900, ge=1)
+    # Implementers legitimately run longer; unset falls back to the above.
+    implementer_phase_timeout_seconds: int | None = Field(default=None, ge=1)
     command_timeout_seconds: int = Field(default=120, ge=1)
     retry_base_seconds: float = Field(default=5, ge=0)
     self_improvement: ImprovementPolicy = Field(
@@ -237,7 +241,7 @@ class Submission(Contract):
 
 class CriterionAssessment(Contract):
     criterion: int = Field(ge=0)
-    result: Literal["passed", "incomplete", "failed"]
+    result: Literal["passed", "incomplete", "failed", "unverifiable", "waived"]
     evidence_refs: list[str] = Field(default_factory=list)
     explanation: str = Field(min_length=1)
 

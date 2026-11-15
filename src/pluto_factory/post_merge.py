@@ -3,7 +3,7 @@
 import time
 from datetime import UTC, datetime
 
-from .acceptance import acceptance_intent, current_evidence
+from .acceptance import acceptance_intent, citable_ids, current_evidence
 from .config import digest, resolved_bundle
 from .coordinator import CoordinatorError
 from .github_checks import merge_check_status
@@ -313,12 +313,9 @@ def _reassess_merged(engine, work):
         intent, remaining = acceptance_intent(
             decision,
             len(work["payload"]["acceptance"]),
-            {
-                item["id"]
-                for item in current_evidence(
-                    engine.state, engine.home, engine.config, work
-                )
-            },
+            citable_ids(
+                current_evidence(engine.state, engine.home, engine.config, work)
+            ),
         )
     except ValueError:
         engine._failure(
