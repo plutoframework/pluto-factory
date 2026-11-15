@@ -549,7 +549,7 @@ def untrack(state, slug, number):
     return get_pr(state, slug, number)
 
 
-def set_pr(state, row, **fields):
+def set_pr(ledger, row, **fields):
     """Update a row; a state change is one event (and maybe a notice)."""
     now = time.time()
     stored = {
@@ -562,14 +562,14 @@ def set_pr(state, row, **fields):
         stored["state_since"] = now
     stored["updated"] = now
     assignments = ",".join(f"{key}=?" for key in stored)
-    with state.db:
-        state.db.execute(
+    with ledger.db:
+        ledger.db.execute(
             f"UPDATE pull_requests SET {assignments} WHERE id=?",
             (*stored.values(), row["id"]),
         )
         if new != previous:
             subject = row["work_id"] or "factory"
-            state._event(
+            ledger._event(
                 "pr.state_changed",
                 subject,
                 {
@@ -585,7 +585,7 @@ def set_pr(state, row, **fields):
                 head = fields.get("head", row["head"])[:8]
                 reason = fields.get("reason") or row["reason"]
                 label = "ready to merge" if new == "ready" else reason
-                state._notify(
+                ledger._notify(
                     row["work_id"],
                     "attention",
                     f"{row['slug']}#{row['number']}: {label}",

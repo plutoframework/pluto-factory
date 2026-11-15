@@ -592,6 +592,15 @@ class PRTracker:
             f"Failure log excerpt:\n{row['log_excerpt']}\n\n{REPAIR_RULES}"
         )
 
+    def _ordinal(self, row):
+        """Next repair number for this PR; never reused, even after a grant."""
+        prefix = repair_source(row["slug"], row["number"])
+        (count,) = self.state.db.execute(
+            "SELECT COUNT(*) FROM work WHERE source_key LIKE ? ESCAPE '\\'",
+            (prefix.replace("_", "\\_") + ":%",),
+        ).fetchone()
+        return count + 1
+
     def _spawn(self, row, attempts):
         repairs = dict(row["repairs"])
         repairs[row["head"]] = attempts + 1
@@ -645,7 +654,7 @@ class PRTracker:
                 ],
                 repositories=[repository.name],
                 source=repair_source(row["slug"], row["number"]),
-                delivery_key=f"{row['head']}:{attempts + 1}",
+                delivery_key=f"{row['head']}:{self._ordinal(row)}",
             )
         )
         set_pr(self.state, row, repair_work=work["id"], **fields)
