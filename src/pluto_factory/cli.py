@@ -172,6 +172,7 @@ def parser() -> argparse.ArgumentParser:
     setup.add_argument("--max-recoveries", type=int, default=3)
     setup.add_argument("--max-revisions", type=int, default=5)
     setup.add_argument("--phase-timeout", type=int, default=900)
+    setup.add_argument("--implementer-phase-timeout", type=int, default=None)
     setup.add_argument("--command-timeout", type=int, default=120)
     setup.add_argument("--retry-base", type=float, default=5)
     setup.add_argument(
@@ -773,6 +774,7 @@ def _setup(args: argparse.Namespace) -> dict:
             max_recoveries=args.max_recoveries,
             max_revisions=args.max_revisions,
             phase_timeout_seconds=args.phase_timeout,
+            implementer_phase_timeout_seconds=args.implementer_phase_timeout,
             command_timeout_seconds=args.command_timeout,
             retry_base_seconds=args.retry_base,
             integration=args.integration,
@@ -1013,6 +1015,21 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
                         "passed": bool(getattr(repo, kind)),
                     }
                 )
+    checks.append(
+        {
+            "name": "phase-timeouts",
+            "passed": True,
+            "detail": (
+                f"phase {config.phase_timeout_seconds}s; implementer "
+                f"{config.implementer_phase_timeout_seconds or config.phase_timeout_seconds}s"
+                + (
+                    ""
+                    if config.implementer_phase_timeout_seconds
+                    else " (inherits phase timeout)"
+                )
+            ),
+        }
+    )
     if config.coordinator == "model":
         library = (
             "claude_agent_sdk"

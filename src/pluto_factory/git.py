@@ -405,13 +405,28 @@ class GitWorkspace:
                 found.append(name)
         return found
 
-    def _candidate(self, entry: dict) -> None:
+    def unrecorded(self, entries: list[dict]) -> list[str]:
+        """Names of repositories whose worktree differs from the record.
+
+        Left by an interrupted or failed worker: uncommitted edits, or a HEAD
+        that moved past the recorded candidate.
+        """
+        names = []
+        for entry in entries:
+            _, _, worktree = self._entry(entry)
+            if self._text(worktree, "rev-parse", "HEAD") != entry[
+                "candidate"
+            ] or self._text(worktree, "status", "--porcelain"):
+                names.append(entry["name"])
+        return names
+
+    def _candidate(self, entry: dict, *, clean: bool = True) -> None:
         _, _, worktree = self._entry(entry)
         if self._text(worktree, "rev-parse", "HEAD") != entry["candidate"]:
             raise GitFailure(
                 "git.candidate_changed", "Candidate revision moved"
             )
-        if self._text(worktree, "status", "--porcelain"):
+        if clean and self._text(worktree, "status", "--porcelain"):
             raise GitFailure(
                 "git.candidate_changed", "Candidate has new changes"
             )
@@ -685,7 +700,8 @@ class GitWorkspace:
         for original in entries:
             entry = dict(original)
             repo, managed, worktree = self._entry(entry)
-            self._candidate(entry)
+            # A merge awaiting resolution is legitimately dirty.
+            self._candidate(entry, clean=not self._merging(worktree))
             if self._merging(worktree):
                 # A merge awaits the worker's resolution; keep it intact.
                 result.append(entry)

@@ -1271,3 +1271,98 @@ def test_unverifiable_criterion_advances_without_completing(tmp_path):
         assert recorded["acceptance_decision"]["action"] == "advance"
     finally:
         engine.state.close()
+
+
+def test_interrupted_implementer_partial_edits_are_committed_and_resumed(
+    tmp_path,
+):
+    home, prepared = prepare_demo(tmp_path)
+    harness = ObservedHarness()
+    engine = Engine(home, harness=harness)
+    work_id = prepared["submitted"]["id"]
+    launched = []
+    engine._launch = launched.append
+    work = engine.state.get_work(work_id)
+    entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+    writable = next(e for e in entries if e["access"] == "write")
+    engine.state.update_work(
+        work_id,
+        phase="implementing",
+        control="ready",
+        data={"entries": entries, "workspace_id": work_id},
+    )
+    run = engine.state.create_run(work_id, "implementer", {"id": "run-hung"})
+    engine.state.update_run(run["id"], state="running", session={"owned": True})
+    engine.state.update_work(work_id, current_run=run["id"])
+    # The worker edits, then the phase deadline interrupts it mid-run.
+    (Path(writable["worktree"]) / "partial.txt").write_text("half done\n")
+    try:
+        engine._failure(
+            work_id,
+            Failure(
+                code="phase.timeout",
+                summary="Assignment exceeded its phase deadline",
+                source="coordinator",
+            ),
+        )
+        assert harness.interrupted
+        assert git(Path(writable["worktree"]), "status", "--porcelain")
+        engine.state.update_work(work_id, control="ready", wake_at=0)
+        engine._step(engine.state.get_work(work_id))
+        # Recovery dispatches instead of looping on candidate_changed.
+        assert not git(Path(writable["worktree"]), "status", "--porcelain")
+        current = engine.state.get_work(work_id)
+        entry = next(
+            e
+            for e in current["data"]["entries"]
+            if e["name"] == writable["name"]
+        )
+        assert entry["candidate"] == git(
+            Path(writable["worktree"]), "rev-parse", "HEAD"
+        )
+        assert entry["candidate"] != writable["candidate"]
+        packet = Path(launched[0]["assignment"]["packet_path"]).read_text()
+        notes = json.loads(packet.split("\n\n", 1)[1])["default_branch_sync"]
+        assert notes["previous_run_interrupted"]["committed_partial_work"] == [
+            writable["name"]
+        ]
+    finally:
+        engine.state.close()
+
+
+def test_candidate_changed_is_recovered_by_retry_not_coordinator(tmp_path):
+    home, prepared = prepare_demo(tmp_path)
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    engine._decide = lambda *a, **k: pytest.fail("coordinator consulted")
+    try:
+        engine._failure(
+            work_id,
+            Failure(
+                code="git.candidate_changed",
+                summary="Candidate has new changes",
+                source="adapter",
+            ),
+        )
+        current = engine.state.get_work(work_id)
+        assert current["control"] == "backoff"
+        assert current["recoveries"] == 1
+    finally:
+        engine.state.close()
+
+
+def test_implementer_timeout_is_configured_separately(tmp_path):
+    home, prepared = prepare_demo(tmp_path)
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    run = engine.state.create_run(work_id, "implementer", {"id": "r"})
+    engine.state.update_work(work_id, current_run=run["id"])
+    work = engine.state.get_work(work_id)
+    try:
+        assert (
+            engine._phase_timeout(work) == engine.config.phase_timeout_seconds
+        )
+        engine.config.implementer_phase_timeout_seconds = 5000
+        assert engine._phase_timeout(work) == 5000
+    finally:
+        engine.state.close()

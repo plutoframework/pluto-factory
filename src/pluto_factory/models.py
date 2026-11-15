@@ -188,6 +188,8 @@ class FactoryConfig(Contract):
     max_recoveries: int = Field(default=3, ge=0, le=20)
     max_revisions: int = Field(default=5, ge=0, le=100)
     phase_timeout_seconds: int = Field(default=900, ge=1)
+    # Implementers legitimately run longer; unset falls back to the above.
+    implementer_phase_timeout_seconds: int | None = Field(default=None, ge=1)
     command_timeout_seconds: int = Field(default=120, ge=1)
     retry_base_seconds: float = Field(default=5, ge=0)
     self_improvement: ImprovementPolicy = Field(

@@ -336,6 +336,29 @@ class Engine:
             )
         return changed
 
+    def _reconcile_worktree(self, work):
+        """Commit partial edits an interrupted run left in the worktree.
+
+        Retrying cannot change a dirty candidate, so the factory records the
+        edits as an increment before the next implementer starts. Returns the
+        repository names that were snapshotted.
+        """
+        data = work["data"]
+        pending = self.git.unrecorded(data["entries"])
+        if not pending:
+            return []
+        try:
+            self._refresh_candidate(work)
+        except GitFailure as error:
+            if error.code != "git.conflict":
+                raise
+            # Unresolved merge: the next implementer resolves it.
+            return []
+        self.state.update_work(
+            work["id"], data=data, event="candidate.reconciled"
+        )
+        return pending
+
     def _synchronize_for_dispatch(self, work):
         """Merge the latest default branch before an implementer starts.
 
@@ -346,6 +369,7 @@ class Engine:
         work_id = work["id"]
         data = work["data"]
         before = {entry["name"]: entry["base"] for entry in data["entries"]}
+        salvaged = self._reconcile_worktree(work)
         if self.github:
             self.github.adapter.refresh_defaults(data["entries"])
         conflict = None
@@ -364,18 +388,29 @@ class Engine:
             for entry in data["entries"]
             if entry["base"] != before[entry["name"]]
         ]
-        if not (merged or conflict):
+        if not (merged or conflict or salvaged):
             return None
-        notes = {
-            "default_branch_merged": merged,
-            "guidance": (
+        notes = {}
+        if salvaged:
+            notes["previous_run_interrupted"] = {
+                "committed_partial_work": salvaged,
+                "guidance": (
+                    "The previous implementer run was interrupted or failed "
+                    "and left edits in the worktree. The factory committed "
+                    "them as an increment in the listed repositories. They "
+                    "may be incomplete or broken: review the committed "
+                    "diff, continue from it, and do not start over."
+                ),
+            }
+        if merged or conflict:
+            notes["default_branch_merged"] = merged
+            notes["guidance"] = (
                 "The latest default branch was merged into your candidate "
                 "worktree since earlier work or runs. Repository docs "
                 "(AGENTS.md, README, contributing guides) and code may have "
                 "changed: re-read them before continuing, and re-check "
                 "earlier conclusions, since problems may already be fixed."
-            ),
-        }
+            )
         if conflict:
             notes["merge_conflict"] = conflict
         return notes
@@ -633,7 +668,7 @@ class Engine:
                         source="runtime",
                     ),
                 )
-        elif time.time() - run["created"] > self.config.phase_timeout_seconds:
+        elif time.time() - run["created"] > self._phase_timeout(work):
             self._failure(
                 work["id"],
                 Failure(
@@ -642,6 +677,15 @@ class Engine:
                     source="coordinator",
                 ),
             )
+
+    def _phase_timeout(self, work):
+        run = self.state.get_run(work["current_run"])
+        if run["role"] == "implementer":
+            return (
+                self.config.implementer_phase_timeout_seconds
+                or self.config.phase_timeout_seconds
+            )
+        return self.config.phase_timeout_seconds
 
     def _decide(
         self,
@@ -1203,6 +1247,7 @@ class Engine:
             "phase.timeout",
             "coordinator.failed",
             "github.no_changes",
+            "git.candidate_changed",
         }
         if (
             failure.code not in known_codes

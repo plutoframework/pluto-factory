@@ -125,7 +125,11 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "sandbox",
         }
     )
-    lines = [f"{key} = {json.dumps(value)}" for key, value in scalar.items()]
+    lines = [
+        f"{key} = {json.dumps(value)}"
+        for key, value in scalar.items()
+        if value is not None  # TOML has no null; unset falls back
+    ]
     for table in (
         "worker",
         "reviewer",
