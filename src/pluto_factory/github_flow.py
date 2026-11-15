@@ -58,22 +58,63 @@ class GitHubFlow:
                 "SELECT id,payload FROM work WHERE source_key=?", (source_key,)
             ).fetchone()
             if existing:
-                accepted = Submission.model_validate(
-                    json.loads(existing["payload"])
-                ).model_dump()
-                if accepted != submission.model_dump():
-                    self.state.event(
-                        "intake.issue_changed",
-                        existing["id"],
-                        {
-                            "note": "Existing accepted scope was preserved",
-                        },
-                    )
+                self._observe_change(existing, submission)
                 continue
             try:
                 self.state.submit(submission)
             except ValueError as error:
                 self._reject(source_key, str(error))
+
+    def _observe_change(self, existing, submission):
+        """Record each distinct edited issue state once; scope stays frozen."""
+        accepted = Submission.model_validate(
+            json.loads(existing["payload"])
+        ).model_dump()
+        observed = submission.model_dump()
+        if accepted == observed:
+            return
+        observed_digest = digest(observed)
+        work = self.state.get_work(existing["id"])
+        data = work["data"]
+        if data.get("observed_issue_digest") == observed_digest:
+            return
+        changed = {
+            field: {
+                "accepted": digest({"v": accepted[field]})[:12],
+                "observed": digest({"v": observed[field]})[:12],
+            }
+            for field in observed
+            if accepted.get(field) != observed[field]
+        }
+        change = {
+            "digest": observed_digest,
+            "changed": changed,
+            "observed": {
+                key: observed[key]
+                for key in ("title", "instruction", "acceptance")
+                if key in changed
+            },
+            "surfaced": False,
+        }
+        data["observed_issue_digest"] = observed_digest
+        data["issue_change"] = change
+        try:
+            self.state.update_work(
+                existing["id"],
+                data=data,
+                event="intake.issue_observed",
+            )
+        except StateConflict:
+            return  # paused; recorded on a later poll
+        self.state.event(
+            "intake.issue_changed",
+            existing["id"],
+            {
+                "note": "Existing accepted scope was preserved",
+                "changed": sorted(changed),
+                "digest": observed_digest,
+            },
+        )
 
     def _reject(self, source_key, reason):
         self.state.event(

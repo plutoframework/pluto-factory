@@ -664,6 +664,27 @@ class Engine:
             "evaluation": evaluation,
             "human_guidance": self._guidance(work["id"]),
         }
+        change = work["data"].get("issue_change")
+        if change and not change.get("surfaced"):
+            snapshot["issue_change"] = {
+                "note": (
+                    "The source issue was edited after acceptance; accepted "
+                    "scope above is unchanged. Judge whether the edit "
+                    "(e.g. a moved criterion) matters; this is shown once."
+                ),
+                "changed": change["changed"],
+                "observed": change["observed"],
+            }
+            data = {
+                **work["data"],
+                "issue_change": {**change, "surfaced": True},
+            }
+            try:
+                self.state.update_work(
+                    work["id"], data=data, event="intake.issue_surfaced"
+                )
+            except StateConflict:
+                pass
         snapshot["verification_policy"] = (
             "Workers run in a sandbox that cannot reach Docker, databases or "
             "other host services, so missing worker-side verification of "

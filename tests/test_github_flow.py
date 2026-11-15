@@ -811,3 +811,31 @@ def test_watcher_stays_available_with_empty_queue(tmp_path):
     assert time.monotonic() - started >= 0.02
     assert result["work"] == []
     engine.state.close()
+
+
+def test_issue_edit_is_recorded_once_and_surfaced_once(tmp_path):
+    _, state, config = setup(tmp_path)
+    flow = GitHubFlow(state, config)
+    flow.adapter = SimpleNamespace(poll=lambda: [submission()])
+    flow.poll(force=True)
+    edited = submission().model_copy(
+        update={"title": "Renamed", "acceptance": ["Other"]}
+    )
+    flow.adapter = SimpleNamespace(poll=lambda: [edited])
+    for _ in range(5):
+        flow.poll(force=True)
+    kinds = [e["kind"] for e in state.inspect()["events"]]
+    assert kinds.count("intake.issue_changed") == 1
+    work = state.list_work()[0]
+    assert work["payload"]["title"] == "Issue"
+    change = work["data"]["issue_change"]
+    assert set(change["changed"]) == {"title", "acceptance"}
+    assert change["observed"]["title"] == "Renamed"
+    # a further distinct edit fires again
+    edited2 = edited.model_copy(update={"title": "Renamed again"})
+    flow.adapter = SimpleNamespace(poll=lambda: [edited2])
+    flow.poll(force=True)
+    flow.poll(force=True)
+    kinds = [e["kind"] for e in state.inspect()["events"]]
+    assert kinds.count("intake.issue_changed") == 2
+    state.close()
