@@ -805,3 +805,57 @@ def test_deferred_repair_surfaces_as_needs_owner_on_next_poll(tmp_path):
     engine._defer(engine.state.get_work(work["id"]), "cannot fix")
     row = observe(engine)
     assert row["state"] == "needs_owner"
+
+
+# --- repair review -----------------------------------------------------------
+
+
+def test_repair_goes_through_review_before_push(tmp_path):
+    engine, gh = build(tmp_path)
+    work = repair_work(engine, gh)
+    data = {
+        "entries": [{"name": "r", "candidate": SHA2, "pr_branch": "feature"}],
+        "repair": {"slug": "plutoframework/cli", "number": 5, "head": SHA},
+    }
+    engine.state.update_work(work["id"], phase="checking", data=data)
+    engine.git.snapshot = lambda entries, workspace: entries
+    engine.git.validate = lambda entries, kind: [{"passed": True}]
+    engine._step(engine.state.get_work(work["id"]))
+    assert engine.state.get_work(work["id"])["phase"] == "reviewing"
+    packet = engine._repair_packet(
+        engine.state.get_work(work["id"]), "reviewer"
+    )
+    assert "skips tests" in packet["review_checklist"]
+    assert "review_checklist" not in engine._repair_packet(
+        engine.state.get_work(work["id"])
+    )
+
+
+def test_rejected_repair_review_consumes_budget_and_escalates(tmp_path):
+    engine, gh = build(tmp_path)
+    work = repair_work(engine, gh)
+    target = ("plutoframework/cli", 5)
+    item = engine.state.update_work(work["id"], phase="reviewing")
+    before = get_pr(engine.state, *target)
+    assert before["repairs"][SHA] == 1
+    # Rejection spends the second of two attempts on this head.
+    engine._repair_rejected(item, target, "removed an assertion")
+    row = get_pr(engine.state, *target)
+    assert row["repairs"][SHA] == 2 and row["repair_total"] == 2
+    assert row["state"] == "needs_owner"
+    assert engine.state.get_work(work["id"])["phase"] == "completed"
+    assert list_decisions(engine.state, {"open"})
+
+
+def test_rejected_repair_with_budget_left_revises(tmp_path):
+    engine, gh = build(tmp_path)
+    engine.config.pr_max_repairs = 3
+    work = repair_work(engine, gh)
+    target = ("plutoframework/cli", 5)
+    item = engine.state.update_work(work["id"], phase="reviewing")
+    engine._repair_rejected(item, target, "added a noqa")
+    row = get_pr(engine.state, *target)
+    assert row["repairs"][SHA] == 2 and row["state"] != "needs_owner"
+    revised = engine.state.get_work(work["id"])
+    assert revised["phase"] == "implementing"
+    assert "added a noqa" in revised["data"]["revision_reason"]

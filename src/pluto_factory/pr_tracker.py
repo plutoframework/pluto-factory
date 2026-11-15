@@ -51,6 +51,13 @@ REPAIR_RULES = (
     "fixed in code (secrets, permissions, scanning alerts, flaky "
     "infrastructure), report outcome=defer and explain."
 )
+REVIEW_CHECKLIST = (
+    "Repair review checklist: REJECT (outcome=revise) if the diff deletes or "
+    "skips tests, relaxes or removes assertions, adds lint/type/scanner "
+    "suppressions, widens allowed values, edits CI configuration, or bumps "
+    "timeouts/retries without a demonstrated cause. Approve only a change "
+    "that fixes the production cause of the recorded failure."
+)
 FAILURE_RANK = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"}
 
 
@@ -611,6 +618,39 @@ class PRTracker:
             ],
             proposal={"pr": f"{row['slug']}#{row['number']}"},
         )
+
+    def reject_repair(self, slug, number, reason):
+        """A reviewer rejected a repair: it costs one attempt on this head.
+
+        Returns True while budget remains (the worker revises); otherwise the
+        PR moves to needs_owner with a decision and False is returned.
+        """
+        row = get_pr(self.state, slug, number)
+        if row is None:
+            return False
+        repairs = dict(row["repairs"])
+        repairs[row["head"]] = repairs.get(row["head"], 0) + 1
+        total = row["repair_total"] + 1
+        set_pr(
+            self.state,
+            row,
+            repairs=repairs,
+            repair_total=total,
+            reason=f"Repair rejected in review: {reason[:300]}",
+        )
+        self.state.event(
+            "pr.repair_rejected",
+            row["work_id"] or "factory",
+            {"pr": f"{slug}#{number}", "head": row["head"], "reason": reason},
+        )
+        row = get_pr(self.state, slug, number)
+        if (
+            repairs[row["head"]] >= self.config.pr_max_repairs
+            or total >= self.config.pr_max_repairs_total
+        ):
+            self._exhausted(row, repairs[row["head"]])
+            return False
+        return True
 
     def grant(self, slug, number):
         """Owner granted more repairs: reset the budget and re-evaluate."""

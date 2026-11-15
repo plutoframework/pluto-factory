@@ -44,7 +44,12 @@ from .improvements import propose
 from .models import Failure, WorkerReport, workable_repositories
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
-from .pr_tracker import REPAIR_RULES, PRTracker, parse_repair_source
+from .pr_tracker import (
+    REPAIR_RULES,
+    REVIEW_CHECKLIST,
+    PRTracker,
+    parse_repair_source,
+)
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
@@ -378,8 +383,9 @@ class Engine:
             # synchronizing: a new conflict must not lose it.
             self.state.update_work(work_id, data=data)
             if repair:
-                # A repair is judged by CI on the PR branch, not rebased.
-                self._validate(work_id, "checks", "pushing")
+                # Judged by CI on the PR branch, not rebased; an independent
+                # reviewer must clear it before anything is pushed.
+                self._validate(work_id, "checks", "reviewing")
                 return
             if not self._synchronize(work_id, data, None):
                 self.state.update_work(work_id, data=data)
@@ -1029,7 +1035,7 @@ class Engine:
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
-            "pr_repair": self._repair_packet(work),
+            "pr_repair": self._repair_packet(work, role),
             "conflict_revision": work["data"].get("conflict_revision"),
             "evidence": bound_evidence(
                 [json.loads(row["data"]) for row in evidence]
@@ -1045,7 +1051,7 @@ class Engine:
         self.tracer.provenance(work, run)
         self._launch(run)
 
-    def _repair_packet(self, work):
+    def _repair_packet(self, work, role="implementer"):
         target = self._repair_target(work)
         row = get_pr(self.state, *target) if target else None
         if row is None:
@@ -1057,6 +1063,11 @@ class Engine:
             "failing_checks": row["failing"],
             "log_excerpt": row["log_excerpt"],
             "rules": REPAIR_RULES,
+            **(
+                {"review_checklist": REVIEW_CHECKLIST}
+                if role == "reviewer"
+                else {}
+            ),
             "guidance": (
                 "Your worktree is the PR branch at its failing head. Fix "
                 "it in place; the factory commits, validates and pushes to "
@@ -1330,13 +1341,19 @@ class Engine:
         if evaluation == "handoff":
             next_phase = {
                 "implementing": "checking",
-                "reviewing": "preparing",
+                "reviewing": "pushing"
+                if self._repair_target(work)
+                else "preparing",
                 "qa": "integrating",
             }[work["phase"]]
             advance_meanings = {
                 "checking": (
                     "Snapshot the implementation and execute independent "
                     "checks; this grants neither integration nor completion."
+                ),
+                "pushing": (
+                    "Push the reviewed repair to the PR branch; CI then "
+                    "judges it."
                 ),
                 "preparing": (
                     "Synchronize the reviewed candidate and run required QA; "
@@ -1536,14 +1553,18 @@ class Engine:
         work = self.state.update_work(work["id"], current_run=None, data=data)
         if not keep:
             self._close_session(work["id"], run, "completed")
+        repair = self._repair_target(work)
         if action in {"revise", "retry"}:
-            self._revise(work, rationale)
+            if repair and run["role"] == "reviewer":
+                self._repair_rejected(work, repair, rationale)
+            else:
+                self._revise(work, rationale)
         elif action == "defer":
             self._defer(work, rationale)
         else:
             phase = {
                 "implementer": "checking",
-                "reviewer": "preparing",
+                "reviewer": "pushing" if repair else "preparing",
                 "qa": "integrating",
             }[run["role"]]
             self.state.update_work(
@@ -1757,6 +1778,18 @@ class Engine:
                     "incident_key": f"completed:{work_id}",
                 },
             )
+
+    def _repair_rejected(self, work, target, reason):
+        """Review rejection spends repair budget; exhaustion escalates."""
+        if self.tracker.reject_repair(*target, reason):
+            self._revise(work, f"Review rejected the repair: {reason}")
+            return
+        self.state.update_work(
+            work["id"],
+            phase="completed",
+            control="settled",
+            event="work.repair_abandoned",
+        )
 
     def _revise(self, work, reason):
         if work["revisions"] >= self.config.max_revisions:
