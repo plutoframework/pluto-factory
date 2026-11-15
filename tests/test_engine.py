@@ -958,3 +958,166 @@ def test_repeated_working_observations_append_one_event(tmp_path):
         assert [item["state"] for item in observed()] == ["working", "idle"]
     finally:
         engine.state.close()
+
+
+def test_worker_check_runs_on_worktree_snapshot_and_records_evidence(tmp_path):
+    from pluto_factory import claude_worker
+
+    home, prepared = prepare_demo(tmp_path / "check")
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    try:
+        work = engine.state.get_work(work_id)
+        entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+        writable = next(e for e in entries if e["access"] == "write")
+        worktree = Path(writable["worktree"])
+        (worktree / "wip.txt").write_text("uncommitted\n")
+        before = git(worktree, "status", "--porcelain")
+        engine.state.update_work(
+            work_id, data={"entries": entries, "workspace_id": work_id}
+        )
+        folder = tmp_path / "assignment"
+        run = engine.state.create_run(
+            work_id,
+            "implementer",
+            {"id": "run-check", "assignment_path": str(folder / "a.json")},
+        )
+        assignment = engine.state.get_run(run["id"])["assignment"]
+        (folder / "checks").mkdir(parents=True)
+        request = "a" * 32
+        (folder / "checks" / f"{request}.request.json").write_text("{}")
+        engine._service_checks(
+            engine.state.get_work(work_id), engine.state.get_run(run["id"])
+        )
+        answer = json.loads(
+            (folder / "checks" / f"{request}.result.json").read_text()
+        )
+        assert claude_worker.pending_checks(assignment) == []
+        assert answer["results"]
+        assert git(worktree, "status", "--porcelain") == before
+        rows = [
+            json.loads(row["data"])
+            for row in engine.state.db.execute(
+                "SELECT data FROM evidence WHERE work_id=?", (work_id,)
+            )
+        ]
+        assert rows and all(row["kind"] == "worker_check" for row in rows)
+    finally:
+        engine.state.close()
+
+
+def test_coordinator_sees_verification_policy_against_deferral(tmp_path):
+    home, prepared = prepare_demo(tmp_path / "policy")
+    engine = Engine(home)
+    try:
+        seen = []
+
+        class Judge:
+            def decide(self, snapshot, allowed, prompt):
+                seen.append(snapshot)
+                return Decision(action="defer", rationale="x")
+
+        engine.coordinator = Judge()
+        work = engine.state.get_work(prepared["submitted"]["id"])
+        engine._decide(work, {"defer", "advance"}, "advance")
+        policy = seen[0]["verification_policy"]
+        assert "not a reason to defer" in policy
+        assert "genuine human decision" in policy
+    finally:
+        engine.state.close()
+
+
+def _commit_default(managed, name, text):
+    (managed / name).write_text(text)
+    git(managed, "add", ".")
+    git(
+        managed,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@localhost",
+        "commit",
+        "-m",
+        f"Change {name}",
+    )
+
+
+def _dispatch_implementer(tmp_path, advance, candidate_file=None):
+    home, prepared = prepare_demo(tmp_path)
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    launched = []
+    engine._launch = launched.append
+    work = engine.state.get_work(work_id)
+    entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+    writable = next(e for e in entries if e["access"] == "write")
+    if candidate_file:
+        (Path(writable["worktree"]) / candidate_file[0]).write_text(
+            candidate_file[1]
+        )
+        entries = engine.git.snapshot(entries, work_id)
+    advance(Path(writable["managed"]))
+    engine.state.update_work(
+        work_id,
+        phase="implementing",
+        control="deferred",
+        data={"entries": entries, "workspace_id": work_id},
+    )
+    engine.state.resume(work_id)
+    engine._step(engine.state.get_work(work_id))
+    packet = Path(launched[0]["assignment"]["packet_path"]).read_text()
+    return engine, work_id, writable, json.loads(packet.split("\n\n", 1)[1])
+
+
+def test_resumed_implementer_sees_merged_default(tmp_path):
+    engine, work_id, writable, packet = _dispatch_implementer(
+        tmp_path,
+        lambda managed: _commit_default(managed, "fix.txt", "fixed\n"),
+        ("feature.txt", "candidate\n"),
+    )
+    try:
+        entry = next(
+            e
+            for e in engine.state.get_work(work_id)["data"]["entries"]
+            if e["name"] == writable["name"]
+        )
+        assert (Path(entry["worktree"]) / "fix.txt").read_text() == "fixed\n"
+        assert entry["base"] != writable["base"]
+        assert any(
+            e["kind"] == "candidate.synchronized"
+            for e in engine.state.inspect()["events"]
+        )
+        sync = packet["default_branch_sync"]
+        assert sync["default_branch_merged"] == [writable["name"]]
+        assert "AGENTS.md" in sync["guidance"]
+    finally:
+        engine.state.close()
+
+
+def test_implementer_dispatch_with_conflict_prepares_merge(tmp_path):
+    engine, _work_id, writable, packet = _dispatch_implementer(
+        tmp_path,
+        lambda managed: _commit_default(managed, "shared.txt", "default\n"),
+        ("shared.txt", "candidate\n"),
+    )
+    try:
+        worktree = Path(writable["worktree"])
+        assert "<<<<<<<" in (worktree / "shared.txt").read_text()
+        assert (
+            "conflicts in: shared.txt"
+            in (packet["default_branch_sync"]["merge_conflict"])
+        )
+    finally:
+        engine.state.close()
+
+
+def test_implementer_dispatch_skips_sync_when_default_unchanged(tmp_path):
+    engine, _, _, packet = _dispatch_implementer(tmp_path, lambda managed: None)
+    try:
+        assert packet["default_branch_sync"] is None
+        assert not any(
+            e["kind"] == "candidate.synchronized"
+            for e in engine.state.inspect()["events"]
+        )
+    finally:
+        engine.state.close()

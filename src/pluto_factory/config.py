@@ -51,6 +51,9 @@ def load_config(home: Path) -> FactoryConfig:
     ]
     if len(paths) != len(set(paths)):
         raise ValueError("a repository cannot be registered twice")
+    from .sandbox import validate_policy
+
+    validate_policy(config.sandbox, home)
     return config
 
 

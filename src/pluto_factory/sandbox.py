@@ -10,13 +10,22 @@ session folder, its agent's own config and any explicitly granted paths.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from .models import DOCKER_SOCKET
+
 PROFILE = Path(__file__).with_name("nono_sealed.json")
+log = logging.getLogger(__name__)
+DOCKER_WARNING = (
+    "sandbox.allow_docker = true: workers can reach the Docker socket, which "
+    "is root-equivalent on the host. A container escape is a host escape."
+)
+SECRET_FOLDERS = (".ssh", ".gnupg", ".aws", ".kube")
 
 
 class SandboxError(RuntimeError):
@@ -26,6 +35,68 @@ class SandboxError(RuntimeError):
 def profile_path(policy: dict) -> str:
     value = (policy or {}).get("profile") or ""
     return os.path.expanduser(value) if value else str(PROFILE)
+
+
+def _contains(parent: Path, child: Path) -> bool:
+    return child == parent or parent in child.parents
+
+
+def validate_policy(policy, home: Path) -> None:
+    """Reject grants that would defeat the sandbox. Raises ``ValueError``."""
+    user = Path.home().resolve()
+    sockets = [Path(herdr_socket()).resolve(), Path(DOCKER_SOCKET).resolve()]
+    # Neither these nor anything containing them may be granted.
+    protected = [
+        (home.resolve(), "the factory home"),
+        *[(user / name, f"~/{name}") for name in SECRET_FOLDERS],
+    ]
+    for key in ("read_paths", "write_paths"):
+        for raw in getattr(policy, key):
+            path = Path(os.path.expanduser(raw)).resolve()
+            if _contains(path, user):
+                raise ValueError(
+                    f"sandbox.{key}: {raw!r} is or contains your home "
+                    "directory; grant a narrower path"
+                )
+            for target, label in protected:
+                if _contains(path, target) or _contains(target, path):
+                    raise ValueError(f"sandbox.{key}: {raw!r} exposes {label}")
+            for socket in sockets:
+                if _contains(path, socket) or _contains(socket, path):
+                    raise ValueError(
+                        f"sandbox.{key}: {raw!r} exposes {socket}; use "
+                        "allow_docker for the Docker socket"
+                    )
+
+
+def effective(policy: dict) -> dict:
+    """What the sandbox will actually allow, for ``doctor``."""
+    policy = policy or {}
+    return {
+        "profile": profile_path(policy),
+        "read_paths": list(policy.get("read_paths", [])),
+        "write_paths": list(policy.get("write_paths", [])),
+        "allow_domains": list(policy.get("allow_domains", [])),
+        "network": "restricted to allow_domains"
+        if policy.get("allow_domains")
+        else "open",
+        "env_passthrough": list(policy.get("env_passthrough", [])),
+        "host_sockets": "blocked (Herdr, dbus, ssh-agent)"
+        + (
+            "; DOCKER SOCKET EXPOSED (root-equivalent)"
+            if policy.get("allow_docker")
+            else ", docker blocked"
+        ),
+        "allow_docker": bool(policy.get("allow_docker")),
+    }
+
+
+def environment_args(policy: dict) -> list[str]:
+    return [
+        f"{name}={os.environ[name]}"
+        for name in (policy or {}).get("env_passthrough", [])
+        if name in os.environ
+    ]
 
 
 def herdr_socket() -> str:
@@ -175,8 +246,8 @@ def grants(assignment: dict, agent: str, policy: dict) -> dict:
             # The worktree's own admin folder holds its index and HEAD.
             if root["access"] == "write" and own != common:
                 write.append(Path(own))
-    read.extend(Path(p).expanduser() for p in policy.get("read", []))
-    write.extend(Path(p).expanduser() for p in policy.get("write", []))
+    read.extend(Path(p).expanduser() for p in policy.get("read_paths", []))
+    write.extend(Path(p).expanduser() for p in policy.get("write_paths", []))
 
     def unique(paths):
         seen = []
@@ -206,6 +277,7 @@ def wrap(
         # Git aborts on an unreadable global config, and the user's may
         # hold credential helpers; workers get none.
         "GIT_CONFIG_GLOBAL=/dev/null",
+        *environment_args(policy),
         "nono",
         "run",
         "--silent",
@@ -223,4 +295,7 @@ def wrap(
         command.extend(["--allow-file", path])
     for domain in policy.get("allow_domains", []):
         command.extend(["--allow-domain", domain])
+    if policy.get("allow_docker"):
+        log.warning(DOCKER_WARNING)
+        command.extend(["--allow-unix-socket", DOCKER_SOCKET])
     return [*command, "--", allowed["binary"], *native[1:]]

@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 from contextlib import ExitStack
@@ -40,7 +41,11 @@ class GitWorkspace:
             )
 
     def _git(
-        self, cwd: Path, *args: str, check: bool = True
+        self,
+        cwd: Path,
+        *args: str,
+        check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         command = [
             "git",
@@ -65,6 +70,7 @@ class GitWorkspace:
         ):
             environment.pop(key, None)
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment.update(env or {})
         try:
             result = subprocess.run(
                 command,
@@ -312,14 +318,27 @@ class GitWorkspace:
             if entry["work_key"] != self._key(work_id):
                 raise GitFailure("scope.denied", "Work item identity changed")
             repo, _, worktree = self._entry(entry)
-            if self._text(worktree, "ls-files", "--unmerged"):
+            merging = self._merging(worktree)
+            if merging:
+                remaining = self._conflict_markers(worktree)
+                if remaining:
+                    raise GitFailure(
+                        "git.conflict",
+                        "Conflict markers remain in: " + ", ".join(remaining),
+                    )
+            elif self._text(worktree, "ls-files", "--unmerged"):
                 raise GitFailure(
                     "git.conflict", "Resolve merge conflicts first"
                 )
             changed = self._text(worktree, "status", "--porcelain")
             if changed and repo.access == "read":
                 raise GitFailure("scope.denied", "Read-only repository changed")
-            if changed:
+            if merging:
+                # The worker edits files only; the factory stages the
+                # resolution and records the merge commit.
+                self._git(worktree, "add", "--all")
+                self._git(worktree, "commit", "--no-verify", "--no-edit")
+            elif changed:
                 self._git(worktree, "add", "--all")
                 self._git(
                     worktree,
@@ -352,6 +371,39 @@ class GitWorkspace:
             result.append(entry)
         self._save(result)
         return result
+
+    def _merging(self, worktree: Path) -> bool:
+        return (
+            self._git(
+                worktree,
+                "rev-parse",
+                "-q",
+                "--verify",
+                "MERGE_HEAD",
+                check=False,
+            ).returncode
+            == 0
+        )
+
+    def _conflict_paths(self, worktree: Path) -> list[str]:
+        return self._text(
+            worktree, "diff", "--name-only", "--diff-filter=U"
+        ).splitlines()
+
+    def _conflict_markers(self, worktree: Path) -> list[str]:
+        """Paths of the merge's conflicted files that still hold markers."""
+        found = []
+        for name in self._conflict_paths(worktree):
+            path = worktree / name
+            if not path.is_file():
+                continue
+            text = path.read_text(errors="replace")
+            if any(
+                line.startswith(("<<<<<<< ", ">>>>>>> ")) or line == "======="
+                for line in text.splitlines()
+            ):
+                found.append(name)
+        return found
 
     def _candidate(self, entry: dict) -> None:
         _, _, worktree = self._entry(entry)
@@ -425,17 +477,55 @@ class GitWorkspace:
     def validate(self, entries: list[dict], kind: str) -> list[dict]:
         return self._validate(entries, kind)
 
+    def _worktree_commit(self, worktree: Path) -> str:
+        """Commit object for the worktree as it is now, touching nothing.
+
+        Uses a throwaway index, so the worker's index, HEAD and files are
+        left exactly as they were (including an in-progress merge).
+        """
+        with tempfile.TemporaryDirectory() as scratch:
+            index = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            self._git(worktree, "read-tree", "HEAD", env=index)
+            self._git(worktree, "add", "--all", env=index)
+            tree = self._git(worktree, "write-tree", env=index).stdout.strip()
+        return self._git(
+            worktree,
+            "commit-tree",
+            tree,
+            "-p",
+            "HEAD",
+            "-m",
+            "Factory worker check snapshot",
+        ).stdout.strip()
+
+    def check_worktree(self, entries: list[dict]) -> list[dict]:
+        """Run configured checks on a snapshot of the live worktrees."""
+        selected = {}
+        for entry in entries:
+            _, _, worktree = self._entry(entry)
+            selected[entry["name"]] = (
+                self._worktree_commit(worktree)
+                if entry["access"] == "write"
+                else entry["candidate"]
+            )
+        rows = self._validate(entries, "checks", selected, frozen=False)
+        for row in rows:
+            row["kind"] = "worker_check"
+        return rows
+
     def _validate(
         self,
         entries: list[dict],
         kind: str,
         candidates: dict[str, str] | None = None,
         integration_plan: dict | None = None,
+        frozen: bool = True,
     ) -> list[dict]:
         if kind not in {"checks", "qa"}:
             raise GitFailure("config.invalid", "Unknown validation phase")
         for entry in entries:
-            self._candidate(entry)
+            if frozen:
+                self._candidate(entry)
         selected = candidates or {
             entry["name"]: entry["candidate"] for entry in entries
         }
@@ -596,6 +686,10 @@ class GitWorkspace:
             entry = dict(original)
             repo, managed, worktree = self._entry(entry)
             self._candidate(entry)
+            if self._merging(worktree):
+                # A merge awaits the worker's resolution; keep it intact.
+                result.append(entry)
+                continue
             latest = self._text(
                 managed, "rev-parse", f"refs/heads/{entry['default_branch']}"
             )
@@ -605,8 +699,24 @@ class GitWorkspace:
                         worktree, "merge", "--no-edit", latest, check=False
                     )
                     if merge.returncode:
+                        paths = self._conflict_paths(worktree)
+                        if not paths:
+                            self._git(worktree, "merge", "--abort", check=False)
+                            raise GitFailure(
+                                "git.conflict", merge.stderr or merge.stdout
+                            )
                         raise GitFailure(
-                            "git.conflict", merge.stderr or merge.stdout
+                            "git.conflict",
+                            "Merging the new default branch "
+                            f"({entry['default_branch']}) into "
+                            f"{repo.name} conflicts in: "
+                            + ", ".join(paths)
+                            + ". The merge is prepared in the worktree with "
+                            "conflict markers. Edit those files to the "
+                            "correct combined content and remove every "
+                            "<<<<<<<, =======, >>>>>>> marker. Do not run "
+                            "git add, commit or merge --abort: the factory "
+                            "stages and commits the merge after you report.",
                         )
                 else:
                     self._git(worktree, "checkout", "--detach", latest)

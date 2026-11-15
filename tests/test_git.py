@@ -429,3 +429,67 @@ def test_validate_merged_refuses_commit_without_candidate(tmp_path):
     with pytest.raises(GitFailure) as error:
         manager.validate_merged(entries, {"source": merged}, "checks")
     assert error.value.code == "git.merge_provenance"
+
+
+def conflicted(tmp_path):
+    manager, _ = workspace(tmp_path)
+    entries = candidate(manager)
+    managed = Path(entries[0]["managed"])
+    (managed / "value.txt").write_text("other fix\n")
+    git(managed, "add", ".")
+    git(managed, "commit", "-m", "Conflicting work")
+    with pytest.raises(GitFailure) as error:
+        manager.sync(entries)
+    return manager, entries, error.value
+
+
+def test_conflict_message_tells_worker_what_to_do(tmp_path):
+    _, _, failure = conflicted(tmp_path)
+    assert "value.txt" in failure.summary
+    assert "Do not run git add" in failure.summary
+
+
+def test_factory_completes_merge_after_worker_edits_files(tmp_path):
+    manager, entries, _ = conflicted(tmp_path)
+    worktree = Path(entries[0]["worktree"])
+    managed = Path(entries[0]["managed"])
+    # Unresolved markers are refused.
+    with pytest.raises(GitFailure) as error:
+        manager.snapshot(entries, "item")
+    assert error.value.code == "git.conflict"
+    assert "value.txt" in error.value.summary
+    # The worker only edits the file; it never runs git add/commit.
+    (worktree / "value.txt").write_text("merged\n")
+    resolved = manager.snapshot(entries, "item")
+    assert git(worktree, "rev-parse", "-q", "--verify", "HEAD^2")
+    assert not git(worktree, "ls-files", "--unmerged")
+    assert not git(worktree, "status", "--porcelain")
+    assert resolved[0]["candidate"] == git(worktree, "rev-parse", "HEAD")
+    synced, changed = manager.sync(resolved)
+    assert changed
+    assert all(row["passed"] for row in manager.validate(synced, "checks"))
+    manager.integrate(synced)
+    assert (managed / "value.txt").read_text() == "merged\n"
+
+
+def test_check_worktree_snapshots_without_touching_worker_files(tmp_path):
+    manager, _ = workspace(tmp_path)
+    entries = manager.prepare("item", ["source"])
+    worktree = Path(entries[0]["worktree"])
+    (worktree / "value.txt").write_text("dirty\n")
+    (worktree / "new.txt").write_text("untracked\n")
+    head = git(worktree, "rev-parse", "HEAD")
+    status = git(worktree, "status", "--porcelain")
+    rows = manager.check_worktree(entries)
+    assert rows[0]["passed"]
+    assert rows[0]["kind"] == "worker_check"
+    assert git(worktree, "rev-parse", "HEAD") == head
+    assert git(worktree, "status", "--porcelain") == status
+    tree = git(
+        Path(entries[0]["managed"]),
+        "ls-tree",
+        "-r",
+        "--name-only",
+        rows[0]["revision"],
+    )
+    assert "new.txt" in tree

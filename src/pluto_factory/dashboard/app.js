@@ -499,6 +499,11 @@
   function renderOverview(work) {
     const sections = [];
     if (work.revision_reason) sections.push(append(section("Current revision"), node("p", "body-copy", work.revision_reason)));
+    if (work.guidance?.length) {
+      const guidance = section("Human guidance");
+      work.guidance.forEach(item => guidance.append(node("p", "body-copy", `${item.author}: ${item.text}`)));
+      sections.push(guidance);
+    }
     const acceptance = section("Acceptance criteria");
     if (work.acceptance?.length) acceptance.append(append(node("ol", "acceptance-list"), work.acceptance.map(text => node("li", "", text))));
     else acceptance.append(node("p", "body-copy", "No acceptance criteria were recorded."));
