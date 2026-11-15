@@ -217,6 +217,48 @@ def _read(database, selected=None):
         connection.close()
 
 
+def _project_decision(decision, factory_id, name):
+    """Terse problem first; raw block text is separate collapsed evidence."""
+    now = time.time()
+    return {
+        "factory": factory_id,
+        "factory_name": text(name, 200),
+        "id": decision["id"],
+        "work_id": decision["work_id"],
+        "kind": decision["kind"],
+        "question": text(decision["question"], 500),
+        "details": [text(d, 300) for d in decision["details"][:8]],
+        "why": text(decision.get("why"), 300),
+        "evidence": text(decision["context"], 6000),
+        "options": [
+            {
+                "label": text(o["label"], 200),
+                "effect": text(o.get("effect") or o.get("description"), 300),
+                "tradeoff": text(o.get("tradeoff"), 300),
+                "locus": text(o.get("locus") or "app", 200),
+                "fix": text(o.get("fix"), 300),
+                "recommended": bool(o["recommended"]),
+            }
+            for o in decision["options"][:10]
+        ],
+        "state": decision["state"],
+        "answer": text(decision["answer"], 500),
+        "advice": decision.get("advice", "none"),
+        "created": decision["created"],
+        "age": max(0, now - decision["created"]),
+    }
+
+
+def _work_decision(owner, work_id, factory_id, name):
+    """The newest open or answered decision blocking this work item."""
+    rows = [
+        d
+        for d in owner["decisions"]
+        if d["work_id"] == work_id and d["state"] in {"open", "answered"}
+    ]
+    return _project_decision(rows[-1], factory_id, name) if rows else None
+
+
 def _agent_activity(item, snapshot, coordinator_running):
     """Reported activity, not an inference from assignment or workflow phase.
 
@@ -438,8 +480,15 @@ class DashboardData:
                         needs, projected["id"], entry["name"], snapshot["owner"]
                     )
                     projected["work"] = [
-                        _summary(
-                            item, snapshot, entry.get("coordinator_running")
+                        self._with_decision(
+                            _summary(
+                                item,
+                                snapshot,
+                                entry.get("coordinator_running"),
+                            ),
+                            snapshot["owner"],
+                            projected["id"],
+                            entry["name"],
                         )
                         for item in snapshot["work"]
                     ]
@@ -484,6 +533,15 @@ class DashboardData:
         }
 
     @staticmethod
+    def _with_decision(summary, owner, factory_id, name):
+        decision = _work_decision(owner, summary["id"], factory_id, name)
+        summary["decision"] = decision
+        if decision:
+            # The card shows the terse problem, never the raw paragraph.
+            summary["latest_failure"] = decision["question"]
+        return summary
+
+    @staticmethod
     def _owner_items(needs, factory_id, name, owner):
         """Aggregate PRs and decisions that wait on the owner."""
         now = time.time()
@@ -507,32 +565,12 @@ class DashboardData:
             )
         for decision in owner["decisions"]:
             needs["decisions"].append(
-                {
-                    "factory": factory_id,
-                    "factory_name": text(name, 200),
-                    "id": decision["id"],
-                    "work_id": decision["work_id"],
-                    "kind": decision["kind"],
-                    "question": text(decision["question"], 500),
-                    "context": text(decision["context"], 6000),
-                    "options": [
-                        {
-                            "label": text(o["label"], 200),
-                            "description": text(o["description"], 500),
-                            "recommended": bool(o["recommended"]),
-                        }
-                        for o in decision["options"][:10]
-                    ],
-                    "state": decision["state"],
-                    "answer": text(decision["answer"], 500),
-                    "created": decision["created"],
-                    "age": max(0, now - decision["created"]),
-                }
+                _project_decision(decision, factory_id, name)
             )
         needs["decisions"].sort(key=lambda item: item["created"])
         needs["pull_requests"].sort(key=lambda item: -item["age"])
 
-    def answer(self, factory_id, decision_id, answer, note=""):
+    def answer(self, factory_id, decision_id, answer, note="", by="owner"):
         """Record an owner's answer in the factory ledger; nothing else."""
         from .state import State
 
@@ -542,7 +580,7 @@ class DashboardData:
         state = State(home)
         try:
             return answer_decision(
-                state, decision_id, answer, note, via="dashboard"
+                state, decision_id, answer, note, via="dashboard", by=by
             )
         except UnknownDecision as error:
             raise KeyError("Decision was not found.") from error
@@ -562,7 +600,12 @@ class DashboardData:
         )
         if item is None:
             raise KeyError("Work item was not found.")
-        summary = _summary(item, snapshot, entry.get("coordinator_running"))
+        summary = self._with_decision(
+            _summary(item, snapshot, entry.get("coordinator_running")),
+            snapshot["owner"],
+            factory_id,
+            entry["name"],
+        )
         runs = snapshot["runs"]
         reports = []
         for run in runs:

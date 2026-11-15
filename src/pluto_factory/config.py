@@ -8,11 +8,18 @@ from pathlib import Path
 
 from .models import FactoryConfig
 
+TERSE_STYLE = (
+    "Style for every rationale, defer reason and blocker message: "
+    "telegraphic, minimal words, bullets over prose, no filler; grammar may "
+    "be dropped but never a needed fact."
+)
+
 ROLE_TEXT = {
     "orchestrator": (
         "Choose a permitted next action from recorded evidence. Recover "
         "autonomously within authority. Notifications do not require blocking. "
-        "An unsupported claim never substitutes for required evidence."
+        "An unsupported claim never substitutes for required evidence. "
+        + TERSE_STYLE
     ),
     "implementer": (
         "Implement the assigned increment in the listed worktrees. Preserve "
@@ -26,6 +33,27 @@ ROLE_TEXT = {
         "assigned repository. Report required defects as findings and use "
         "factory_report for the verdict."
     ),
+    "advisor": (
+        "Brief the owner on a blocked item. Read-only: you have no tools and "
+        "change nothing. From the block reason and evidence, write a decision "
+        "record: problem in telegraphic style (hard cap 40 words, grammar may "
+        "be dropped, no needed fact dropped), optional detail bullets (each "
+        "at most 15 words), and 2-4 options. Each option: label (at most 8 "
+        "words), effect (at most 25 words), tradeoff (at most 25 words). "
+        "Mark exactly one option recommended and give a one-line why. "
+        "Bullets over prose; the raw block text is shown separately. "
+        "Framework rule: you can read the Pluto library sources the app "
+        "depends on (CLI, pluto-core, pluto-rbac, pluto-auth, pluto-jobs, "
+        "the TypeScript SDK) at the pinned versions; read them before "
+        "advising. If the root cause is a deficiency in a Pluto library or "
+        "the CLI, say so plainly in the problem, name the library, and "
+        "recommend the framework fix. Never recommend app-side workarounds "
+        "that bypass or loosen Pluto rules (RBAC, auth, jobs, core "
+        "conventions). Every option carries locus: 'app' or "
+        "'framework:<library>'; a framework option names the library and "
+        "gives a one-line fix summary. Prefer a framework option when the "
+        "cause is in the framework."
+    ),
     "qa": (
         "Validate the candidate's assigned behavior using the supplied "
         "scenarios and recorded checks. Do not change source or start agents. "
@@ -36,6 +64,8 @@ ROLE_TEXT = {
 
 # Tracking policy never affects validation; keep it out of the config digest.
 BUNDLE_EXCLUDED = {
+    "advisor",
+    "advisor_model",
     "tracked_repositories",
     "pr_poll_seconds",
     "pr_max_repairs",
@@ -69,6 +99,8 @@ def load_config(home: Path) -> FactoryConfig:
 def resolved_bundle(home: Path, config: FactoryConfig) -> dict:
     prompts = {}
     for role in ROLE_TEXT:
+        if role == "advisor":
+            continue  # read-only briefing; never part of validated config
         path = home / "prompts" / f"{role}.md"
         prompts[role] = path.read_text()
     guidance = home / "qa" / "guidance.md"
@@ -127,6 +159,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         exclude={
             "repositories",
             "tracked_repositories",
+            "advisor",
             "worker",
             "reviewer",
             "qa_model",
@@ -147,6 +180,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "self_improvement",
         "debug",
         "sandbox",
+        "advisor",
     ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():
@@ -181,3 +215,9 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "require_qa = true\n"
         "required_findings_block_integration = true\n"
     )
+
+
+def advisor_prompt(home: Path) -> str:
+    """The advisor role text; factories predating the role use the default."""
+    path = home / "prompts" / "advisor.md"
+    return path.read_text() if path.exists() else ROLE_TEXT["advisor"]

@@ -9,6 +9,7 @@ exhausted budgets escalate to the owner instead of looping.
 import re
 import time
 
+from .advisor import fallback_advice, terse
 from .attention import (
     OPEN_PR_STATES,
     add_decision,
@@ -368,6 +369,47 @@ class PRTracker:
         )
 
     def observe(self, row):
+        row = self._observe(row)
+        self._escalate(row)
+        return row
+
+    def _escalate(self, row):
+        """A PR that needs the owner always gets a decision (advised later)."""
+        if (
+            not row
+            or row["state"] != "needs_owner"
+            or row["reason"].startswith("Repair budget exhausted")
+        ):
+            return
+        advice = fallback_advice(row["reason"], pull_request=True)
+        add_decision(
+            self.state,
+            kind="free_text",
+            notify=False,  # set_pr already raised an attention notice
+            question=terse(
+                f"{row['slug']}#{row['number']}: {row['reason']}", 30
+            ),
+            context=(
+                f"{row['slug']}#{row['number']} {row['title']}\n"
+                f"{row['reason']}\n\n{row['log_excerpt'][-1500:]}"
+            ),
+            options=[
+                {
+                    "label": o.label,
+                    "effect": o.effect,
+                    "tradeoff": o.tradeoff,
+                    "locus": o.locus,
+                    "description": o.effect,
+                    "recommended": o.recommended,
+                }
+                for o in advice.options
+            ],
+            why=advice.why,
+            advice="pending",
+            block_key=f"pr:{row['slug']}#{row['number']}:{row['head']}:{row['reason'][:80]}",
+        )
+
+    def _observe(self, row):
         try:
             view = self.view(row)
         except GitHubFailure as error:

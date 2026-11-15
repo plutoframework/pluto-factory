@@ -113,6 +113,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if tailnet.https_port == 443:
                 origin_host = tailnet.dns_name
         self._expected_origin = scheme + origin_host
+        # Only a tailnet-proxied request vouches for a user identity.
+        self._login = (
+            self.headers.get("Tailscale-User-Login")
+            if host not in hosts
+            else None
+        )
         origins = self.headers.get_all("Origin", [])
         if origins and (
             len(origins) != 1 or origins[0] != scheme + origin_host
@@ -304,7 +310,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         factory, decision = match.groups()
         try:
             result = self.server.data.answer(
-                factory, decision, body["answer"], body.get("note", "")
+                factory,
+                decision,
+                body["answer"],
+                body.get("note", ""),
+                by=self._login or "owner",
             )
         except KeyError:
             return self._reject(404, "Factory or decision was not found.")

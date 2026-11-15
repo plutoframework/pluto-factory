@@ -5,11 +5,17 @@ import json
 import os
 from pathlib import Path
 
+from .config import TERSE_STYLE
 from .credentials import credential_environment
 from .models import CriterionAssessment, Decision, FactoryConfig, Failure
 from .ratelimit import limit_failure
 
 CLAUDE_TIMEOUT_SECONDS = 120
+
+
+def _styled(prompt: str) -> str:
+    """Stale on-disk prompts still get the terse-message rule."""
+    return prompt if TERSE_STYLE in prompt else f"{prompt}\n\n{TERSE_STYLE}"
 
 
 class CoordinatorError(RuntimeError):
@@ -85,7 +91,7 @@ class Coordinator:
             agent = Agent(
                 self.config.coordinator_model,
                 output_type=Decision,
-                instructions=prompt,
+                instructions=_styled(prompt),
                 retries=1,
                 model_settings={"timeout": 45},
             )
@@ -108,7 +114,7 @@ class Coordinator:
         model = self.config.coordinator_model.removeprefix("anthropic:")
         options = ClaudeAgentOptions(
             model=model,
-            system_prompt=prompt,
+            system_prompt=_styled(prompt),
             tools=[],
             setting_sources=[],
             max_turns=3,

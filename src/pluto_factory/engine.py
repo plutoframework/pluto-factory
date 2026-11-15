@@ -13,23 +13,34 @@ from .acceptance import (
     citable_ids,
     current_evidence,
 )
+from .advisor import Advisor, evidence_packet, fallback_advice, terse
 from .attention import (
+    GAP_RESUME,
     add_decision,
+    answer_decision,
+    apply_advice,
     apply_config_change,
     approved,
+    chosen_option,
+    enqueue_issue_comment,
+    flush_issue_comments,
+    framework_library,
+    get_decision,
     get_pr,
     guidance_text,
     list_decisions,
     mark_applied,
+    record_framework_gap,
     set_pr,
 )
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
+from .framework_sources import pins
 from .git import GitFailure, GitWorkspace
 from .github import GitHubFailure
 from .harness import HarnessError, make_harness
 from .improvements import propose
-from .models import Failure, WorkerReport
+from .models import Failure, WorkerReport, workable_repositories
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
 from .pr_tracker import REPAIR_RULES, PRTracker, parse_repair_source
@@ -138,6 +149,7 @@ class Engine:
 
             self.github = GitHubFlow(self.state, self.config)
         self.tracker = PRTracker(self)
+        self.advisor = Advisor(self.home, self.config)
 
     def _ready(self, work):
         if work["phase"] == "completed" or work["control"] in {
@@ -486,7 +498,10 @@ class Engine:
 
     def attention(self, force=False):
         """Apply answered decisions, then poll tracked pull requests."""
+        self.check_framework_gaps()
         self.process_decisions()
+        self.advise_pending()
+        self.flush_issue_comments()
         if self.state.is_paused():
             return
         try:
@@ -529,44 +544,128 @@ class Engine:
         if proposal.get("pr") and decision["answer"].startswith("Grant"):
             slug, _, number = proposal["pr"].rpartition("#")
             self.tracker.grant(slug, int(number))
+        option = chosen_option(decision)
+        if framework_library(option):
+            # Parked until the gap decision is answered or the pin moves.
+            gap = record_framework_gap(
+                self.state,
+                decision,
+                option,
+                pins(self.advisor.sources()),
+            )
+            detail["framework_gap"] = gap["id"]
+            enqueue_issue_comment(self.state, decision, "answered")
+            mark_applied(self.state, decision["id"], detail)
+            return
         if decision["work_id"]:
             work = self.state.get_work(decision["work_id"])
             self.state.add_guidance(decision["work_id"], text, "owner")
             if work["control"] in {"deferred", "quarantined", "backoff"}:
                 self.state.resume(decision["work_id"])
+        enqueue_issue_comment(self.state, decision, "answered")
         mark_applied(self.state, decision["id"], detail)
 
     def _reload_config(self):
         self.config = load_config(self.home)
         self.git.config = self.config
         self.tracker.config = self.config
+        self.advisor.config = self.config
         if hasattr(self.coordinator, "config"):
             self.coordinator.config = self.config
 
     def _ask_owner(self, work, reason):
-        """Every deferral a human must resolve becomes a durable decision."""
+        """Every deferral a human must resolve becomes a durable decision.
+
+        Filed at once with a deterministic terse headline; the advisor
+        rewrites headline, options and rationale in place on a later tick.
+        Raw block text stays as collapsed evidence.
+        """
+        advice = fallback_advice(reason)
         add_decision(
             self.state,
             work_id=work["id"],
             kind="free_text",
             notify=False,  # the deferral already raised action_required
-            question=f"{work['title']}: {reason}"[:500],
+            question=f"{work['title']}: {terse(reason, 30)}"[:500],
             context=(
-                f"Work '{work['title']}' ({work['id']}) is parked in phase "
-                f"{work['phase']}.\n\n{reason}"
+                f"Work '{work['title']}' ({work['id']}), phase "
+                f"{work['phase']}.\n{reason}"
             ),
             options=[
                 {
-                    "label": "Retry as planned",
-                    "description": "Resume the work and try again",
-                    "recommended": True,
-                },
-                {
-                    "label": "Stop; I will handle it manually",
-                    "description": "Resume with guidance to stand down",
-                },
+                    "label": o.label,
+                    "effect": o.effect,
+                    "tradeoff": o.tradeoff,
+                    "locus": o.locus,
+                    "fix": o.fix,
+                    "description": o.effect,
+                    "recommended": o.recommended,
+                }
+                for o in advice.options
             ],
+            why=advice.why,
+            advice="pending",
+            block_key=digest({"work": work["id"], "reason": reason})[:24],
         )
+
+    def check_framework_gaps(self):
+        """A bumped library pin answers its open framework gap."""
+        open_gaps = [
+            d
+            for d in list_decisions(self.state, {"open"})
+            if d["kind"] == "framework_gap" and d["proposal"]
+        ]
+        if not open_gaps:
+            return
+        current = pins(self.advisor.sources())
+        for gap in open_gaps:
+            library, pinned = gap["proposal"]["library"], gap["proposal"]["pin"]
+            now = current.get(library)
+            if now and pinned != "unknown" and now != pinned:
+                answer_decision(
+                    self.state,
+                    gap["id"],
+                    GAP_RESUME,
+                    f"{library} pin bumped {pinned} -> {now}",
+                    via="coordinator",
+                    by="coordinator",
+                )
+
+    def advise_pending(self, limit=2):
+        """Run the advisor on decisions still carrying raw block text."""
+        if self._limited():
+            return 0
+        done = 0
+        rows = self.state.db.execute(
+            "SELECT id FROM decisions WHERE state='open' AND "
+            "advice='pending' ORDER BY created LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            decision = get_decision(self.state, row["id"])
+            packet = evidence_packet(self.state, decision, decision["context"])
+            advice, source = self.advisor.advise(
+                packet, pull_request=decision["work_id"] is None
+            )
+            if apply_advice(self.state, decision["id"], advice, source):
+                done += 1
+        return done
+
+    def flush_issue_comments(self):
+        allowed = {
+            repo.github
+            for repo in workable_repositories(self.config)
+            if repo.github
+        }
+        try:
+            return flush_issue_comments(
+                self.state, self.tracker.adapter, allowed
+            )
+        except GitHubFailure as error:
+            self.state.event(
+                "issue_comment.failed", "factory", {"code": error.code}
+            )
+            return 0
 
     def _resync_pull_requests(self, work, stale):
         """Bring a published candidate up to date with the default branch.

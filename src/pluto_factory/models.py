@@ -50,6 +50,32 @@ class TrackedRepository(Contract):
         return ("t-" + slug)[:32]
 
 
+ANTHROPIC_ADVISOR_MODEL = "claude-opus-5-5"
+OPENAI_ADVISOR_MODEL = "gpt-6.1-sol"
+
+
+class AdvisorPolicy(Contract):
+    """Read-only advisor: reasoning effort and extra framework sources.
+
+    ``reference_paths`` are local checkouts of Pluto libraries (CLI,
+    pluto-core/rbac/auth/jobs, the TypeScript SDK) added to the sources
+    resolved from the Go module cache and node_modules at pinned versions.
+    """
+
+    reasoning: str = "high"
+    reference_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("reference_paths")
+    @classmethod
+    def _paths(cls, paths):
+        for raw in paths:
+            if not raw or "\0" in raw or ".." in Path(raw).parts:
+                raise ValueError(f"invalid reference path: {raw!r}")
+            if not os.path.isabs(os.path.expanduser(raw)):
+                raise ValueError(f"reference path must be absolute: {raw!r}")
+        return paths
+
+
 class ModelProfile(Contract):
     provider: str = "openai"
     model: str = "gpt-6.1-sol"
@@ -194,6 +220,9 @@ class FactoryConfig(Contract):
     api_key_env: str = "OPENAI_API_KEY"
     worker: ModelProfile = Field(default_factory=ModelProfile)
     reviewer: ModelProfile = Field(default_factory=ModelProfile)
+    # Strongest tier by default; set to e.g. "claude-fable-5-2" to override.
+    advisor_model: str = ""
+    advisor: AdvisorPolicy = Field(default_factory=lambda: AdvisorPolicy())
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"
@@ -231,6 +260,38 @@ class FactoryConfig(Contract):
     )
     debug: DebugPolicy = Field(default_factory=DebugPolicy)
     sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
+
+    @model_validator(mode="after")
+    def _advisor_model(self):
+        if self.advisor_model:
+            if not re.fullmatch(r"[A-Za-z0-9._:/-]+", self.advisor_model):
+                raise ValueError("advisor_model has invalid characters")
+            if self.advisor_provider == "anthropic" and not (
+                self.advisor_model.startswith("claude-")
+            ):
+                raise ValueError(
+                    "advisor_model must be a claude-* model on Anthropic"
+                )
+        return self
+
+    @property
+    def advisor_provider(self) -> str:
+        anthropic = (
+            self.coordinator_runtime == "claude_agent_sdk"
+            or self.harness == "claude"
+        )
+        return "anthropic" if anthropic else "openai"
+
+    def advisor_model_name(self) -> str:
+        """Configured override, else the provider's strongest default."""
+        if self.advisor_model:
+            return self.advisor_model
+        if self.advisor_provider == "anthropic":
+            return ANTHROPIC_ADVISOR_MODEL
+        prefix, sep, _ = self.coordinator_model.partition(":")
+        return (
+            f"{prefix}:{OPENAI_ADVISOR_MODEL}" if sep else OPENAI_ADVISOR_MODEL
+        )
 
 
 def workable_repositories(config) -> list[Repository]:
@@ -298,7 +359,10 @@ class CriterionAssessment(Contract):
 
 class Decision(Contract):
     action: Literal["advance", "revise", "retry", "defer", "complete"]
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(
+        min_length=1,
+        description="Telegraphic, minimal words, bullets over prose.",
+    )
     acceptance: list[CriterionAssessment] = Field(default_factory=list)
 
 

@@ -20,7 +20,18 @@ CREATE TABLE IF NOT EXISTS decisions (
     question TEXT NOT NULL, context TEXT NOT NULL DEFAULT '',
     options TEXT NOT NULL DEFAULT '[]', proposal TEXT,
     state TEXT NOT NULL DEFAULT 'open', answer TEXT, note TEXT,
-    created REAL NOT NULL, answered_at REAL, applied_at REAL
+    created REAL NOT NULL, answered_at REAL, applied_at REAL,
+    details TEXT NOT NULL DEFAULT '[]', why TEXT NOT NULL DEFAULT '',
+    advice TEXT NOT NULL DEFAULT 'none', block_key TEXT,
+    answered_by TEXT
+);
+CREATE TABLE IF NOT EXISTS issue_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id TEXT NOT NULL, kind TEXT NOT NULL,
+    slug TEXT NOT NULL, issue INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+    wake_at REAL NOT NULL DEFAULT 0, last_error TEXT,
+    created REAL NOT NULL, UNIQUE (decision_id, kind)
 );
 CREATE TABLE IF NOT EXISTS pull_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +50,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 """
 
-DECISION_KINDS = {"choice", "free_text", "config"}
+DECISION_KINDS = {"choice", "free_text", "config", "framework_gap"}
 OPEN_PR_STATES = {
     "open",
     "pending",
@@ -87,8 +98,23 @@ class TrackingRequired(ValueError):
     """A delivery step was attempted without a tracker row for its PR."""
 
 
+DECISION_COLUMNS = {
+    "details": "TEXT NOT NULL DEFAULT '[]'",
+    "why": "TEXT NOT NULL DEFAULT ''",
+    "advice": "TEXT NOT NULL DEFAULT 'none'",
+    "block_key": "TEXT",
+    "answered_by": "TEXT",
+}
+
+
 def ensure_schema(db):
     db.executescript(SCHEMA)
+    present = {row[1] for row in db.execute("PRAGMA table_info(decisions)")}
+    for column, definition in DECISION_COLUMNS.items():
+        if column not in present:
+            db.execute(
+                f"ALTER TABLE decisions ADD COLUMN {column} {definition}"
+            )
 
 
 def _id(prefix):
@@ -111,6 +137,7 @@ def _decision(row):
     result["proposal"] = (
         json.loads(result["proposal"]) if result["proposal"] else None
     )
+    result["details"] = json.loads(result.get("details") or "[]")
     return result
 
 
@@ -126,6 +153,10 @@ def normalize_options(options):
             {
                 "label": label,
                 "description": _clip(option.get("description"), 500),
+                "effect": _clip(option.get("effect"), 300),
+                "locus": _clip(option.get("locus") or "app", 200),
+                "fix": _clip(option.get("fix"), 300),
+                "tradeoff": _clip(option.get("tradeoff"), 300),
                 "recommended": bool(option.get("recommended")),
             }
         )
@@ -165,8 +196,18 @@ def add_decision(
     work_id=None,
     proposal=None,
     notify=True,
+    details=None,
+    why="",
+    advice="none",
+    block_key=None,
 ):
-    """File a decision for the owner; the same open work+question is one."""
+    """File a decision for the owner; the same open work+question is one.
+
+    ``block_key`` also dedupes: the advisor may reword the question later, so
+    a repeated block is recognised by its raw reason, not its headline.
+    ``advice='pending'`` queues the advisor to rewrite the headline,
+    options and rationale in place.
+    """
     if kind not in DECISION_KINDS:
         raise AttentionError(f"unknown decision kind {kind!r}")
     question = _clip(question, QUESTION_LIMIT).strip()
@@ -182,24 +223,25 @@ def add_decision(
                     {"label": "Decline"},
                 ]
             )
-    if kind == "choice" and len(options) < 2:
+    if kind in {"choice", "framework_gap"} and len(options) < 2:
         raise AttentionError("a choice needs at least two options")
     with state.db:
         state.db.execute("BEGIN IMMEDIATE")
         if work_id is not None:
             state.get_work(work_id)
         existing = state.db.execute(
-            "SELECT * FROM decisions WHERE work_id IS ? AND question=? "
+            "SELECT * FROM decisions WHERE work_id IS ? AND "
+            "(question=? OR (block_key IS NOT NULL AND block_key=?)) "
             "AND state IN ('open','answered')",
-            (work_id, question),
+            (work_id, question, block_key),
         ).fetchone()
         if existing:
             return _decision(existing)
         decision_id = _id("decision")
         state.db.execute(
             "INSERT INTO decisions "
-            "(id,work_id,kind,question,context,options,proposal,created) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "(id,work_id,kind,question,context,options,proposal,created,"
+            "details,why,advice,block_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 decision_id,
                 work_id,
@@ -209,6 +251,10 @@ def add_decision(
                 json.dumps(options),
                 json.dumps(proposal) if proposal else None,
                 time.time(),
+                json.dumps([_clip(d, 300) for d in (details or [])][:8]),
+                _clip(why, 300),
+                advice,
+                block_key,
             ),
         )
         state._event(
@@ -223,7 +269,10 @@ def add_decision(
                 f"Needs your decision: {question}",
                 f"decision:{decision_id}",
             )
-    return get_decision(state, decision_id)
+    decision = get_decision(state, decision_id)
+    if advice == "none":
+        enqueue_issue_comment(state, decision, "created")
+    return decision
 
 
 def get_decision(state, decision_id):
@@ -246,7 +295,7 @@ def list_decisions(state, states=None):
     ]
 
 
-def answer_decision(state, decision_id, answer, note="", via="cli"):
+def answer_decision(state, decision_id, answer, note="", via="cli", by="owner"):
     """Record the owner's answer only; the coordinator applies it."""
     answer = _clip(answer, ANSWER_LIMIT).strip()
     note = _clip(note, ANSWER_LIMIT).strip()
@@ -258,17 +307,25 @@ def answer_decision(state, decision_id, answer, note="", via="cli"):
         if decision["state"] != "open":
             raise DecisionConflict(f"decision is already {decision['state']}")
         labels = [option["label"] for option in decision["options"]]
-        if decision["kind"] in {"choice", "config"} and answer not in labels:
+        if (
+            decision["kind"] in {"choice", "config", "framework_gap"}
+            and answer not in labels
+        ):
             raise AttentionError("answer must be one of the listed options")
         state.db.execute(
             "UPDATE decisions SET state='answered',answer=?,note=?,"
-            "answered_at=? WHERE id=?",
-            (answer, note, time.time(), decision_id),
+            "answered_at=?,answered_by=? WHERE id=?",
+            (answer, note, time.time(), _clip(by, 200) or "owner", decision_id),
         )
         state._event(
             "decision.answered",
             decision["work_id"] or "factory",
-            {"id": decision_id, "answer": answer[:200], "via": via},
+            {
+                "id": decision_id,
+                "answer": answer[:200],
+                "via": via,
+                "by": _clip(by, 200) or "owner",
+            },
         )
     return get_decision(state, decision_id)
 
@@ -301,6 +358,55 @@ def mark_applied(state, decision_id, detail=None):
             decision["work_id"] or "factory",
             {"id": decision_id, **(detail or {})},
         )
+
+
+def chosen_option(decision):
+    for option in decision["options"]:
+        if option["label"] == decision["answer"]:
+            return option
+    return None
+
+
+def framework_library(option):
+    locus = (option or {}).get("locus", "app")
+    return locus.partition(":")[2] if locus.startswith("framework:") else ""
+
+
+GAP_RESUME = "Framework fixed; resume"
+GAP_WITHDRAW = "Withdraw; handle in the app"
+
+
+def record_framework_gap(state, decision, option, pins):
+    """File a framework-gap item for a chosen framework option.
+
+    The blocked work stays parked: only an answer to the gap decision (or a
+    bump of the library's pinned version) resumes it. No framework repo is
+    edited.
+    """
+    library = framework_library(option)
+    gap = add_decision(
+        state,
+        work_id=decision["work_id"],
+        kind="framework_gap",
+        question=f"Framework gap in {library}: {option['fix']}"[:500],
+        context=(
+            f"Chosen: {option['label']}.\nBlocked: {decision['question']}\n"
+            f"Pinned: {library} {pins.get(library, 'unknown')}"
+        ),
+        options=[
+            {"label": GAP_RESUME, "recommended": True},
+            {"label": GAP_WITHDRAW},
+        ],
+        proposal={"library": library, "pin": pins.get(library, "unknown")},
+        block_key=f"gap:{decision['id']}",
+        notify=True,
+    )
+    state.event(
+        "framework_gap.recorded",
+        decision["work_id"] or "factory",
+        {"id": gap["id"], "library": library, "fix": option["fix"][:300]},
+    )
+    return gap
 
 
 def guidance_text(decision):
@@ -639,3 +745,198 @@ def read_attention(connection):
     ):  # tables absent: factory predates attention
         return {"decisions": [], "pull_requests": []}
     return {"decisions": decisions, "pull_requests": prs}
+
+
+def apply_advice(state, decision_id, advice, source):
+    """Replace a pending decision's headline/options with advisor output."""
+    options = normalize_options(
+        [
+            {
+                "label": o.label,
+                "effect": o.effect,
+                "tradeoff": o.tradeoff,
+                "locus": o.locus,
+                "fix": o.fix,
+                "description": o.effect,
+                "recommended": o.recommended,
+            }
+            for o in advice.options
+        ]
+    )
+    with state.db:
+        changed = state.db.execute(
+            "UPDATE decisions SET question=?,details=?,options=?,why=?,"
+            "advice=? WHERE id=? AND state='open' AND advice='pending'",
+            (
+                _clip(advice.problem, QUESTION_LIMIT),
+                json.dumps(advice.details),
+                json.dumps(options),
+                advice.why,
+                source,
+                decision_id,
+            ),
+        ).rowcount
+        if not changed:
+            state.db.execute(
+                "UPDATE decisions SET advice='skipped' WHERE id=? "
+                "AND advice='pending'",
+                (decision_id,),
+            )
+        else:
+            state._event(
+                "decision.advised",
+                get_decision(state, decision_id)["work_id"] or "factory",
+                {"id": decision_id, "source": source},
+            )
+    if changed:
+        enqueue_issue_comment(
+            state, get_decision(state, decision_id), "created"
+        )
+    return bool(changed)
+
+
+# --- GitHub issue history (coordinator-side outbox) ------------------------
+
+MARKER = "<!-- pluto-factory:decision:{id}:{kind} -->"
+ISSUE_SOURCE = re.compile(r"^github:([^:]+):(\d+)$")
+
+
+def marker(decision_id, kind):
+    return MARKER.format(id=decision_id, kind=kind)
+
+
+def source_issue(state, work_id):
+    """(slug, issue number) of the work's source issue, if it has one."""
+    if not work_id:
+        return None
+    from .dependencies import canonical_existing
+
+    row = state.db.execute(
+        "SELECT source_key FROM work WHERE id=?", (work_id,)
+    ).fetchone()
+    match = (
+        ISSUE_SOURCE.fullmatch(canonical_existing(row[0]) or "")
+        if row
+        else None
+    )
+    return (match[1], int(match[2])) if match else None
+
+
+def enqueue_issue_comment(state, decision, kind):
+    """Queue one comment per (decision, kind); a no-op without an issue."""
+    issue = source_issue(state, decision["work_id"])
+    if issue is None:
+        return False
+    with state.db:
+        cursor = state.db.execute(
+            "INSERT OR IGNORE INTO issue_comments "
+            "(decision_id,kind,slug,issue,created) VALUES (?,?,?,?,?)",
+            (decision["id"], kind, issue[0], issue[1], time.time()),
+        )
+    return bool(cursor.rowcount)
+
+
+def _words(text, limit):
+    return (
+        text if len(text.split()) <= limit else " ".join(text.split()[:limit])
+    )
+
+
+def comment_body(decision, kind):
+    lines = [marker(decision["id"], kind)]
+    if kind == "created":
+        lines.append(f"**Owner decision needed:** {decision['question']}")
+        for detail in decision["details"]:
+            lines.append(f"- {detail}")
+        lines.append("")
+        for option in decision["options"]:
+            star = " (recommended)" if option["recommended"] else ""
+            effect = option.get("effect") or option.get("description") or ""
+            tradeoff = option.get("tradeoff")
+            line = f"- **{option['label']}**{star}: {effect}"
+            lines.append(line + (f" Tradeoff: {tradeoff}" if tradeoff else ""))
+        if decision.get("why"):
+            lines.append(f"\nRecommended because: {decision['why']}")
+    else:
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M:%SZ", time.gmtime(decision["answered_at"] or 0)
+        )
+        lines.append(f"**Decision answered:** {decision['question']}")
+        lines.append(f"- Answer: {decision['answer']}")
+        if decision.get("note"):
+            lines.append(f"- Custom feedback: {decision['note']}")
+        lines.append(f"- By: {decision.get('answered_by') or 'owner'}")
+        lines.append(f"- At: {stamp}")
+    return _clip("\n".join(lines), 6000)
+
+
+def flush_issue_comments(state, adapter, allowed_slugs):
+    """Post queued comments once each; retry with backoff on failure."""
+    from .github import GitHubFailure
+
+    posted = 0
+    rows = state.db.execute(
+        "SELECT * FROM issue_comments WHERE state='pending' AND wake_at<=? "
+        "ORDER BY id",
+        (time.time(),),
+    ).fetchall()
+    for row in rows:
+        decision = get_decision(state, row["decision_id"])
+        if row["slug"] not in allowed_slugs:
+            outcome, error = "skipped", "issue repository is not registered"
+        else:
+            try:
+                existing = adapter._json(
+                    [
+                        "gh",
+                        "issue",
+                        "view",
+                        str(row["issue"]),
+                        "--repo",
+                        row["slug"],
+                        "--json",
+                        "comments",
+                    ]
+                )
+                tag = marker(row["decision_id"], row["kind"])
+                if any(
+                    tag in (c.get("body") or "")
+                    for c in existing.get("comments") or []
+                ):
+                    outcome, error = "delivered", None  # already there
+                else:
+                    adapter._run(
+                        [
+                            "gh",
+                            "issue",
+                            "comment",
+                            str(row["issue"]),
+                            "--repo",
+                            row["slug"],
+                            "--body",
+                            comment_body(decision, row["kind"]),
+                        ],
+                        mutating=True,
+                    )
+                    outcome, error = "delivered", None
+                    posted += 1
+            except GitHubFailure as failure:
+                outcome, error = "retry", failure.code
+        with state.db:
+            if outcome == "retry":
+                state.db.execute(
+                    "UPDATE issue_comments SET attempts=attempts+1,"
+                    "last_error=?,wake_at=? WHERE id=?",
+                    (
+                        error,
+                        time.time() + min(5 * 2 ** row["attempts"], 300),
+                        row["id"],
+                    ),
+                )
+            else:
+                state.db.execute(
+                    "UPDATE issue_comments SET state=?,attempts=attempts+1,"
+                    "last_error=? WHERE id=?",
+                    (outcome, error, row["id"]),
+                )
+    return posted
