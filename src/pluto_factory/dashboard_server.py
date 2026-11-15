@@ -1,10 +1,15 @@
-"""Read-only loopback HTTP boundary for the local factory dashboard.
+"""Loopback HTTP boundary for the local factory dashboard.
 
-The server only binds 127.0.0.1. Optional tailnet access goes through a
+Everything is read-only except one narrow route: POST
+``/api/factories/<id>/decisions/<decision>/answer`` records an owner's answer
+in the factory ledger. The server never runs git, gh or workers; the
+coordinator acts on the answer. The server only binds 127.0.0.1. Optional tailnet access goes through a
 foreground ``tailscale serve`` proxy (see ``tailnet``)."""
 
+import hmac
 import json
 import re
+import secrets
 import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .attention import AttentionError, DecisionConflict
 from .dashboard_data import DashboardData
 from .tailnet import TailnetAccess, TailnetProxy, discover
 from .visibility import VisibilityError
@@ -32,7 +38,12 @@ PAGES = {"/", "/index.html"}
 DETAIL = re.compile(
     r"^/api/factories/([a-f0-9]{20})/work/([A-Za-z0-9_-]{1,100})(/terminal)?$"
 )
+ANSWER = re.compile(
+    r"^/api/factories/([a-f0-9]{20})/decisions/(decision-[a-f0-9]{12})/answer$"
+)
 MAX_RESPONSE = 8 * 1024 * 1024
+MAX_BODY = 16 * 1024
+CSRF_HEADER = "X-Pluto-CSRF"
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -49,6 +60,8 @@ class DashboardServer(ThreadingHTTPServer):
             raise ValueError("dashboard port must be between 0 and 65535")
         self.data = data
         self.tailnet = tailnet
+        # Per-process secret, delivered with /api/state, required on writes.
+        self.csrf = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), DashboardHandler)
 
 
@@ -99,6 +112,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             scheme = "https://"
             if tailnet.https_port == 443:
                 origin_host = tailnet.dns_name
+        self._expected_origin = scheme + origin_host
         origins = self.headers.get_all("Origin", [])
         if origins and (
             len(origins) != 1 or origins[0] != scheme + origin_host
@@ -178,7 +192,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = parsed.path
         try:
             if path == "/api/state":
-                return self._json(200, self.server.data.state())
+                return self._json(
+                    200, {**self.server.data.state(), "csrf": self.server.csrf}
+                )
             match = DETAIL.fullmatch(path)
             if match:
                 factory, work, terminal = match.groups()
@@ -212,11 +228,98 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _unsupported(self):
         self._json(
-            405, {"error": "The dashboard supports read-only GET requests."}
+            405,
+            {
+                "error": "The dashboard supports GET requests and decision "
+                "answers only."
+            },
         )
         self.close_connection = True
 
-    do_POST = _unsupported
+    def _reject(self, status, message):
+        self._json(status, {"error": message})
+        self.close_connection = True
+
+    def _write_refusal(self):
+        """Extra checks every state-changing request must pass."""
+        origins = self.headers.get_all("Origin", [])
+        if len(origins) != 1 or origins[0] != self._expected_origin:
+            return 403, "A matching Origin header is required."
+        if self.headers.get("Sec-Fetch-Site") != "same-origin":
+            return 403, "Same-origin requests are required."
+        token = self.headers.get(CSRF_HEADER, "")
+        if not hmac.compare_digest(token.encode(), self.server.csrf.encode()):
+            return 403, "A valid CSRF token is required."
+        kind = self.headers.get("Content-Type", "").split(";")[0].strip()
+        if kind.lower() != "application/json":
+            return 415, "Content-Type must be application/json."
+        if self.headers.get("Transfer-Encoding"):
+            return 411, "A Content-Length body is required."
+        return None
+
+    def do_POST(self):
+        refusal = self._refusal()
+        if refusal:
+            print(f"dashboard: refused request: {refusal}", file=sys.stderr)
+            return self._reject(
+                403,
+                "Loopback or allowed tailnet same-origin requests are "
+                f"required: {refusal}.",
+            )
+        try:
+            parsed = urlsplit(self.path)
+        except ValueError:
+            return self._reject(404, "Unknown dashboard route.")
+        match = (
+            None
+            if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+            else ANSWER.fullmatch(parsed.path)
+        )
+        if not match:
+            return self._unsupported()
+        refused = self._write_refusal()
+        if refused:
+            return self._reject(*refused)
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return self._reject(411, "A Content-Length body is required.")
+        if length < 1:
+            return self._reject(400, "A JSON body is required.")
+        if length > MAX_BODY:
+            return self._reject(413, "The request body is too large.")
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            return self._reject(400, "The body must be valid JSON.")
+        if (
+            not isinstance(body, dict)
+            or set(body) - {"answer", "note"}
+            or not isinstance(body.get("answer"), str)
+            or not isinstance(body.get("note", ""), str)
+        ):
+            return self._reject(
+                400, "Send an object with a text 'answer' and optional 'note'."
+            )
+        factory, decision = match.groups()
+        try:
+            result = self.server.data.answer(
+                factory, decision, body["answer"], body.get("note", "")
+            )
+        except KeyError:
+            return self._reject(404, "Factory or decision was not found.")
+        except AttentionError as error:
+            return self._reject(400, str(error))
+        except DecisionConflict as error:
+            return self._reject(409, str(error))
+        except (OSError, RuntimeError, TypeError, sqlite3.Error):
+            return self._reject(503, "Factory data is temporarily unavailable.")
+        self._json(
+            200,
+            {"id": result["id"], "state": result["state"]},
+        )
+        self.close_connection = True
+
     do_PUT = _unsupported
     do_PATCH = _unsupported
     do_DELETE = _unsupported
@@ -258,7 +361,7 @@ def serve(
                     flush=True,
                 )
             print(
-                "Read-only. Press Ctrl-C to stop the dashboard.",
+                "Read-only except answering decisions. Press Ctrl-C to stop.",
                 file=sys.stderr,
                 flush=True,
             )

@@ -23,6 +23,7 @@
     openAssignments: new Set(), expanded: false,
     renderedPanelKey: null,
     lastPanelSignature: null, toastTimer: null,
+    needsSignature: null, picked: new Map(), drafts: new Map(), answering: new Set(), answerErrors: new Map(),
   };
 
   function node(tag, className, text) {
@@ -704,8 +705,108 @@
     return content;
   }
 
+  function ageText(seconds) {
+    const s = Math.max(0, Math.floor(seconds));
+    if (s < 60) return "just now";
+    if (s < 3600) return `${Math.floor(s / 60)}m`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h`;
+    return `${Math.floor(s / 86400)}d`;
+  }
+  function renderNeeds() {
+    const needs = state.data?.needs_you || { pull_requests: [], decisions: [], count: 0 };
+    const signature = JSON.stringify([needs.pull_requests, needs.decisions].map(list => list.map(({ age, ...rest }) => rest)));
+    $("#needs-you").hidden = !needs.pull_requests.length && !needs.decisions.length;
+    $("#needs-count").textContent = needs.count ? String(needs.count) : "";
+    if (signature === state.needsSignature) return;
+    // Keep text the owner is typing: only rebuild when the data changed.
+    if (state.needsSignature !== null && document.activeElement?.closest?.("#needs-decisions")) {
+      const active = document.activeElement;
+      if (active.tagName === "TEXTAREA") return;
+    }
+    state.needsSignature = signature;
+    const prs = $("#needs-prs");
+    prs.replaceChildren(...(needs.pull_requests.length ? needs.pull_requests.map(pr => {
+      const item = node("li", "needs-item");
+      const title = pr.url ? safeLink(pr.url, `${pr.repo}#${pr.number}`) : node("span", "", `${pr.repo}#${pr.number}`);
+      append(item,
+        append(node("div", "needs-line"), title, badge(human(pr.state), pr.state === "ready" ? "success" : "active"),
+          node("span", "muted", `${pr.factory_name} · ${ageText(pr.age)}`)),
+        node("p", "needs-title", pr.title),
+        node("p", "secondary-line", pr.reason));
+      return item;
+    }) : [node("li", "muted", "No pull requests need you.")]));
+    const list = $("#needs-decisions");
+    list.replaceChildren(...(needs.decisions.length ? needs.decisions.map(decisionCard) : [node("p", "muted", "No open decisions.")]));
+  }
+  function decisionCard(decision) {
+    const card = node("div", "needs-item decision");
+    card.dataset.decisionId = decision.id;
+    append(card, append(node("div", "needs-line"), node("strong", "", decision.question),
+      node("span", "muted", `${decision.factory_name} · ${ageText(decision.age)}`)));
+    if (decision.context) card.append(node("pre", "decision-context", decision.context));
+    if (decision.state === "answered") {
+      card.append(node("p", "secondary-line", `Answered: ${decision.answer}. Waiting for the coordinator.`));
+      return card;
+    }
+    if (decision.state === "applied") {
+      card.append(node("p", "secondary-line", `Applied: ${decision.answer}.`));
+      return card;
+    }
+    const options = node("div", "decision-options");
+    for (const option of decision.options) {
+      const button = node("button", "button button-small", option.label + (option.recommended ? " (recommended)" : ""));
+      button.type = "button";
+      if (option.description) button.title = option.description;
+      const selected = (state.picked.get(decision.id) ?? decision.options.find(o => o.recommended)?.label) === option.label;
+      button.setAttribute("aria-pressed", String(selected));
+      button.addEventListener("click", () => {
+        state.picked.set(decision.id, option.label);
+        options.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b === button)));
+      });
+      options.append(button);
+    }
+    const field = node("textarea", "decision-text");
+    field.rows = 2; field.maxLength = 4000;
+    field.placeholder = decision.kind === "choice" ? "Optional note" : "Answer in your own words";
+    field.setAttribute("aria-label", `Answer: ${decision.question}`);
+    field.value = state.drafts.get(decision.id) || "";
+    field.addEventListener("input", () => state.drafts.set(decision.id, field.value));
+    const submit = node("button", "button", "Answer");
+    submit.type = "button";
+    submit.disabled = state.answering.has(decision.id);
+    const error = node("p", "decision-error", state.answerErrors.get(decision.id) || "");
+    submit.addEventListener("click", () => answerDecision(decision, submit, error));
+    append(card, options, field, append(node("div", "decision-actions"), submit), error);
+    return card;
+  }
+  async function answerDecision(decision, button, error) {
+    const picked = state.picked.get(decision.id) ?? decision.options.find(o => o.recommended)?.label;
+    const text = (state.drafts.get(decision.id) || "").trim();
+    let answer = picked, note = text;
+    if (decision.kind === "free_text" && text && !state.picked.has(decision.id)) { answer = text; note = ""; }
+    if (!answer) { error.textContent = "Choose an option or type an answer."; return; }
+    state.answering.add(decision.id); button.disabled = true; error.textContent = "";
+    try {
+      const response = await fetch(`/api/factories/${decision.factory}/decisions/${decision.id}/answer`, {
+        method: "POST", cache: "no-store",
+        headers: { "Content-Type": "application/json", "X-Pluto-CSRF": state.data?.csrf || "" },
+        body: JSON.stringify({ answer, note }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "The answer was not recorded.");
+      state.drafts.delete(decision.id); state.picked.delete(decision.id); state.answerErrors.delete(decision.id);
+      showToast("Answer recorded; the coordinator will pick it up");
+      state.needsSignature = null;
+      await refresh();
+    } catch (failure) {
+      state.answerErrors.set(decision.id, failure.message);
+      error.textContent = failure.message;
+    } finally {
+      state.answering.delete(decision.id); button.disabled = false;
+    }
+  }
   function renderAll() {
-    renderFactories(); renderHeader(); renderPipeline(); renderQueue(); renderDetail();
+    renderNeeds(); renderFactories(); renderHeader(); renderPipeline(); renderQueue(); renderDetail();
   }
   function reconcileSelection() {
     const factories = state.data?.factories || [];
