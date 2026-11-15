@@ -15,7 +15,7 @@ from .config import atomic_json
 from .dependencies import DependencyError, source_key
 from .github_checks import merge_check_status
 from .github_process import classify_failure, git_command, operation_name
-from .models import FactoryConfig, Submission
+from .models import FactoryConfig, Submission, workable_repositories
 
 SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REVISION = re.compile(r"^[a-fA-F0-9]{40}(?:[a-fA-F0-9]{24})?$")
@@ -37,9 +37,11 @@ class GitHubAdapter:
         self.config = config
         self.runner = runner or subprocess.run
         self.rejected_issues = []
-        self.repositories = {repo.name: repo for repo in config.repositories}
+        repositories = workable_repositories(config)
+        self.repositories = {repo.name: repo for repo in repositories}
+        self._state = None
         self.github = {}
-        for repo in config.repositories:
+        for repo in repositories:
             slug = getattr(repo, "github", "")
             if slug:
                 if not SLUG.fullmatch(slug):

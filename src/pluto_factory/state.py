@@ -9,6 +9,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from .attention import TrackingRequired, ensure_schema, ensure_tracked
 from .dependencies import (
     canonical_existing,
     validate_graph,
@@ -32,6 +33,9 @@ def encode(value) -> str:
 
 # Seconds between worker.observed events for an unchanged observation.
 OBSERVATION_HEARTBEAT = 60.0
+
+
+DELIVERY_PHASES = {"awaiting_merge", "completed"}
 
 
 class StateConflict(RuntimeError):
@@ -112,6 +116,7 @@ class State:
             );
             PRAGMA user_version = 1;
         """)
+        ensure_schema(self.db)
         for folder in (
             "assignments",
             "artifacts",
@@ -345,6 +350,8 @@ class State:
             current = self.get_work(work_id)
             if current["control"] == "paused" or self.is_paused():
                 raise StateConflict("factory or work item is paused")
+            if values.get("phase") in DELIVERY_PHASES:
+                self._require_tracking(current, values)
             self.db.execute(
                 f"UPDATE work SET {query} WHERE id=?",
                 (*stored.values(), work_id),
@@ -353,6 +360,21 @@ class State:
             if notice:
                 self._notify(work_id, **notice)
         return self.get_work(work_id)
+
+    def _require_tracking(self, current, values):
+        """Delivery never advances without a tracker row for each PR."""
+        data = values.get("data", current["data"])
+        pull_requests = data.get("pull_requests") or []
+        if values["phase"] == "awaiting_merge" and not pull_requests:
+            from .config import load_config
+
+            try:
+                github = load_config(self.home).integration == "github"
+            except (OSError, ValueError):
+                github = False
+            if github:
+                raise TrackingRequired("awaiting_merge requires tracked PRs")
+        ensure_tracked(self, pull_requests)
 
     def list_work(self) -> list[dict]:
         rows = self.db.execute(

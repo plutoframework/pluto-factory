@@ -17,7 +17,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .config import atomic_json
-from .models import FactoryConfig, Repository
+from .models import FactoryConfig, Repository, workable_repositories
 
 
 class GitFailure(RuntimeError):
@@ -40,8 +40,9 @@ class GitWorkspace:
     def __init__(self, home: Path, config: FactoryConfig) -> None:
         self.home = home.resolve()
         self.config = config
-        self.repositories = {repo.name: repo for repo in config.repositories}
-        if len(self.repositories) != len(config.repositories):
+        repositories = workable_repositories(config)
+        self.repositories = {repo.name: repo for repo in repositories}
+        if len(self.repositories) != len(repositories):
             raise GitFailure(
                 "config.invalid", "Repository names must be unique"
             )

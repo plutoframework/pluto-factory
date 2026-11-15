@@ -32,6 +32,24 @@ class Repository(Contract):
     )
 
 
+class TrackedRepository(Contract):
+    """An extra GitHub repository whose open PRs the factory watches.
+
+    ``local_path`` is the checkout workers repair from; ``checks``/``qa``
+    mirror ``[[repositories]]``.
+    """
+
+    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    local_path: str = ""
+    checks: list[list[str]] = Field(default_factory=list)
+    qa: list[list[str]] = Field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        slug = re.sub(r"[^a-z0-9_-]+", "-", self.repo.lower())
+        return ("t-" + slug)[:32]
+
+
 class ModelProfile(Contract):
     provider: str = "openai"
     model: str = "gpt-6.1-sol"
@@ -84,7 +102,16 @@ DOMAIN = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$"
 )
 # Variables that would hand a worker a host control channel.
-FORBIDDEN_ENV = {"HC_TERMINAL_SOCKET", "DOCKER_HOST", "SSH_AUTH_SOCK"}
+FORBIDDEN_ENV = {
+    "HC_TERMINAL_SOCKET",
+    "DOCKER_HOST",
+    "SSH_AUTH_SOCK",
+    # Workers never publish: no GitHub credentials may reach them.
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+}
 
 
 class SandboxPolicy(Contract):
@@ -156,6 +183,7 @@ class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     repositories: list[Repository] = Field(min_length=1)
+    tracked_repositories: list[TrackedRepository] = Field(default_factory=list)
     harness: Literal["pi", "claude", "fixture"] = "pi"
     coordinator: Literal["model", "rules"] = "model"
     coordinator_runtime: Literal["pydantic_ai", "claude_agent_sdk"] = (
@@ -193,12 +221,34 @@ class FactoryConfig(Contract):
     # Implementers legitimately run longer; unset falls back to the above.
     implementer_phase_timeout_seconds: int | None = Field(default=None, ge=1)
     command_timeout_seconds: int = Field(default=120, ge=1)
+    # Pull-request tracking: poll cadence and bounded self-healing.
+    pr_poll_seconds: int = Field(default=300, ge=1)
+    pr_max_repairs: int = Field(default=2, ge=0, le=20)
+    pr_max_repairs_total: int = Field(default=6, ge=0, le=100)
     retry_base_seconds: float = Field(default=5, ge=0)
     self_improvement: ImprovementPolicy = Field(
         default_factory=ImprovementPolicy
     )
     debug: DebugPolicy = Field(default_factory=DebugPolicy)
     sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
+
+
+def workable_repositories(config) -> list[Repository]:
+    """Registered repositories plus tracked ones with a local checkout."""
+    extra = [
+        Repository(
+            name=item.name,
+            path=item.local_path,
+            access="write",
+            github=item.repo,
+            checks=item.checks,
+            qa=item.qa,
+        )
+        for item in getattr(config, "tracked_repositories", [])
+        if item.local_path
+    ]
+    known = {repo.name for repo in config.repositories}
+    return [*config.repositories, *(r for r in extra if r.name not in known)]
 
 
 class Finding(Contract):

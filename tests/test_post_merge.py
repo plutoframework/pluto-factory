@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from pluto_factory.acceptance import current_evidence
+from pluto_factory.attention import track_pr
 from pluto_factory.config import digest, resolved_bundle, write_config
 from pluto_factory.coordinator import CoordinatorError
 from pluto_factory.engine import Engine
@@ -116,6 +117,7 @@ def merged(tmp_path):
     for kind in ("acceptance", "checks", "qa"):
         data[kind + "_candidate"] = candidates
         data[kind + "_config_digest"] = revision
+    track_pr(engine.state, pr["slug"], pr["number"], origin="factory")
     work = engine.state.update_work(
         work["id"], phase="awaiting_merge", data=data
     )

@@ -34,6 +34,15 @@ ROLE_TEXT = {
 }
 
 
+# Tracking policy never affects validation; keep it out of the config digest.
+BUNDLE_EXCLUDED = {
+    "tracked_repositories",
+    "pr_poll_seconds",
+    "pr_max_repairs",
+    "pr_max_repairs_total",
+}
+
+
 def factory_root() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
     return Path(base) / "pluto" / "factories"
@@ -76,7 +85,7 @@ def resolved_bundle(home: Path, config: FactoryConfig) -> dict:
             "unsupported QA gate rules; required gates were preserved"
         )
     return {
-        "config": config.model_dump(),
+        "config": config.model_dump(exclude=BUNDLE_EXCLUDED),
         "prompts": prompts,
         "qa_guidance": guidance.read_text() if guidance.exists() else "",
         "qa_rules": rules,
@@ -117,6 +126,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
     scalar = config.model_dump(
         exclude={
             "repositories",
+            "tracked_repositories",
             "worker",
             "reviewer",
             "qa_model",
@@ -152,6 +162,10 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             lines.extend(["", "[[repositories.flag_environments]]"])
             for key, value in environment.items():
                 lines.append(f"{json.dumps(key)} = {json.dumps(value)}")
+    for tracked in config.tracked_repositories:
+        lines.extend(["", "[[tracked_repositories]]"])
+        for key, value in tracked.model_dump().items():
+            lines.append(f"{key} = {json.dumps(value)}")
     (home / "factory.toml").write_text("\n".join(lines) + "\n")
     for role, text in ROLE_TEXT.items():
         path = home / "prompts" / f"{role}.md"
