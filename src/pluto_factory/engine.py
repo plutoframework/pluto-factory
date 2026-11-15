@@ -22,6 +22,7 @@ from .improvements import propose
 from .models import Failure, WorkerReport
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
+from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
@@ -137,6 +138,16 @@ class Engine:
             return False
         return self.state.dependency_status(work["id"])["ready"]
 
+    def _limited(self):
+        """True while a provider limit holds back new dispatches."""
+        until = self.state.rate_limited_until()
+        if not until:
+            return False
+        if until > time.time():
+            return True
+        self.state.clear_rate_limit()
+        return False
+
     def tick(self):
         if self.state.is_paused():
             return False
@@ -146,7 +157,10 @@ class Engine:
             for work in work_items
             if self._ready(work) and work["current_run"]
         ]
-        ready = active or [work for work in work_items if self._ready(work)]
+        if self._limited():
+            ready = active
+        else:
+            ready = active or [work for work in work_items if self._ready(work)]
         if not ready:
             return False
         work = ready[0]
@@ -224,6 +238,9 @@ class Engine:
                         for item in pending
                         if item["wake_at"] > time.time()
                     ]
+                    until = self.state.rate_limited_until()
+                    if until > time.time():
+                        future.append(until)
                     if not future and not watching:
                         break
                     delay = (
@@ -625,6 +642,13 @@ class Engine:
             return
         self._service_checks(work, run)
         observation = self.harness.observe(run["session"], assignment)
+        if (observation.get("failure") or {}).get("code") in {
+            "harness.error",
+            "harness.exited",
+        }:
+            limited = self._worker_limit(run)
+            if limited:
+                observation["failure"] = limited.model_dump()
         self.tracer.ingest(run)
         if observation.get("failure") or observation["state"] in {
             "settled",
@@ -662,7 +686,8 @@ class Engine:
             ):
                 self._failure(
                     work["id"],
-                    Failure(
+                    self._worker_limit(run)
+                    or Failure(
                         code="report.missing",
                         summary="Worker settled without a valid report",
                         source="runtime",
@@ -677,6 +702,16 @@ class Engine:
                     source="coordinator",
                 ),
             )
+
+    def _worker_limit(self, run):
+        """A provider limit recorded at the end of the worker transcript."""
+        try:
+            started = json.loads(
+                Path(run["assignment"]["started_path"]).read_text()
+            )
+        except (OSError, ValueError):
+            return None
+        return transcript_failure(started.get("session_file"))
 
     def _phase_timeout(self, work):
         run = self.state.get_run(work["current_run"])
@@ -1359,6 +1394,25 @@ class Engine:
             if run_id != work["current_run"]:
                 work = self.state.update_work(work_id, current_run=run_id)
             self._revise(work, failure.summary)
+            return
+        if recovery.action == "rate_limit":
+            until = self.state.set_rate_limit(time.time() + recovery.delay)
+            reset = time.strftime("%H:%M", time.localtime(until))
+            self.state.update_work(
+                work_id,
+                current_run=run_id,
+                control="backoff",
+                wake_at=until,
+                event="recovery.rate_limited",
+                notice={
+                    "kind": recovery.notify,
+                    "message": (
+                        f"{failure.summary}; dispatch paused until {reset}, "
+                        "then resumes automatically"
+                    ),
+                    "incident_key": f"ratelimit:{int(until)}",
+                },
+            )
             return
         self.state.update_work(
             work_id,

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .credentials import credential_environment
 from .models import CriterionAssessment, Decision, FactoryConfig, Failure
+from .ratelimit import limit_failure
 
 CLAUDE_TIMEOUT_SECONDS = 120
 
@@ -54,6 +55,15 @@ class Coordinator:
             else:
                 decision = self._pydantic_decide(prompt, payload)
         except Exception as error:
+            limited = limit_failure(
+                f"{error} {getattr(error, 'status_code', '')}", "coordinator"
+            ) or (
+                limit_failure("429 rate limit", "coordinator")
+                if getattr(error, "status_code", None) in {429, 529}
+                else None
+            )
+            if limited:
+                raise CoordinatorError(limited) from error
             raise CoordinatorError(
                 Failure(
                     code=_failure_code(error),
@@ -121,7 +131,15 @@ class Coordinator:
             raise ClaudeCoordinatorError("no result from Claude Agent SDK")
         if result.is_error or result.structured_output is None:
             raise ClaudeCoordinatorError(
-                result.subtype, status_code=result.api_error_status
+                " ".join(
+                    str(part)
+                    for part in (
+                        result.subtype,
+                        getattr(result, "result", None),
+                    )
+                    if part
+                ),
+                status_code=result.api_error_status,
             )
         return Decision.model_validate(result.structured_output)
 

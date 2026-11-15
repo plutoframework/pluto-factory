@@ -517,6 +517,30 @@ class State:
         ).fetchone()
         return bool(row and row["value"] == "true")
 
+    def rate_limited_until(self):
+        row = self.db.execute(
+            "SELECT value FROM settings WHERE key='rate_limited_until'"
+        ).fetchone()
+        return float(row["value"]) if row else 0.0
+
+    def set_rate_limit(self, until):
+        """Pause new dispatches until ``until``; never shortens a limit."""
+        until = max(until, self.rate_limited_until())
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO settings VALUES "
+                "('rate_limited_until',?)",
+                (str(until),),
+            )
+        return until
+
+    def clear_rate_limit(self):
+        with self.db:
+            self.db.execute(
+                "DELETE FROM settings WHERE key='rate_limited_until'"
+            )
+            self._event("provider.limit_cleared", "factory", {})
+
     def pause(self, work_id=None):
         with self.db:
             if work_id:

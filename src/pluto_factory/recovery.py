@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from .models import Failure
+from .ratelimit import FALLBACK_SECONDS
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,14 @@ def plan_recovery(
         "github.no_changes",
     }:
         return Recovery("defer", 0, "action_required")
+    if failure.code == "provider.rate_limited":
+        # Waiting out a limit is not a failed attempt: no budget, no deferral.
+        delay = failure.retry_after_seconds
+        return Recovery(
+            "rate_limit",
+            FALLBACK_SECONDS if delay is None else delay,
+            "progress",
+        )
     if recoveries >= maximum:
         return Recovery("defer", 0, "action_required")
     delay = failure.retry_after_seconds
