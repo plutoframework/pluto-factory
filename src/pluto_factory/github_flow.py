@@ -4,7 +4,7 @@ import copy
 import json
 import time
 
-from .acceptance import acceptance_intent, current_evidence
+from .acceptance import acceptance_intent, citable_ids, current_evidence
 from .config import digest, resolved_bundle
 from .github import GitHubAdapter, GitHubFailure
 from .models import Decision, Submission
@@ -462,25 +462,21 @@ class GitHubFlow:
             raise ValueError(
                 "recorded acceptance does not authorize integration"
             )
-        evidence_ids = {
-            item["id"]
-            for item in current_evidence(
-                self.state, self.state.home, self.config, work
-            )
-        }
+        evidence_ids = citable_ids(
+            current_evidence(self.state, self.state.home, self.config, work)
+        )
         if rebound:
             # The frozen publication decision was validated under the earlier
             # configuration; its citations stay valid against that digest.
-            evidence_ids |= {
-                item["id"]
-                for item in current_evidence(
+            evidence_ids |= citable_ids(
+                current_evidence(
                     self.state,
                     self.state.home,
                     self.config,
                     work,
                     config_digest=acceptance["config_digest"],
                 )
-            }
+            )
         intent, remaining = acceptance_intent(
             decision, len(work["payload"]["acceptance"]), evidence_ids
         )

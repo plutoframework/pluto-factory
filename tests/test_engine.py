@@ -1121,3 +1121,153 @@ def test_implementer_dispatch_skips_sync_when_default_unchanged(tmp_path):
         )
     finally:
         engine.state.close()
+
+
+def _gryt_engine(tmp_path, name, decide):
+    """Integrating item with one citable checks row and one worker_check."""
+    from types import SimpleNamespace
+
+    home, prepared = prepare_demo(tmp_path / name)
+    engine = Engine(home)
+    work = integration_work(engine, prepared["submitted"]["id"])
+    cfg = digest(resolved_bundle(engine.home, engine.config))
+    candidates = {"core": "candidate-core", "cli": "candidate-cli"}
+    for kind in ("checks", "worker_check"):
+        engine.state.evidence(
+            work["id"],
+            {
+                "kind": kind,
+                "passed": True,
+                "candidate_set": candidates,
+                "config_digest": cfg,
+            },
+        )
+    engine.coordinator = SimpleNamespace(decide=decide)
+    engine.git = SimpleNamespace(
+        sync=lambda entries: (entries, False),
+        validate_integration_plan=lambda entries: [],
+    )
+    engine.github = SimpleNamespace(
+        adapter=SimpleNamespace(refresh_defaults=lambda entries: None),
+        publish=lambda *a: None,
+    )
+    return engine, work
+
+
+def _assessments(count, refs):
+    from pluto_factory.models import CriterionAssessment
+
+    return [
+        CriterionAssessment(
+            criterion=i, result="passed", evidence_refs=refs, explanation="e"
+        )
+        for i in range(count)
+    ]
+
+
+def _rejections(engine):
+    rows = engine.state.db.execute(
+        "SELECT data FROM events WHERE kind='coordinator.decision_rejected'"
+    ).fetchall()
+    return [json.loads(row["data"]) for row in rows]
+
+
+def test_contract_invalid_decision_is_retried_with_precise_error(tmp_path):
+    seen = []
+
+    def decide(snapshot, allowed, prompt):
+        seen.append(snapshot)
+        citable = snapshot["citable_evidence_ids"]
+        assert len(citable) == 1
+        assert [r["citable"] for r in snapshot["evidence"]].count(False) == 1
+        # gryt #9: first answer passes a criterion with no evidence refs.
+        refs = [] if len(seen) == 1 else citable
+        return Decision(
+            action="advance",
+            rationale="Safe increment",
+            acceptance=_assessments(len(snapshot["work"]["acceptance"]), refs),
+        )
+
+    engine, work = _gryt_engine(tmp_path, "retry", decide)
+    try:
+        engine._integrate(work)
+        current = engine.state.get_work(work["id"])
+        assert current["control"] != "deferred"
+        assert len(seen) == 2
+        assert "contract_error" not in seen[0]
+        error = seen[1]["contract_error"]
+        assert "criterion 0" in error["problems"][0]
+        assert error["citable_evidence_ids"] == seen[1]["citable_evidence_ids"]
+        assert [r["will_retry"] for r in _rejections(engine)] == [True]
+        assert current["data"]["acceptance_decision"]["action"] == "complete"
+    finally:
+        engine.state.close()
+
+
+def test_worker_check_ref_is_rejected_then_corrected(tmp_path):
+    seen = []
+
+    def decide(snapshot, allowed, prompt):
+        seen.append(snapshot)
+        wrong = [r["id"] for r in snapshot["evidence"] if not r["citable"]]
+        refs = wrong if len(seen) == 1 else snapshot["citable_evidence_ids"]
+        return Decision(
+            action="advance",
+            rationale="x",
+            acceptance=_assessments(len(snapshot["work"]["acceptance"]), refs),
+        )
+
+    engine, work = _gryt_engine(tmp_path, "workercheck", decide)
+    try:
+        engine._integrate(work)
+        assert engine.state.get_work(work["id"])["control"] != "deferred"
+        assert len(seen) == 2
+        assert "not citable" in seen[1]["contract_error"]["problems"][0]
+    finally:
+        engine.state.close()
+
+
+def test_persistently_invalid_decision_defers_after_recorded_retries(tmp_path):
+    from pluto_factory.engine import CONTRACT_RETRIES
+
+    seen = []
+
+    def decide(snapshot, allowed, prompt):
+        seen.append(snapshot)
+        return Decision(
+            action="advance",
+            rationale="x",
+            acceptance=_assessments(len(snapshot["work"]["acceptance"]), []),
+        )
+
+    engine, work = _gryt_engine(tmp_path, "persist", decide)
+    try:
+        with pytest.raises(ValueError, match="after 3 attempts"):
+            engine._integrate(work)
+        assert len(seen) == CONTRACT_RETRIES + 1
+        rejections = _rejections(engine)
+        assert [r["will_retry"] for r in rejections] == [True, True, False]
+    finally:
+        engine.state.close()
+
+
+def test_unverifiable_criterion_advances_without_completing(tmp_path):
+    from pluto_factory.models import CriterionAssessment
+
+    def decide(snapshot, allowed, prompt):
+        count = len(snapshot["work"]["acceptance"])
+        items = _assessments(count, snapshot["citable_evidence_ids"])
+        items[0] = CriterionAssessment(
+            criterion=0,
+            result="unverifiable",
+            explanation="No configured check runs docker compose",
+        )
+        return Decision(action="advance", rationale="x", acceptance=items)
+
+    engine, work = _gryt_engine(tmp_path, "unverifiable", decide)
+    try:
+        engine._integrate(work)
+        recorded = engine.state.get_work(work["id"])["data"]
+        assert recorded["acceptance_decision"]["action"] == "advance"
+    finally:
+        engine.state.close()

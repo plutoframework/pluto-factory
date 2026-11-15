@@ -237,7 +237,7 @@ class Submission(Contract):
 
 class CriterionAssessment(Contract):
     criterion: int = Field(ge=0)
-    result: Literal["passed", "incomplete", "failed"]
+    result: Literal["passed", "incomplete", "failed", "unverifiable", "waived"]
     evidence_refs: list[str] = Field(default_factory=list)
     explanation: str = Field(min_length=1)
 

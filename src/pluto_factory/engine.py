@@ -7,7 +7,12 @@ from threading import Event
 
 from pydantic import ValidationError
 
-from .acceptance import acceptance_intent, current_evidence
+from .acceptance import (
+    AcceptanceContractError,
+    acceptance_intent,
+    citable_ids,
+    current_evidence,
+)
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
 from .git import GitFailure, GitWorkspace
@@ -24,6 +29,8 @@ from .trace import Tracer
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
 REAP_INTERVAL_SECONDS = 300
+# Times the coordinator is re-asked with the validation error before deferring.
+CONTRACT_RETRIES = 2
 GUIDANCE_AUTHORITY = (
     "AUTHORITATIVE human decision. It overrides prior conclusions, "
     "reports and deferrals. Follow it, or report precisely why it cannot "
@@ -636,7 +643,15 @@ class Engine:
                 ),
             )
 
-    def _decide(self, work, allowed, preferred, report=None, evaluation=None):
+    def _decide(
+        self,
+        work,
+        allowed,
+        preferred,
+        report=None,
+        evaluation=None,
+        contract_error=None,
+    ):
         bundle = resolved_bundle(self.home, self.config)
         snapshot = {
             "work": work["payload"],
@@ -662,6 +677,17 @@ class Engine:
         )
         if evaluation in {"acceptance", "handoff"}:
             snapshot["evidence"] = self._current_evidence(work)
+            snapshot["citable_evidence_ids"] = sorted(
+                citable_ids(snapshot["evidence"])
+            )
+            snapshot["evidence_citation_rules"] = (
+                "evidence_refs may contain ONLY ids listed in "
+                "citable_evidence_ids. Rows with citable=false (worker_check "
+                "snapshots) and ids from earlier reports or candidates are "
+                "rejected. A 'passed' criterion needs at least one ref."
+            )
+        if contract_error:
+            snapshot["contract_error"] = contract_error
         if evaluation == "handoff":
             next_phase = {
                 "implementing": "checking",
@@ -713,7 +739,8 @@ class Engine:
                 if work["phase"] == "awaiting_merge"
                 else "pre_publication",
                 "complete": "All product criteria pass with current evidence; publish and confirm merges before closing the issue.",
-                "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete.",
+                "advance": "Publish a safe increment only when explicitly assessed product criteria remain incomplete or unverifiable.",
+                "criterion_results": "passed (needs citable evidence_refs); incomplete; unverifiable (no configured check can prove it; needs no refs, blocks complete, allows advance); waived (satisfied by authoritative human_guidance; no refs); failed.",
                 "worker_remaining_work": work["data"]
                 .get("reports", {})
                 .get("implementer", {})
@@ -749,6 +776,21 @@ class Engine:
             if evaluation in {"acceptance", "handoff"}
             else decision.action
         )
+
+    def _acceptance_intent(self, work, decision):
+        intent, remaining = acceptance_intent(
+            decision,
+            len(work["payload"]["acceptance"]),
+            citable_ids(self._current_evidence(work)),
+        )
+        if any(a.result == "waived" for a in decision.acceptance) and not (
+            self._guidance(work["id"])
+        ):
+            raise AcceptanceContractError(
+                ["'waived' requires authoritative human_guidance, none exists"],
+                citable_ids(self._current_evidence(work)),
+            )
+        return intent, remaining
 
     def _current_evidence(self, work):
         return current_evidence(self.state, self.home, self.config, work)
@@ -957,30 +999,62 @@ class Engine:
             self._revise(work, "Intermediate repository compatibility failed")
             return
         remaining = reports.get("implementer", {}).get("remaining_work", [])
-        decision = self._decide(
-            work,
-            {"advance", "complete", "revise", "defer"},
-            "advance" if remaining else "complete",
-            evaluation="acceptance",
-        )
-        if decision.action == "revise":
-            self._revise(work, decision.rationale)
-            return
-        if decision.action == "defer":
-            self._defer(work, decision.rationale)
-            return
-        if digest(resolved_bundle(self.home, self.config)) != current_digest:
-            self.state.update_work(
-                work_id,
-                phase="checking",
-                control="ready",
-                event="validation.configuration_changed",
+        allowed = {"advance", "complete", "revise", "defer"}
+        preferred = "advance" if remaining else "complete"
+        contract_error = None
+        for attempt in range(CONTRACT_RETRIES + 1):
+            decision = self._decide(
+                work,
+                allowed,
+                preferred,
+                evaluation="acceptance",
+                contract_error=contract_error,
             )
-            return
-        evidence_ids = {item["id"] for item in self._current_evidence(work)}
-        intent, remaining = acceptance_intent(
-            decision, len(work["payload"]["acceptance"]), evidence_ids
-        )
+            if decision.action == "revise":
+                self._revise(work, decision.rationale)
+                return
+            if decision.action == "defer":
+                self._defer(work, decision.rationale)
+                return
+            if (
+                digest(resolved_bundle(self.home, self.config))
+                != current_digest
+            ):
+                self.state.update_work(
+                    work_id,
+                    phase="checking",
+                    control="ready",
+                    event="validation.configuration_changed",
+                )
+                return
+            try:
+                intent, remaining = self._acceptance_intent(work, decision)
+                break
+            except AcceptanceContractError as error:
+                # A reasonable decision with a fixable citation mistake must
+                # not park the item: tell the coordinator exactly what failed.
+                self.state.event(
+                    "coordinator.decision_rejected",
+                    work_id,
+                    {
+                        "attempt": attempt + 1,
+                        "retries_allowed": CONTRACT_RETRIES,
+                        "problems": error.problems,
+                        "citable_evidence_ids": error.citable,
+                        "will_retry": attempt < CONTRACT_RETRIES,
+                    },
+                )
+                if attempt == CONTRACT_RETRIES:
+                    raise ValueError(
+                        f"{error} (after {attempt + 1} attempts)"
+                    ) from error
+                contract_error = {
+                    "message": "Your previous decision was rejected. Fix it "
+                    "and decide again.",
+                    "problems": error.problems,
+                    "citable_evidence_ids": error.citable,
+                    "previous_decision": decision.model_dump(),
+                }
         if intent.action != decision.action:
             self.state.event(
                 "acceptance.intent_normalized",
