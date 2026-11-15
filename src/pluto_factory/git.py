@@ -700,7 +700,32 @@ class GitWorkspace:
                 evidence.extend(self._validate(entries, kind, selected, plan))
         return evidence
 
-    def sync(self, entries: list[dict]) -> tuple[list[dict], bool]:
+    def _merge_conflict(self, repo, entry, paths: list[str]) -> GitFailure:
+        return GitFailure(
+            "git.conflict",
+            "Merging the new default branch "
+            f"({entry['default_branch']}) into "
+            f"{repo.name} conflicts in: "
+            + ", ".join(paths)
+            + ". The merge is prepared in the worktree with "
+            "conflict markers. Edit those files to the "
+            "correct combined content and remove every "
+            "<<<<<<<, =======, >>>>>>> marker. Do not run "
+            "git add, commit or merge --abort: the factory "
+            "stages and commits the merge after you report.",
+            paths=paths,
+        )
+
+    def sync(
+        self, entries: list[dict], *, strict: bool = False
+    ) -> tuple[list[dict], bool]:
+        """Merge the latest default branch into each candidate.
+
+        A merge already awaiting resolution is kept intact for the worker,
+        unless ``strict``: callers about to publish must not treat an
+        unresolved merge as a synchronized candidate, so it raises the
+        conflict again.
+        """
         changed = False
         result = []
         for original in entries:
@@ -710,6 +735,13 @@ class GitWorkspace:
             self._candidate(entry, clean=not self._merging(worktree))
             if self._merging(worktree):
                 # A merge awaits the worker's resolution; keep it intact.
+                if strict:
+                    raise self._merge_conflict(
+                        repo,
+                        entry,
+                        self._conflict_paths(worktree)
+                        or ["(merge in progress)"],
+                    )
                 result.append(entry)
                 continue
             latest = self._text(
@@ -727,20 +759,7 @@ class GitWorkspace:
                             raise GitFailure(
                                 "git.conflict", merge.stderr or merge.stdout
                             )
-                        raise GitFailure(
-                            "git.conflict",
-                            "Merging the new default branch "
-                            f"({entry['default_branch']}) into "
-                            f"{repo.name} conflicts in: "
-                            + ", ".join(paths)
-                            + ". The merge is prepared in the worktree with "
-                            "conflict markers. Edit those files to the "
-                            "correct combined content and remove every "
-                            "<<<<<<<, =======, >>>>>>> marker. Do not run "
-                            "git add, commit or merge --abort: the factory "
-                            "stages and commits the merge after you report.",
-                            paths=paths,
-                        )
+                        raise self._merge_conflict(repo, entry, paths)
                 else:
                     self._git(worktree, "checkout", "--detach", latest)
                 entry["base"] = latest

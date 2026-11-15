@@ -839,3 +839,32 @@ def test_issue_edit_is_recorded_once_and_surfaced_once(tmp_path):
     kinds = [e["kind"] for e in state.inspect()["events"]]
     assert kinds.count("intake.issue_changed") == 2
     state.close()
+
+
+@pytest.mark.parametrize(
+    ("merge_state", "require", "resyncs"),
+    [("DIRTY", False, 1), ("BEHIND", False, 0), ("BEHIND", True, 1)],
+)
+def test_dirty_or_behind_pr_triggers_resync(
+    tmp_path, merge_state, require, resyncs
+):
+    _, state, config = setup(tmp_path)
+    config.github_require_up_to_date = require
+    work = merged_work(state, config)
+    flow = GitHubFlow(state, config)
+    pr = {"repository": "core", "state": "open", "merge_state": merge_state}
+    flow.adapter = SimpleNamespace(
+        poll_pull_requests=lambda _prs: {
+            "state": "open",
+            "pull_requests": [pr],
+        }
+    )
+    calls = []
+    flow.advance(
+        work,
+        lambda *_: None,
+        lambda *_: None,
+        resync=lambda item, stale: calls.append(stale),
+    )
+    assert len(calls) == resyncs
+    state.close()

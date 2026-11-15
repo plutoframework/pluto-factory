@@ -4,6 +4,7 @@ import json
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from pluto_factory.config import digest, resolved_bundle
 from pluto_factory.coordinator import Coordinator, CoordinatorError
 from pluto_factory.demo import prepare_demo
 from pluto_factory.engine import Engine
+from pluto_factory.git import GitFailure
 from pluto_factory.harness import HarnessError
 from pluto_factory.models import Decision, Failure, WorkerReport
 from pluto_factory.state import StateConflict
@@ -209,7 +211,7 @@ def test_changed_validation_configuration_invalidates_integration(tmp_path):
     )
 
     class NoIntegration:
-        def sync(self, entries):
+        def sync(self, entries, **_):
             raise AssertionError(
                 "stale policy evidence reached Git integration"
             )
@@ -438,7 +440,7 @@ def test_failed_intermediate_compatibility_prevents_any_merge(tmp_path):
     work = integration_work(engine, prepared["submitted"]["id"])
 
     class IncompatibleGit:
-        def sync(self, entries):
+        def sync(self, entries, **_):
             return entries, False
 
         def validate_integration_plan(self, entries):
@@ -471,7 +473,7 @@ def test_completion_requires_each_acceptance_criterion(tmp_path):
     work = integration_work(engine, prepared["submitted"]["id"])
 
     class NoMerge:
-        def sync(self, entries):
+        def sync(self, entries, **_):
             return entries, False
 
         def validate_integration_plan(self, entries):
@@ -540,7 +542,7 @@ def test_admin_remaining_and_all_passed_advance_do_not_create_another_increment(
 
     engine.coordinator = FinalAcceptance()
     engine.git = SimpleNamespace(
-        sync=lambda entries: (entries, False),
+        sync=lambda entries, **_: (entries, False),
         validate_integration_plan=lambda entries: [],
     )
     engine.github = SimpleNamespace(
@@ -633,7 +635,7 @@ def test_acceptance_policy_change_during_decision_prevents_publication(
 
     engine.coordinator = ChangedPolicy()
     engine.git = SimpleNamespace(
-        sync=lambda entries: (entries, False),
+        sync=lambda entries, **_: (entries, False),
         validate_integration_plan=lambda entries: [],
         integrate=forbidden,
     )
@@ -683,7 +685,7 @@ def test_explicit_acceptance_veto_wins_over_all_passed_assessments(
 
     engine.coordinator = Veto()
     engine.git = SimpleNamespace(
-        sync=lambda entries: (entries, False),
+        sync=lambda entries, **_: (entries, False),
         validate_integration_plan=lambda entries: [],
         integrate=forbidden,
     )
@@ -1144,7 +1146,7 @@ def _gryt_engine(tmp_path, name, decide):
         )
     engine.coordinator = SimpleNamespace(decide=decide)
     engine.git = SimpleNamespace(
-        sync=lambda entries: (entries, False),
+        sync=lambda entries, **_: (entries, False),
         validate_integration_plan=lambda entries: [],
     )
     engine.github = SimpleNamespace(
@@ -1446,5 +1448,108 @@ def test_conflict_revision_dispatches_implementer_with_merge_notes(tmp_path):
         assert packet["conflict_revision"]["paths"] == ["shared.txt"]
         assert "shared.txt" in packet["default_branch_sync"]["merge_conflict"]
         assert "conflict-only" in packet["default_branch_sync"]["guidance"]
+    finally:
+        engine.state.close()
+
+
+def _integrating_digests(engine, work_id):
+    current = digest(resolved_bundle(engine.home, engine.config))
+    data = engine.state.get_work(work_id)["data"]
+    data.update(
+        checks_config_digest=current,
+        qa_config_digest=current,
+        report_config_digests={"reviewer": current, "qa": current},
+    )
+    engine.state.update_work(work_id, data=data)
+
+
+def test_resume_with_unresolved_merge_routes_to_conflict_revision(tmp_path):
+    engine, work_id, _writable = _conflicted_work(tmp_path, "preparing")
+    try:
+        # A prior conflict left the merge prepared; the item was deferred.
+        with pytest.raises(GitFailure):
+            engine.git.sync(engine.state.get_work(work_id)["data"]["entries"])
+        engine.state.update_work(
+            work_id, phase="integrating", control="deferred"
+        )
+        _integrating_digests(engine, work_id)
+        engine.state.resume(work_id)
+        published = []
+        engine.github = SimpleNamespace(
+            adapter=SimpleNamespace(refresh_defaults=lambda _e: None),
+            publish=lambda *a: published.append(a),
+        )
+        engine.tick()
+        work = engine.state.get_work(work_id)
+        assert not published
+        assert work["phase"] == "implementing"
+        assert work["data"]["conflict_revision"]["paths"] == ["shared.txt"]
+    finally:
+        engine.state.close()
+
+
+def _awaiting(tmp_path, dirty_entries=True):
+    engine, work_id, writable = _conflicted_work(tmp_path, "preparing")
+    engine.state.update_work(work_id, phase="awaiting_merge", control="backoff")
+    engine.github = SimpleNamespace(
+        adapter=SimpleNamespace(refresh_defaults=lambda _e: None)
+    )
+    return engine, work_id, writable
+
+
+STALE = [{"repository": "core", "merge_state": "DIRTY"}]
+
+
+def test_dirty_pr_with_conflict_requests_conflict_revision(tmp_path):
+    engine, work_id, _ = _awaiting(tmp_path)
+    try:
+        work = engine.state.get_work(work_id)
+        with pytest.raises(GitFailure) as raised:
+            engine._resync_pull_requests(work, STALE)
+        assert engine._conflict_revision(work, raised.value)
+        work = engine.state.get_work(work_id)
+        assert work["phase"] == "implementing"
+        assert work["data"]["pr_resyncs"] == 1
+    finally:
+        engine.state.close()
+
+
+def test_dirty_pr_clean_sync_revalidates_and_is_bounded(tmp_path):
+    engine, work_id, writable = _awaiting(tmp_path)
+    try:
+        managed = Path(writable["managed"])
+        _commit_default(managed, "other.txt", "other\n")
+        work = engine.state.get_work(work_id)
+        # Resolve the earlier conflicting default change by using a new file
+        # only: reset candidate to the original base first.
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                writable["worktree"],
+                "reset",
+                "--hard",
+                "-q",
+                work["data"]["entries"][0]["base"],
+            ],
+            check=True,
+        )
+        data = work["data"]
+        data["entries"] = engine.git.snapshot(data["entries"], work_id)
+        engine.state.update_work(work_id, data=data)
+        engine.config.github_max_resyncs = 1
+        work = engine.state.get_work(work_id)
+        engine._resync_pull_requests(work, STALE)
+        work = engine.state.get_work(work_id)
+        assert work["phase"] == "checking"
+        assert work["data"]["pr_resyncs"] == 1
+        assert any(
+            e["kind"] == "pull_requests.resynced"
+            for e in engine.state.inspect()["events"]
+        )
+        engine.state.update_work(work_id, phase="awaiting_merge")
+        engine._resync_pull_requests(engine.state.get_work(work_id), STALE)
+        work = engine.state.get_work(work_id)
+        assert work["control"] == "deferred"
     finally:
         engine.state.close()

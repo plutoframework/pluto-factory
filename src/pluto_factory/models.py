@@ -181,6 +181,8 @@ class FactoryConfig(Contract):
     github_issue_label: str = Field(default="factory:ready", min_length=1)
     github_poll_seconds: int = Field(default=30, ge=1)
     github_auto_merge: bool = False
+    github_require_up_to_date: bool = False
+    github_max_resyncs: int = Field(default=3, ge=0, le=20)
     github_required_checks: list[str] = Field(default_factory=list)
     close_source_issues: bool = True
     herdr_space: str = ""

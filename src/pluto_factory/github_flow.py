@@ -177,6 +177,7 @@ class GitHubFlow:
         reassess=None,
         confirm=None,
         revalidate=None,
+        resync=None,
     ):
         result = self.adapter.poll_pull_requests(work["data"]["pull_requests"])
         data = work["data"]
@@ -197,6 +198,22 @@ class GitHubFlow:
             defer(work, "A required pull request was closed without merging")
             return
         if status != "merged":
+            stale = [
+                pr
+                for pr in result["pull_requests"]
+                if pr.get("state") == "open"
+                and (
+                    pr.get("merge_state") == "DIRTY"
+                    or (
+                        self.config.github_require_up_to_date
+                        and pr.get("merge_state") == "BEHIND"
+                    )
+                )
+            ]
+            if stale and resync is not None:
+                work = self.state.update_work(work["id"], data=data)
+                resync(work, stale)
+                return
             if self.config.github_auto_merge:
                 self.adapter.request_merge(result["pull_requests"])
             self.state.update_work(
@@ -375,6 +392,7 @@ class GitHubFlow:
             "entries",
             "reports",
             "pull_requests",
+            "pr_resyncs",
             "publication_acceptance",
             "post_merge_acceptance",
             "post_merge_validation",

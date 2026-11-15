@@ -343,9 +343,66 @@ class Engine:
                 reassess=lambda item: reassess_merged(self, item),
                 confirm=lambda item: confirm_merged(self, item),
                 revalidate=lambda item: revalidate_merged(self, item),
+                resync=self._resync_pull_requests,
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
+
+    def _resync_pull_requests(self, work, stale):
+        """Bring a published candidate up to date with the default branch.
+
+        A PR GitHub reports as DIRTY (or BEHIND where up-to-date branches are
+        required) never gets checks. Merge the default branch into the
+        candidate: a conflict raises ``git.conflict`` (routed to a conflict
+        revision by ``tick``); a clean merge restarts validation and the
+        republish pushes the new head to the PR branch. Bounded per item.
+        """
+        work_id = work["id"]
+        data = work["data"]
+        states = {pr["repository"]: pr.get("merge_state") for pr in stale}
+        used = data.get("pr_resyncs", 0)
+        if used >= self.config.github_max_resyncs:
+            self._defer(
+                work,
+                f"Pull request still {states} after {used} default-branch "
+                "syncs; manual resolution needed",
+            )
+            return
+        self.github.adapter.refresh_defaults(data["entries"])
+        try:
+            entries, changed = self.git.sync(data["entries"], strict=True)
+        except GitFailure as error:
+            if error.code == "git.conflict":
+                data["pr_resyncs"] = used + 1
+                self.state.update_work(
+                    work_id,
+                    data=data,
+                    event="pull_requests.resync_conflict",
+                )
+            raise
+        if not changed:
+            # The candidate already contains the default branch; GitHub's
+            # mergeability is stale or needs a human. Keep polling.
+            self.state.update_work(
+                work_id,
+                data=data,
+                control="backoff",
+                wake_at=time.time() + self.config.github_poll_seconds,
+                event="pull_requests.resync_noop",
+            )
+            return
+        data["entries"] = entries
+        data["pr_resyncs"] = used + 1
+        data.pop("checks_candidate", None)
+        data.pop("qa_candidate", None)
+        self.state.update_work(
+            work_id,
+            phase="checking",
+            control="ready",
+            wake_at=0,
+            data=data,
+            event="pull_requests.resynced",
+        )
 
     def _synchronize(self, work_id, data, unchanged_phase):
         """Merge an advanced default branch into the candidate.
@@ -1133,7 +1190,9 @@ class Engine:
                 event="validation.configuration_changed",
             )
             return
-        entries, changed = self.git.sync(data["entries"])
+        # Strict: an unresolved merge left by a deferral or resume must route
+        # to the conflict revision, never publish the stale candidate.
+        entries, changed = self.git.sync(data["entries"], strict=True)
         if changed:
             data["entries"] = entries
             self.state.update_work(work_id, phase="checking", data=data)
