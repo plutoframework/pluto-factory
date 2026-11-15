@@ -32,6 +32,7 @@ from .attention import (
     mark_applied,
     record_framework_gap,
     set_pr,
+    withdraw_decision,
 )
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
@@ -48,6 +49,13 @@ from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
+from .triage import Triager, TriageRunner
+from .upstream import (
+    fixed_guidance,
+    flush_upstream,
+    poll_external,
+    request_upstream,
+)
 
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
@@ -150,6 +158,12 @@ class Engine:
             self.github = GitHubFlow(self.state, self.config)
         self.tracker = PRTracker(self)
         self.advisor = Advisor(self.home, self.config)
+        self.triage = TriageRunner(
+            self.state,
+            self.tracker.adapter,
+            self.config,
+            Triager(self.home, self.config),
+        )
 
     def _ready(self, work):
         if work["phase"] == "completed" or work["control"] in {
@@ -501,9 +515,23 @@ class Engine:
         self.check_framework_gaps()
         self.process_decisions()
         self.advise_pending()
+        self.flush_upstream()
         self.flush_issue_comments()
         if self.state.is_paused():
             return
+        try:
+            self.triage.poll(force=force)
+        except GitHubFailure as error:
+            self.state.event(
+                "triage.poll_failed", "factory", {"code": error.code}
+            )
+        poll_external(
+            self.state,
+            self.tracker.adapter,
+            self.config,
+            self._upstream_fixed,
+            force=force,
+        )
         try:
             self.tracker.poll(force=force)
         except GitHubFailure as error:
@@ -541,6 +569,10 @@ class Engine:
                 )
             else:
                 text += ". No configuration change was made."
+        if proposal.get("triage"):
+            self.triage.apply_answer(decision)
+            mark_applied(self.state, decision["id"], detail)
+            return
         if proposal.get("pr") and decision["answer"].startswith("Grant"):
             slug, _, number = proposal["pr"].rpartition("#")
             self.tracker.grant(slug, int(number))
@@ -554,6 +586,7 @@ class Engine:
                 pins(self.advisor.sources()),
             )
             detail["framework_gap"] = gap["id"]
+            request_upstream(self.state, self.config, decision, option)
             enqueue_issue_comment(self.state, decision, "answered")
             mark_applied(self.state, decision["id"], detail)
             return
@@ -563,6 +596,12 @@ class Engine:
             if work["control"] in {"deferred", "quarantined", "backoff"}:
                 self.state.resume(decision["work_id"])
         enqueue_issue_comment(self.state, decision, "answered")
+        if proposal.get("external"):
+            with self.state.db:
+                self.state.db.execute(
+                    "UPDATE external_issues SET state='waived' WHERE key=?",
+                    (proposal["external"],),
+                )
         mark_applied(self.state, decision["id"], detail)
 
     def _reload_config(self):
@@ -570,6 +609,8 @@ class Engine:
         self.git.config = self.config
         self.tracker.config = self.config
         self.advisor.config = self.config
+        self.triage.config = self.config
+        self.triage.triager.config = self.config
         if hasattr(self.coordinator, "config"):
             self.coordinator.config = self.config
 
@@ -649,7 +690,37 @@ class Engine:
             )
             if apply_advice(self.state, decision["id"], advice, source):
                 done += 1
+                self._auto_upstream(get_decision(self.state, decision["id"]))
         return done
+
+    def _auto_upstream(self, decision):
+        """Under file_upstream=auto, a framework-locus recommendation files."""
+        if self.config.framework.file_upstream != "auto":
+            return
+        option = next(
+            (o for o in decision["options"] if o["recommended"]), None
+        )
+        if framework_library(option):
+            request_upstream(self.state, self.config, decision, option)
+
+    def flush_upstream(self):
+        try:
+            return flush_upstream(self.state, self.tracker.adapter, self.config)
+        except GitHubFailure as error:
+            self.state.event("upstream.failed", "factory", {"code": error.code})
+            return 0
+
+    def _upstream_fixed(self, work_id, slug, number, closing):
+        """An upstream issue closed as completed: resume the parked work."""
+        for gap in list_decisions(self.state, {"open"}):
+            if gap["kind"] == "framework_gap" and gap["work_id"] == work_id:
+                withdraw_decision(self.state, gap["id"])
+        work = self.state.get_work(work_id)
+        self.state.add_guidance(
+            work_id, fixed_guidance(slug, number, closing), "coordinator"
+        )
+        if work["control"] in {"deferred", "quarantined", "backoff"}:
+            self.state.resume(work_id)
 
     def flush_issue_comments(self):
         allowed = {

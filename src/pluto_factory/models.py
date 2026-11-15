@@ -76,6 +76,53 @@ class AdvisorPolicy(Contract):
         return paths
 
 
+class FrameworkPolicy(Contract):
+    """Where framework gaps go: library name -> upstream GitHub repository."""
+
+    upstream: dict[str, str] = Field(default_factory=dict)
+    # Informational only: a foreign factory never marks upstream work ready.
+    proposed_label: str = Field(default="factory:proposed", min_length=1)
+    file_upstream: Literal["on_decision", "auto"] = "on_decision"
+
+    @field_validator("upstream")
+    @classmethod
+    def _repos(cls, mapping):
+        for library, repo in mapping.items():
+            if not library.strip() or not re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo
+            ):
+                raise ValueError(
+                    f"upstream {library!r} needs an owner/name repository"
+                )
+        return mapping
+
+    def repository(self, library: str) -> str:
+        def norm(name):
+            return name.lower().removeprefix("@plutoframework/")
+
+        for name, repo in self.upstream.items():
+            if norm(name) == norm(library):
+                return repo
+        return ""
+
+
+class TriagePolicy(Contract):
+    """Optional receiving-side triage of new issues (off by default).
+
+    Model, provider and reasoning default to the strongest tier like the
+    advisor. ``trusted_authors`` may be auto-accepted, as may repository
+    collaborators with write access; everyone else is capped at NEEDS_HUMAN.
+    """
+
+    enabled: bool = False
+    provider: str = ""
+    model: str = ""
+    reasoning: str = "high"
+    watch_label: str = ""
+    reject_label: str = Field(default="factory:rejected", min_length=1)
+    trusted_authors: list[str] = Field(default_factory=list)
+
+
 class ModelProfile(Contract):
     provider: str = "openai"
     model: str = "gpt-6.1-sol"
@@ -223,6 +270,8 @@ class FactoryConfig(Contract):
     # Strongest tier by default; set to e.g. "claude-fable-5-2" to override.
     advisor_model: str = ""
     advisor: AdvisorPolicy = Field(default_factory=lambda: AdvisorPolicy())
+    framework: FrameworkPolicy = Field(default_factory=FrameworkPolicy)
+    triage: TriagePolicy = Field(default_factory=TriagePolicy)
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"
@@ -262,6 +311,19 @@ class FactoryConfig(Contract):
     sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
 
     @model_validator(mode="after")
+    def _labels_never_ready(self):
+        labels = {
+            self.github_issue_label,
+            self.framework.proposed_label,
+            self.triage.reject_label,
+        }
+        if len(labels) != 3:
+            raise ValueError(
+                "ready, proposed and rejected issue labels must all differ"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _advisor_model(self):
         if self.advisor_model:
             if not re.fullmatch(r"[A-Za-z0-9._:/-]+", self.advisor_model):
@@ -281,6 +343,16 @@ class FactoryConfig(Contract):
             or self.harness == "claude"
         )
         return "anthropic" if anthropic else "openai"
+
+    def triage_model_name(self) -> str:
+        """Triage model: override, else the provider's strongest default."""
+        if self.triage.model:
+            return self.triage.model
+        saved, self.advisor_model = self.advisor_model, ""
+        try:
+            return self.advisor_model_name()
+        finally:
+            self.advisor_model = saved
 
     def advisor_model_name(self) -> str:
         """Configured override, else the provider's strongest default."""

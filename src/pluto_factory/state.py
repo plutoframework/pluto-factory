@@ -277,7 +277,9 @@ class State:
                 if row:
                     existing = self.get_work(row["id"])
                     existing_payload = self._normalize_submission(
-                        Submission.model_validate(existing["payload"])
+                        Submission.model_validate(
+                            self.original_payload(existing)
+                        )
                     ).model_dump()
                     if existing_payload != submission.model_dump():
                         raise ValueError(
@@ -311,7 +313,58 @@ class State:
 
     def dependency_status(self, work_id: str) -> dict:
         """Resolve durable symbolic prerequisites without assuming intake order."""
-        return graph_dependency_status(self.list_work(), work_id)
+        return graph_dependency_status(
+            self.list_work(), work_id, self.satisfied_external()
+        )
+
+    def satisfied_external(self) -> frozenset:
+        """External issue keys that are closed-as-completed or waived."""
+        return frozenset(
+            row[0]
+            for row in self.db.execute(
+                "SELECT key FROM external_issues "
+                "WHERE state IN ('completed','waived')"
+            )
+        )
+
+    def original_payload(self, work: dict) -> dict:
+        """The accepted submission without factory-added upstream deps."""
+        payload = dict(work["payload"])
+        added = set(work["data"].get("upstream_dependencies", []))
+        payload["depends_on_sources"] = [
+            key
+            for key in payload.get("depends_on_sources", [])
+            if key not in added
+        ]
+        return payload
+
+    def add_dependency_source(self, work_id: str, key: str) -> bool:
+        """Make a work item wait for an external issue (e.g. upstream)."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            work = self.get_work(work_id)
+            payload = work["payload"]
+            if key in payload.get("depends_on_sources", []):
+                return False
+            payload["depends_on_sources"] = [
+                *payload.get("depends_on_sources", []),
+                key,
+            ]
+            data = work["data"]
+            data["upstream_dependencies"] = [
+                *data.get("upstream_dependencies", []),
+                key,
+            ]
+            self.db.execute(
+                "UPDATE work SET payload=?,data=?,updated=? WHERE id=?",
+                (encode(payload), encode(data), time.time(), work_id),
+            )
+            self._event(
+                "dependency.added",
+                work_id,
+                {"source": key, "origin": "upstream"},
+            )
+        return True
 
     def get_work(self, work_id: str) -> dict:
         row = self.db.execute(

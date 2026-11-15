@@ -25,6 +25,27 @@ CREATE TABLE IF NOT EXISTS decisions (
     advice TEXT NOT NULL DEFAULT 'none', block_key TEXT,
     answered_by TEXT
 );
+CREATE TABLE IF NOT EXISTS external_issues (
+    key TEXT PRIMARY KEY, slug TEXT NOT NULL, number INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open', closing TEXT NOT NULL DEFAULT '',
+    checked REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS upstream_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id TEXT NOT NULL, library TEXT NOT NULL,
+    slug TEXT NOT NULL, number INTEGER, url TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+    wake_at REAL NOT NULL DEFAULT 0, last_error TEXT,
+    created REAL NOT NULL, UNIQUE (decision_id, library)
+);
+CREATE TABLE IF NOT EXISTS triage_issues (
+    slug TEXT NOT NULL, number INTEGER NOT NULL,
+    version TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL, spec TEXT, guidance TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '', trusted INTEGER NOT NULL DEFAULT 0,
+    decision_id TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+    PRIMARY KEY (slug, number)
+);
 CREATE TABLE IF NOT EXISTS issue_comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     decision_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -842,9 +863,16 @@ def _words(text, limit):
     )
 
 
-def comment_body(decision, kind):
+def comment_body(decision, kind, extra=None):
     lines = [marker(decision["id"], kind)]
-    if kind == "created":
+    if kind == "upstream":
+        lines.append(
+            f"**Upstream issue filed** for {extra['library']}: {extra['url']}"
+        )
+        lines.append(
+            "Work stays parked until it closes; the factory resumes it then."
+        )
+    elif kind == "created":
         lines.append(f"**Owner decision needed:** {decision['question']}")
         for detail in decision["details"]:
             lines.append(f"- {detail}")
@@ -905,6 +933,15 @@ def flush_issue_comments(state, adapter, allowed_slugs):
                 ):
                     outcome, error = "delivered", None  # already there
                 else:
+                    extra = None
+                    if row["kind"] == "upstream":
+                        extra = dict(
+                            state.db.execute(
+                                "SELECT library,url FROM upstream_issues "
+                                "WHERE decision_id=? AND url!='' LIMIT 1",
+                                (row["decision_id"],),
+                            ).fetchone()
+                        )
                     adapter._run(
                         [
                             "gh",
@@ -914,7 +951,7 @@ def flush_issue_comments(state, adapter, allowed_slugs):
                             "--repo",
                             row["slug"],
                             "--body",
-                            comment_body(decision, row["kind"]),
+                            comment_body(decision, row["kind"], extra),
                         ],
                         mutating=True,
                     )

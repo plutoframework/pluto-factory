@@ -745,7 +745,8 @@ def test_claude_agent_sdk_coordinator_decides(tmp_path, monkeypatch):
     assert decision.action == "advance"
     options = seen["options"]
     assert options.model == "claude-sonnet-5-5"
-    assert options.system_prompt == "Role"
+    assert options.system_prompt.startswith("Role")
+    assert "telegraphic" in options.system_prompt
     assert options.tools == [] and options.setting_sources == []
     assert options.output_format["type"] == "json_schema"
     assert json.loads(seen["prompt"])["allowed_actions"] == [

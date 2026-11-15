@@ -92,7 +92,7 @@ def validate_graph(items, candidate):
         raise DependencyError("self-dependency or dependency cycle rejected")
 
 
-def dependency_status(items, work_id):
+def dependency_status(items, work_id, satisfied=frozenset()):
     indexed, edges = graph(items)
     if work_id not in indexed:
         raise DependencyError("unknown work item")
@@ -108,7 +108,9 @@ def dependency_status(items, work_id):
             continue
         seen.add(dependency)
         if dependency.startswith("source:"):
-            missing_sources.add(dependency.removeprefix("source:"))
+            key = dependency.removeprefix("source:")
+            if key not in satisfied:
+                missing_sources.add(key)
         elif dependency not in indexed:
             missing_work.add(dependency)
         else:

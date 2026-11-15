@@ -1,7 +1,6 @@
 """GitHub intake and PR waiting are independent of worker execution."""
 
 import copy
-import json
 import time
 
 from .acceptance import acceptance_intent, citable_ids, current_evidence
@@ -68,14 +67,14 @@ class GitHubFlow:
 
     def _observe_change(self, existing, submission):
         """Record each distinct edited issue state once; scope stays frozen."""
+        work = self.state.get_work(existing["id"])
         accepted = Submission.model_validate(
-            json.loads(existing["payload"])
+            self.state.original_payload(work)
         ).model_dump()
         observed = submission.model_dump()
         if accepted == observed:
             return
         observed_digest = digest(observed)
-        work = self.state.get_work(existing["id"])
         data = work["data"]
         if data.get("observed_issue_digest") == observed_digest:
             return

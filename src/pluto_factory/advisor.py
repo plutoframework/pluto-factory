@@ -7,17 +7,14 @@ with the violation named; if every attempt fails the deterministic fallback
 is used, so a blocked item is never left without a decision.
 """
 
-import asyncio
 import json
-import os
 import re
 from pathlib import Path
 
 from pydantic import Field, field_validator, model_validator
 
-from . import framework_sources
+from . import framework_sources, structured
 from .config import advisor_prompt
-from .credentials import credential_environment
 from .models import Contract
 
 ADVISOR_RETRIES = 2
@@ -301,89 +298,25 @@ class Advisor:
         return framework_sources.resolve(self.config)
 
     def _model(self, prompt, payload):
-        sources = self.sources()
-        if self.config.coordinator_runtime == "claude_agent_sdk":
-            return self._claude(prompt, payload, sources)
-        from pydantic_ai import Agent
-
-        reader = framework_sources.ReferenceReader(sources)
-        credentials = credential_environment(self.home)
-        previous = {key: os.environ.get(key) for key in credentials}
-        try:
-            os.environ.update(credentials)
-            agent = Agent(
-                self._model_name(),
-                output_type=Advice,
-                instructions=prompt,
-                retries=1,
-                model_settings={
-                    "timeout": 90,
-                    "openai_reasoning_effort": self.config.advisor.reasoning,
-                },
-            )
-
-            @agent.tool_plain
-            def list_dir(library: str, path: str = "") -> list[str]:
-                """List a directory of a Pluto library (read-only)."""
-                return reader.list_dir(library, path)
-
-            @agent.tool_plain
-            def read_file(library: str, path: str) -> str:
-                """Read a source file of a Pluto library (read-only)."""
-                return reader.read_file(library, path)
-
-            @agent.tool_plain
-            def search(library: str, pattern: str) -> list[str]:
-                """Regex-search a Pluto library's sources (read-only)."""
-                return reader.search(library, pattern)
-
-            return agent.run_sync(payload).output
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+        return structured.run(
+            self.config,
+            self.home,
+            prompt=prompt,
+            payload=payload,
+            output_type=Advice,
+            sources=self.sources(),
+            model=self._model_name(),
+            reasoning=self.config.advisor.reasoning,
+        )
 
     def claude_options(self, prompt, sources):
         """SDK options: read-only tools confined to the framework sources."""
-        from claude_agent_sdk import ClaudeAgentOptions
-
-        return ClaudeAgentOptions(
-            model=self._model_name(),
-            system_prompt=prompt,
-            tools=list(READ_ONLY_TOOLS),
-            allowed_tools=list(READ_ONLY_TOOLS),
-            disallowed_tools=list(DENIED_TOOLS),
-            permission_mode="dontAsk",
-            setting_sources=[],
-            add_dirs=[item["path"] for item in sources],
-            max_turns=12,
-            cwd=str(self.home),
-            effort=self.config.advisor.reasoning,
-            output_format={
-                "type": "json_schema",
-                "schema": Advice.model_json_schema(),
-            },
+        return structured.claude_options(
+            self.config,
+            self.home,
+            prompt,
+            sources,
+            self._model_name(),
+            self.config.advisor.reasoning,
+            Advice.model_json_schema(),
         )
-
-    def _claude(self, prompt, payload, sources):
-        from claude_agent_sdk import ResultMessage, query
-
-        options = self.claude_options(prompt, sources)
-
-        async def run():
-            result = None
-            async for message in query(prompt=payload, options=options):
-                if isinstance(message, ResultMessage):
-                    result = message
-            return result
-
-        result = asyncio.run(asyncio.wait_for(run(), ADVISOR_TIMEOUT_SECONDS))
-        if (
-            result is None
-            or result.is_error
-            or result.structured_output is None
-        ):
-            raise RuntimeError("advisor produced no structured output")
-        return result.structured_output
