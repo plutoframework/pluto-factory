@@ -50,9 +50,9 @@ def test_claude_launch_command(tmp_path):
     item, session, call = launch(tmp_path)
     assert session["kind"] == "claude"
     native = call[call.index("claude") :]
-    assert native[-1] == Path(item["packet_path"]).read_text()
-    assert native[-2] == "Role context"
-    assert native[-3] == "--append-system-prompt"
+    assert str(Path(item["packet_path"]).resolve()) in native[-1]
+    assert native[-2] == item["role_path"]
+    assert native[-3] == "--append-system-prompt-file"
     assert native[native.index("--model") + 1] == "gpt-6.1-sol"
     assert native[native.index("--effort") + 1] == "high"
     assert native[native.index("--permission-mode") + 1] == "dontAsk"
@@ -374,3 +374,32 @@ def test_check_tool_is_allowed_for_implementer_launch(tmp_path):
     assert "mcp__factory__factory_check" in allowed
     _, _, call = launch(tmp_path, role="reviewer")
     assert "factory_check" not in call[call.index("--allowedTools") + 1]
+
+
+def test_claude_launch_with_oversized_packet_keeps_argv_small(tmp_path):
+    core = ClaudeCore()
+    item = assignment(tmp_path)
+    Path(item["packet_path"]).write_text("x" * (200 * 1024))
+    ClaudeHarness(config(tmp_path), core).launch(item)
+    call = next(call for call in core.calls if call[1] == "run")
+    assert max(len(arg) for arg in call) < 4096
+
+
+def test_argument_too_long_is_permanent_config_error(tmp_path):
+    import errno
+
+    from pluto_factory.harness import PiHarness
+    from pluto_factory.models import Failure
+    from pluto_factory.recovery import plan_recovery
+
+    def runner(_args, **_kwargs):
+        raise OSError(errno.E2BIG, "Argument list too long")
+
+    with pytest.raises(HarnessError) as caught:
+        PiHarness(config(tmp_path), runner)._hc(["run"], mutating=True)
+    failure = caught.value.failure
+    assert failure["code"] == "config.invalid"
+    assert "E2BIG" in failure["summary"]
+    assert not failure["uncertain"]
+    recovery = plan_recovery(Failure(**failure), 0, 3, 1)
+    assert recovery.action == "defer"

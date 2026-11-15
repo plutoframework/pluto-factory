@@ -51,6 +51,56 @@ def orphaned_terminals(terminals, work_items, factory):
     ]
 
 
+EVIDENCE_FULL = 3
+EVIDENCE_TEXT_LIMIT = 2000
+EVIDENCE_SUMMARY_KEYS = (
+    "kind",
+    "passed",
+    "exit_code",
+    "command",
+    "repository",
+    "seconds",
+    "timed_out",
+    "artifact",
+)
+
+
+def _clip(text, limit=EVIDENCE_TEXT_LIMIT):
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    return f"[{len(text) - limit} earlier chars omitted]\n" + text[-limit:]
+
+
+def bound_evidence(items):
+    """Keep the newest evidence in full and older rows as pointers.
+
+    Items arrive newest first. Full rows clip large output text to its tail;
+    older rows keep only identifying fields plus their ``artifact`` path, so
+    the packet stops growing with every revision.
+    """
+    bounded = []
+    for index, item in enumerate(items):
+        if index < EVIDENCE_FULL:
+            row = {
+                key: _clip(value) if key in {"stdout", "stderr"} else value
+                for key, value in item.items()
+            }
+        else:
+            row = {k: item[k] for k in EVIDENCE_SUMMARY_KEYS if k in item}
+            if "report" in item:
+                report = item["report"]
+                row["report_summary"] = (
+                    {k: report[k] for k in ("status", "summary") if k in report}
+                    if isinstance(report, dict)
+                    else None
+                )
+            row["summarized"] = (
+                "Older evidence; full output is in the artifact file."
+            )
+        bounded.append(row)
+    return bounded
+
+
 class Engine:
     def __init__(self, home: Path, *, harness=None, coordinator=None):
         self.home = Path(home).resolve()
@@ -403,7 +453,9 @@ class Engine:
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
-            "evidence": [json.loads(row["data"]) for row in evidence],
+            "evidence": bound_evidence(
+                [json.loads(row["data"]) for row in evidence]
+            ),
             "qa_guidance": bundle["qa_guidance"],
             "report_contract": WorkerReport.model_json_schema(),
         }
