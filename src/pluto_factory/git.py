@@ -22,9 +22,15 @@ from .models import FactoryConfig, Repository
 
 class GitFailure(RuntimeError):
     def __init__(
-        self, code: str, summary: str, uncertain: bool = False
+        self,
+        code: str,
+        summary: str,
+        uncertain: bool = False,
+        paths: list[str] | None = None,
     ) -> None:
         super().__init__(summary)
+        # Conflicted paths of a merge left prepared in the worktree.
+        self.paths = paths
         self.code = code
         self.summary = summary
         self.uncertain = uncertain
@@ -733,6 +739,7 @@ class GitWorkspace:
                             "<<<<<<<, =======, >>>>>>> marker. Do not run "
                             "git add, commit or merge --abort: the factory "
                             "stages and commits the merge after you report.",
+                            paths=paths,
                         )
                 else:
                     self._git(worktree, "checkout", "--detach", latest)

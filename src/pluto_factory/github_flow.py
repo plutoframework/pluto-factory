@@ -370,6 +370,7 @@ class GitHubFlow:
             max(increment, *(item["increment"] for item in history)) + 1
         )
         data["revision_reason"] = "; ".join(remaining)
+        data.pop("conflict_revision", None)
         for key in (
             "entries",
             "reports",

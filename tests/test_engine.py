@@ -1366,3 +1366,85 @@ def test_implementer_timeout_is_configured_separately(tmp_path):
         assert engine._phase_timeout(work) == 5000
     finally:
         engine.state.close()
+
+
+def _conflicted_work(tmp_path, phase, extra=None):
+    home, prepared = prepare_demo(tmp_path)
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    work = engine.state.get_work(work_id)
+    entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+    writable = next(e for e in entries if e["access"] == "write")
+    (Path(writable["worktree"]) / "shared.txt").write_text("candidate\n")
+    entries = engine.git.snapshot(entries, work_id)
+    _commit_default(Path(writable["managed"]), "shared.txt", "default\n")
+    data = {
+        "entries": entries,
+        "workspace_id": work_id,
+        "reports": {"reviewer": {"outcome": "ready"}},
+        **(extra or {}),
+    }
+    engine.state.update_work(
+        work_id, phase=phase, control="deferred", data=data
+    )
+    engine.state.resume(work_id)
+    return engine, work_id, writable
+
+
+@pytest.mark.parametrize(
+    "phase", ["preparing", "checking", "qa_checks", "qa", "integrating"]
+)
+def test_sync_conflict_in_any_phase_revises_instead_of_deferring(
+    tmp_path, phase
+):
+    engine, work_id, writable = _conflicted_work(tmp_path, phase)
+    try:
+        if phase == "integrating":
+            current = digest(resolved_bundle(engine.home, engine.config))
+            data = engine.state.get_work(work_id)["data"]
+            data.update(
+                checks_config_digest=current,
+                qa_config_digest=current,
+                report_config_digests={"reviewer": current, "qa": current},
+            )
+            engine.state.update_work(work_id, data=data)
+        engine.tick()
+        work = engine.state.get_work(work_id)
+        assert work["phase"] == "implementing"
+        assert work["control"] == "ready"
+        assert work["revisions"] == 0
+        data = work["data"]
+        assert data["revision_reason"].startswith(
+            "Resolve merge conflicts with the new default branch"
+        )
+        assert "shared.txt" in data["revision_reason"]
+        assert data["conflict_revision"]["paths"] == ["shared.txt"]
+        assert data["reports"]["reviewer"]["outcome"] == "ready"
+        assert (
+            "<<<<<<<" in (Path(writable["worktree"]) / "shared.txt").read_text()
+        )
+        assert not any(
+            e["kind"] == "work.deferred"
+            for e in engine.state.inspect()["events"]
+        )
+    finally:
+        engine.state.close()
+
+
+def test_conflict_revision_dispatches_implementer_with_merge_notes(tmp_path):
+    engine, _work_id, _ = _conflicted_work(tmp_path, "qa_checks")
+    launched = []
+    engine._launch = launched.append
+    try:
+        engine.tick()
+        engine.tick()
+        packet = json.loads(
+            Path(launched[0]["assignment"]["packet_path"])
+            .read_text()
+            .split("\n\n", 1)[1]
+        )
+        assert packet["conflict_revision"]["paths"] == ["shared.txt"]
+        assert "shared.txt" in packet["default_branch_sync"]["merge_conflict"]
+        assert "conflict-only" in packet["default_branch_sync"]["guidance"]
+    finally:
+        engine.state.close()

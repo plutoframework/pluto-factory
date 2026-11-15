@@ -173,6 +173,8 @@ class Engine:
         except HarnessError as error:
             self._failure(work["id"], Failure.model_validate(error.failure))
         except (GitFailure, GitHubFailure) as error:
+            if self._conflict_revision(work, error):
+                return True
             self._failure(
                 work["id"],
                 Failure(
@@ -305,6 +307,18 @@ class Engine:
             if role == "implementer":
                 notes = self._synchronize_for_dispatch(work)
                 work = self.state.get_work(work["id"])
+                pending = work["data"].get("conflict_revision")
+                if notes is None and pending:
+                    # The merge is already prepared in the worktree.
+                    notes = {
+                        "default_branch_merged": [],
+                        "merge_conflict": pending["summary"],
+                        "guidance": (
+                            "This is a conflict-only revision: resolve the "
+                            "prepared merge with the new default branch and "
+                            "change nothing else."
+                        ),
+                    }
             self._dispatch(work, role, notes)
         elif phase == "checking":
             operation = self.state.begin_operation(work_id, "git.snapshot", {})
@@ -375,6 +389,49 @@ class Engine:
             work["id"], data=data, event="candidate.reconciled"
         )
         return pending
+
+    def _conflict_revision(self, work, error):
+        """Route a default-branch merge conflict in any phase to a revision.
+
+        Finished work must not be deferred because the default branch moved:
+        the merge is already prepared in the worktree, so the implementer
+        resolves it and the candidate is re-validated. Accepted evidence and
+        reports stay; the revision is flagged so reviewers focus on the merge.
+        Conflict revisions do not consume the revision budget.
+        """
+        if (
+            not isinstance(error, GitFailure)
+            or error.code != "git.conflict"
+            or not error.paths
+            or work["phase"] in {"queued", "implementing"}
+            or work["current_run"]
+        ):
+            return False
+        try:
+            fresh = self.state.get_work(work["id"])
+            data = fresh["data"]
+            data["revision_reason"] = (
+                "Resolve merge conflicts with the new default branch: "
+                + ", ".join(error.paths)
+            )
+            data["conflict_revision"] = {
+                "paths": error.paths,
+                "summary": error.summary,
+                "from_phase": work["phase"],
+            }
+            data.pop("checks_candidate", None)
+            data.pop("qa_candidate", None)
+            self.state.update_work(
+                work["id"],
+                phase="implementing",
+                control="ready",
+                current_run=None,
+                data=data,
+                event="work.conflict_revision_requested",
+            )
+        except StateConflict:
+            self.state.event("operation.superseded", work["id"], {})
+        return True
 
     def _synchronize_for_dispatch(self, work):
         """Merge the latest default branch before an implementer starts.
@@ -512,6 +569,7 @@ class Engine:
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
+            "conflict_revision": work["data"].get("conflict_revision"),
             "evidence": bound_evidence(
                 [json.loads(row["data"]) for row in evidence]
             ),
@@ -740,6 +798,7 @@ class Engine:
             "recoveries": work["recoveries"],
             "revisions": work["revisions"],
             "candidate": work["data"].get("entries"),
+            "conflict_revision": work["data"].get("conflict_revision"),
             "evaluation": evaluation,
             "human_guidance": self._guidance(work["id"]),
         }
@@ -1189,6 +1248,7 @@ class Engine:
         self.state.finish_operation(operation, {"repositories": result})
         data["integration"] = result
         if remaining:
+            data.pop("conflict_revision", None)
             data["revision_reason"] = "Continue remaining scope: " + "; ".join(
                 remaining
             )
@@ -1222,6 +1282,7 @@ class Engine:
             return
         data = work["data"]
         data["revision_reason"] = reason
+        data.pop("conflict_revision", None)
         data.pop("checks_candidate", None)
         data.pop("qa_candidate", None)
         self.state.update_work(
