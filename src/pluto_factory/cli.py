@@ -1,6 +1,7 @@
 """CLI presentation over the Python factory's typed operations."""
 
 import argparse
+import getpass
 import importlib.util
 import json
 import os
@@ -209,6 +210,14 @@ def parser() -> argparse.ArgumentParser:
         _common(command)
         if name in {"pause", "resume"}:
             command.add_argument("--work", help="Limit the action to one item")
+        if name == "resume":
+            command.add_argument(
+                "--guidance",
+                help="Authoritative human answer for the deferred item",
+            )
+            command.add_argument(
+                "--guidance-file", help="Read the guidance text from a file"
+            )
         if name == "doctor":
             command.add_argument("--verify-auth", action="store_true")
         if name == "notifications":
@@ -972,6 +981,15 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
             "detail": isolation[1],
         }
     )
+    sandbox_policy = None
+    if config.isolation == "required":
+        from .sandbox import effective
+
+        sandbox_policy = effective(config.sandbox.model_dump())
+        if config.sandbox.allow_docker:
+            from .sandbox import DOCKER_WARNING
+
+            print(f"pluto-factory: WARNING: {DOCKER_WARNING}", file=sys.stderr)
     for repo in config.repositories:
         path = Path(repo.path)
         probe = subprocess.run(
@@ -1053,6 +1071,7 @@ def doctor(home: Path, verify_auth: bool = False) -> dict:
         "factory": config.name,
         "credentials_verified": False,
         "secrets": secrets_status,
+        "sandbox": sandbox_policy,
         "native_workers": native_readiness,
         "github": github_status,
         # Owned worker terminals whose run has ended; the coordinator's
@@ -1187,8 +1206,17 @@ def execute(args: argparse.Namespace) -> dict:
             state.close()
     from .engine import Engine
 
-    if args.command in {"pause", "resume"}:
-        return getattr(Engine(home), args.command)(args.work)
+    if args.command == "resume":
+        text = args.guidance
+        if args.guidance_file:
+            if text:
+                raise ValueError("use --guidance or --guidance-file, not both")
+            text = Path(args.guidance_file).expanduser().read_text()
+        return Engine(home).resume(
+            args.work, text, getpass.getuser() if text else "human"
+        )
+    if args.command == "pause":
+        return Engine(home).pause(args.work)
     if args.command == "notifications":
         return Engine(home).flush_notifications()
     if args.max_seconds is not None and args.max_seconds <= 0:

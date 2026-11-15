@@ -355,7 +355,7 @@ def _summary(item, snapshot, coordinator_running=False):
 
 def _event_message(row, snapshot):
     data = row["data"]
-    for key in ("summary", "reason", "message", "rationale", "note"):
+    for key in ("summary", "reason", "message", "rationale", "note", "text"):
         if isinstance(data.get(key), str):
             return text(data[key], 3000)
     decision = data.get("decision")
@@ -552,6 +552,15 @@ class DashboardData:
                 ],
                 "revision_reason": text(item["data"].get("revision_reason"))
                 or None,
+                "guidance": [
+                    {
+                        "author": text(row["data"].get("author"), 200),
+                        "text": text(row["data"].get("text")),
+                        "created": row["created"],
+                    }
+                    for row in reversed(snapshot["events"])
+                    if row["kind"] == "human.guidance"
+                ],
                 "events": [
                     {
                         "seq": row["seq"],

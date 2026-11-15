@@ -301,16 +301,46 @@ fresh rather than rebinding to a new assignment.
 ```toml
 [sandbox]
 profile = ""                          # nono profile name/path; "" = bundled
-read = []                             # extra paths the worker's shell needs
-write = ["~/go/pkg/mod"]              # e.g. let workers fetch Go modules
+read_paths = []                       # extra absolute host paths, read-only
+write_paths = ["~/go/pkg/mod"]        # e.g. let workers fetch Go modules
 allow_domains = []                    # non-empty restricts network egress
+env_passthrough = ["GOFLAGS"]         # extra host env vars (never secrets:
+                                      # values travel on the terminal command)
+allow_docker = false                  # explicit opt-in, see below
 ```
+
+The table is validated and part of the config digest. Paths must be absolute
+(`~` expands) and are rejected if they are `/`, your home directory or an
+ancestor of it, the factory home, `~/.ssh`/`~/.gnupg`/`~/.aws`/`~/.kube`,
+the Herdr socket or the Docker socket. `env_passthrough` rejects
+`DOCKER_HOST`, `SSH_AUTH_SOCK` and `HC_*`/`HERDR*` names. `read`/`write` are
+still accepted as aliases. `pluto-factory doctor` prints the effective policy.
+
+**`allow_docker = true` is dangerous.** It exposes `/var/run/docker.sock`,
+which is root-equivalent on the host: a worker (or prompt-injected content it
+reads) can start a privileged container and escape the sandbox entirely. It
+is off by default; enabling it logs a warning at every dispatch and in
+`doctor`. Prefer `factory_check`, which runs Docker-needing checks outside the
+sandbox.
 
 The bundled profile grants read-only Go, Node, Python and mise toolchains
 (Go's build cache is writable), open network, a private `TMPDIR` and no
 global git config. nono's base profile allows writes under `/tmp`; keep
 factory homes outside it. `--isolation cooperative` runs workers unsandboxed on the host, as an
 explicit choice for a trusted local setup.
+
+### Answering deferred work
+
+A deferral that needs a human decision is a durable `action_required`
+notification. Answer it with
+`pluto-factory resume --work <id> --guidance "approve (a)"` (or
+`--guidance-file answer.md`). This records a `human.guidance` event (who,
+when, text), marks the item's notifications `resolved` and releases it. The
+coordinator snapshot and every later worker task packet carry all guidance
+for the item as `human_guidance`, marked authoritative: it overrides earlier
+conclusions, workers must follow it or report precisely why they cannot, and
+the coordinator must not defer again for the question it answered. `inspect`
+(events) and the dashboard's work detail show the guidance.
 
 ### Authentication and fnox
 

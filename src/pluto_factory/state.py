@@ -545,6 +545,34 @@ class State:
             self._event("factory.resumed", work_id or "factory", {})
         return {"paused": False, "work_id": work_id}
 
+    def add_guidance(self, work_id, text, author):
+        """Record an authoritative human answer and release the item."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("guidance text is empty")
+        with self.db:
+            self.get_work(work_id)
+            self._event(
+                "human.guidance",
+                work_id,
+                {"author": author, "text": text, "at": time.time()},
+            )
+            self.db.execute(
+                "UPDATE notifications SET state='resolved' "
+                "WHERE work_id=? AND kind='action_required' "
+                "AND state IN ('pending','delivered')",
+                (work_id,),
+            )
+        return self.guidance(work_id)
+
+    def guidance(self, work_id):
+        rows = self.db.execute(
+            "SELECT data FROM events WHERE kind='human.guidance' "
+            "AND subject=? ORDER BY seq",
+            (work_id,),
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
     def inspect(self):
         runs = self.db.execute(
             "SELECT id FROM runs ORDER BY created"

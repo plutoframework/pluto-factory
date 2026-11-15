@@ -24,6 +24,11 @@ from .trace import Tracer
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
 REAP_INTERVAL_SECONDS = 300
+GUIDANCE_AUTHORITY = (
+    "AUTHORITATIVE human decision. It overrides prior conclusions, "
+    "reports and deferrals. Follow it, or report precisely why it cannot "
+    "be followed; do not defer again for the question it answers."
+)
 
 
 def orphaned_terminals(terminals, work_items, factory):
@@ -394,6 +399,7 @@ class Engine:
             ),
             "execution_guidance": self._execution_guidance(),
             "default_branch_sync": notes,
+            "human_guidance": self._guidance(work_id),
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
@@ -408,6 +414,20 @@ class Engine:
         atomic_json(Path(assignment["assignment_path"]), run["assignment"])
         self.tracer.provenance(work, run)
         self._launch(run)
+
+    def _guidance(self, work_id):
+        entries = self.state.guidance(work_id)
+        if not entries:
+            return []
+        return [
+            {
+                "authority": GUIDANCE_AUTHORITY,
+                "author": item["author"],
+                "at": item["at"],
+                "text": item["text"],
+            }
+            for item in entries
+        ]
 
     def _execution_guidance(self):
         text = (
@@ -575,6 +595,7 @@ class Engine:
             "revisions": work["revisions"],
             "candidate": work["data"].get("entries"),
             "evaluation": evaluation,
+            "human_guidance": self._guidance(work["id"]),
         }
         snapshot["verification_policy"] = (
             "Workers run in a sandbox that cannot reach Docker, databases or "
@@ -582,7 +603,10 @@ class Engine:
             "that kind is not a reason to defer: advance to checking "
             "(the factory runs the configured checks outside the sandbox) "
             "or revise with a concrete correction. Defer only for a "
-            "genuine human decision."
+            "genuine human decision. If human_guidance is present it is "
+            "authoritative: it overrides earlier conclusions and answers "
+            "the question it addresses, so never defer again for that "
+            "question; defer only for a new, different decision."
         )
         if evaluation in {"acceptance", "handoff"}:
             snapshot["evidence"] = self._current_evidence(work)
@@ -1258,8 +1282,15 @@ class Engine:
         )
         return result
 
-    def resume(self, work_id=None):
-        return self.state.resume(work_id)
+    def resume(self, work_id=None, guidance=None, author="human"):
+        if guidance:
+            if not work_id:
+                raise ValueError("guidance requires --work")
+            self.state.add_guidance(work_id, guidance, author)
+        result = self.state.resume(work_id)
+        if guidance:
+            result["guidance"] = len(self.state.guidance(work_id))
+        return result
 
     def flush_notifications(self):
         return flush(self.state, self.config)

@@ -385,6 +385,7 @@ class PiHarness:
             "env",
             f"PLUTO_FACTORY_ASSIGNMENT={assignment_path}",
             f"PATH={os.environ.get('PATH', os.defpath)}",
+            *sandbox.environment_args(self.config.get("sandbox", {})),
             *[
                 f"{key}={os.environ[key]}"
                 for key in (
@@ -893,6 +894,7 @@ class ClaudeHarness(PiHarness):
             "env",
             f"PLUTO_FACTORY_ASSIGNMENT={assignment_path}",
             f"PATH={os.environ.get('PATH', os.defpath)}",
+            *sandbox.environment_args(self.config.get("sandbox", {})),
             *[
                 f"{key}={os.environ[key]}"
                 for key in ("CLAUDE_CONFIG_DIR",)

@@ -139,3 +139,75 @@ def test_bundled_profile_blocks_herdr_socket():
 def test_missing_nono_is_reported(monkeypatch):
     monkeypatch.setattr(sandbox.shutil, "which", lambda _name: None)
     assert "not installed" in sandbox.check({})
+
+
+def test_policy_validation_rejects_dangerous_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    monkeypatch.setenv("HC_TERMINAL_SOCKET", str(tmp_path / "herdr.sock"))
+    (tmp_path / "user").mkdir()
+    home = tmp_path / "factory"
+    home.mkdir()
+    for bad in (
+        "/",
+        str(tmp_path),  # ancestor of $HOME and the factory home
+        str(tmp_path / "user"),
+        str(home),
+        str(home / "sessions"),
+        str(tmp_path / "user" / ".ssh"),
+        "/var/run/docker.sock",
+        str(tmp_path / "herdr.sock"),
+    ):
+        with pytest.raises(ValueError):
+            sandbox.validate_policy(SandboxPolicy(read_paths=[bad]), home)
+    sandbox.validate_policy(
+        SandboxPolicy(write_paths=[str(tmp_path / "user" / "go")]), home
+    )
+
+
+def test_model_rejects_malformed_values():
+    for bad in (
+        {"read_paths": ["relative/path"]},
+        {"write_paths": ["/a/../etc"]},
+        {"allow_domains": ["bad domain"]},
+        {"env_passthrough": ["1BAD"]},
+        {"env_passthrough": ["DOCKER_HOST"]},
+        {"env_passthrough": ["HC_TERMINAL_SOCKET"]},
+    ):
+        with pytest.raises(ValueError):
+            SandboxPolicy(**bad)
+    assert SandboxPolicy(read=["/opt/x"]).read_paths == ["/opt/x"]
+
+
+def test_env_passthrough_and_docker_opt_in(
+    tmp_path, ready, monkeypatch, caplog
+):
+    monkeypatch.setenv("GOFLAGS", "-mod=mod")
+    monkeypatch.delenv("MISSING_VAR", raising=False)
+    cfg = config(tmp_path, "pi", env_passthrough=["GOFLAGS", "MISSING_VAR"])
+    command = sandbox.wrap(
+        assignment(tmp_path), "pi", cfg.sandbox.model_dump(), ["pi"]
+    )
+    assert "GOFLAGS=-mod=mod" in command
+    assert not any(c.startswith("MISSING_VAR") for c in command)
+    assert "--allow-unix-socket" not in command
+    opened = config(tmp_path, "pi", allow_docker=True)
+    with caplog.at_level("WARNING"):
+        command = sandbox.wrap(
+            assignment(tmp_path),
+            "pi",
+            opened.sandbox.model_dump(),
+            ["pi"],
+        )
+    assert flags(command, "--allow-unix-socket") == [sandbox.DOCKER_SOCKET]
+    assert "root-equivalent" in caplog.text
+
+
+def test_effective_policy_and_digest(tmp_path):
+    shown = sandbox.effective(SandboxPolicy(allow_docker=True).model_dump())
+    assert "DOCKER SOCKET EXPOSED" in shown["host_sockets"]
+    assert sandbox.effective({})["network"] == "open"
+    from pluto_factory.config import digest
+
+    base = config(tmp_path, "pi")
+    other = config(tmp_path, "pi", allow_docker=True)
+    assert digest(base.model_dump()) != digest(other.model_dump())

@@ -1,8 +1,17 @@
 """Contracts shared by the coordinator, adapters and reporting extension."""
 
+import os
+import re
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class Contract(BaseModel):
@@ -68,19 +77,79 @@ class DebugPolicy(Contract):
     redact: bool = True
 
 
+DOCKER_SOCKET = "/var/run/docker.sock"
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DOMAIN = re.compile(
+    r"^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$"
+)
+# Variables that would hand a worker a host control channel.
+FORBIDDEN_ENV = {"HC_TERMINAL_SOCKET", "DOCKER_HOST", "SSH_AUTH_SOCK"}
+
+
 class SandboxPolicy(Contract):
     """nono sandbox for workers when ``isolation = "required"``.
 
     ``profile`` is a nono profile name or path; empty uses the bundled
     sealed profile. Any profile must block host sockets (Herdr, docker,
-    dbus) or dispatch is refused. ``read``/``write`` grant extra paths
-    (toolchains, caches); ``allow_domains`` restricts network egress.
+    dbus) or dispatch is refused. ``read_paths``/``write_paths`` grant extra
+    absolute host paths (toolchains, caches); ``allow_domains`` restricts
+    network egress; ``env_passthrough`` names extra host environment
+    variables copied to the worker (never put secrets here: values travel
+    on the terminal command line). ``allow_docker`` is an explicit opt-in
+    that exposes the Docker socket, which is equivalent to root on the
+    host: a container escape is a host escape.
     """
 
     profile: str = ""
-    read: list[str] = Field(default_factory=list)
-    write: list[str] = Field(default_factory=list)
+    read_paths: list[str] = Field(default_factory=list)
+    write_paths: list[str] = Field(default_factory=list)
     allow_domains: list[str] = Field(default_factory=list)
+    env_passthrough: list[str] = Field(default_factory=list)
+    allow_docker: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_names(cls, value):
+        if isinstance(value, dict):
+            value = dict(value)
+            for old, new in (("read", "read_paths"), ("write", "write_paths")):
+                if old in value:
+                    if new in value:
+                        raise ValueError(f"use only {new}, not {old}")
+                    value[new] = value.pop(old)
+        return value
+
+    @field_validator("read_paths", "write_paths")
+    @classmethod
+    def _paths(cls, paths):
+        for raw in paths:
+            if not raw or "\0" in raw:
+                raise ValueError("sandbox paths must be non-empty")
+            expanded = os.path.expanduser(raw)
+            if not os.path.isabs(expanded):
+                raise ValueError(f"sandbox path must be absolute: {raw!r}")
+            if ".." in Path(expanded).parts:
+                raise ValueError(f"sandbox path must not contain '..': {raw!r}")
+        return paths
+
+    @field_validator("allow_domains")
+    @classmethod
+    def _domains(cls, domains):
+        for domain in domains:
+            if not DOMAIN.fullmatch(domain):
+                raise ValueError(f"invalid sandbox domain: {domain!r}")
+        return domains
+
+    @field_validator("env_passthrough")
+    @classmethod
+    def _environment(cls, names):
+        for name in names:
+            if not ENV_NAME.fullmatch(name):
+                raise ValueError(f"invalid environment variable: {name!r}")
+            if name in FORBIDDEN_ENV or name.startswith(("HC_", "HERDR")):
+                raise ValueError(f"{name} would expose a host control channel")
+        return names
 
 
 class FactoryConfig(Contract):
