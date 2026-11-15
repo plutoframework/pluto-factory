@@ -12,7 +12,10 @@ Both read the assignment from ``PLUTO_FACTORY_ASSIGNMENT``.
 
 import json
 import os
+import re
 import sys
+import time
+import uuid
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -24,6 +27,10 @@ from .trace import worker_event
 SERVER = "factory"
 TOOL = "factory_report"
 QUALIFIED_TOOL = f"mcp__{SERVER}__{TOOL}"
+CHECK_TOOL = "factory_check"
+QUALIFIED_CHECK_TOOL = f"mcp__{SERVER}__{CHECK_TOOL}"
+CHECK_ID = re.compile(r"^[0-9a-f]{32}$")
+OUTPUT_LIMIT = 3000
 PROTOCOL_VERSION = "2025-06-18"
 
 
@@ -89,6 +96,102 @@ def record_report(assignment: dict, arguments: dict) -> str:
     return "Report persisted; coordinator validation is pending"
 
 
+def _check_dir(assignment: dict) -> Path:
+    return Path(assignment["assignment_path"]).parent / "checks"
+
+
+def check_wait_seconds(assignment: dict) -> float:
+    limit = (assignment.get("config") or {}).get("command_timeout_seconds", 900)
+    return limit * 4 + 60
+
+
+def pending_checks(assignment: dict) -> list[str]:
+    """Request ids the worker has filed and the factory has not answered."""
+    if "assignment_path" not in assignment:
+        return []
+    folder = _check_dir(assignment)
+    if not folder.is_dir():
+        return []
+    found = []
+    for path in sorted(folder.glob("*.request.json")):
+        name = path.name.removesuffix(".request.json")
+        if (
+            CHECK_ID.match(name)
+            and not (folder / f"{name}.result.json").exists()
+        ):
+            found.append(name)
+    return found
+
+
+def answer_check(assignment: dict, request_id: str, result: dict) -> None:
+    if not CHECK_ID.match(request_id):
+        raise ValueError("invalid check request id")
+    atomic_json(_check_dir(assignment) / f"{request_id}.result.json", result)
+
+
+def summarize_check(rows: list[dict]) -> dict:
+    """Compact pass/fail view of validation evidence rows for the worker."""
+    results = []
+    for row in rows:
+        output = "\n".join(
+            part for part in (row.get("stdout"), row.get("stderr")) if part
+        )
+        results.append(
+            {
+                "repository": row["repository"],
+                "command": row["command"],
+                "environment": row.get("environment"),
+                "passed": row["passed"],
+                "exit_code": row["exit_code"],
+                "timed_out": row.get("timed_out", False),
+                "mutated_repositories": row.get("mutated_repositories", []),
+                "seconds": round(row.get("seconds", 0), 1),
+                "output_tail": output[-OUTPUT_LIMIT:],
+            }
+        )
+    return {
+        "passed": bool(rows) and all(row["passed"] for row in rows),
+        "results": results,
+    }
+
+
+def request_check(assignment: dict) -> dict:
+    """File a check request and wait for the factory's answer."""
+    folder = _check_dir(assignment)
+    folder.mkdir(parents=True, exist_ok=True)
+    request_id = uuid.uuid4().hex
+    atomic_json(
+        folder / f"{request_id}.request.json",
+        {**_identity(assignment), "requested": time.time()},
+    )
+    result_path = folder / f"{request_id}.result.json"
+    deadline = time.monotonic() + check_wait_seconds(assignment)
+    while time.monotonic() < deadline:
+        if result_path.exists():
+            try:
+                return json.loads(result_path.read_text())
+            except json.JSONDecodeError:
+                pass
+        time.sleep(0.5)
+    return {"passed": False, "error": "Timed out waiting for the factory"}
+
+
+def _check_definition() -> dict:
+    return {
+        "name": CHECK_TOOL,
+        "description": (
+            "Run the repository's configured check commands (the same ones "
+            "the factory runs in its checking phase) OUTSIDE your sandbox, "
+            "against a snapshot of your current worktree. Use this instead "
+            "of running make check, docker or database-backed tests "
+            "yourself: they cannot run in your sandbox. Your files are not "
+            "touched. Returns pass/fail with truncated output; the result "
+            "is recorded as evidence. May take several minutes."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    }
+
+
 def _tool_definition(assignment: dict) -> dict:
     schema = json.loads(Path(assignment["schema_path"]).read_text())
     return {
@@ -118,9 +221,27 @@ def handle_message(assignment: dict, message: dict) -> dict | None:
     elif method == "ping":
         result = {}
     elif method == "tools/list":
-        result = {"tools": [_tool_definition(assignment)]}
+        tools = [_tool_definition(assignment)]
+        if assignment.get("role") == "implementer":
+            tools.append(_check_definition())
+        result = {"tools": tools}
     elif method == "tools/call":
         params = message.get("params") or {}
+        if (
+            params.get("name") == CHECK_TOOL
+            and assignment.get("role") == "implementer"
+        ):
+            outcome = request_check(assignment)
+            return {
+                "jsonrpc": "2.0",
+                "id": identifier,
+                "result": {
+                    "content": [
+                        {"type": "text", "text": json.dumps(outcome, indent=2)}
+                    ],
+                    "isError": not outcome.get("passed"),
+                },
+            }
         if params.get("name") != TOOL:
             return {
                 "jsonrpc": "2.0",

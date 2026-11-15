@@ -363,7 +363,16 @@ class Engine:
     def _execution_guidance(self):
         text = (
             "Leave changes uncommitted in the worktree: the factory commits "
-            "and integrates them. Do not commit, push, or switch branches."
+            "and integrates them. Do not commit, push, or switch branches. "
+            "If the worktree is mid-merge (MERGE_HEAD present, conflict "
+            "markers in files), that is expected: edit the conflicted files "
+            "to the correct combined content and remove every marker; never "
+            "run git add, commit or merge --abort, the factory completes "
+            "the merge after you report. Checks that need Docker, databases "
+            "or other host services may not run where you do: call the "
+            "factory_check tool, which runs the configured checks outside "
+            "your environment on a snapshot of your worktree and returns "
+            "pass/fail output; cite its result as your verification."
         )
         if self.config.isolation == "required":
             text += (
@@ -426,12 +435,32 @@ class Engine:
                 "dispatch.paused_after_launch", work["id"], observation
             )
 
+    def _service_checks(self, work, run):
+        """Run worker-requested checks here, outside the worker's sandbox."""
+        from .claude_worker import answer_check, pending_checks, summarize_check
+
+        assignment = run["assignment"]
+        for request_id in pending_checks(assignment):
+            try:
+                rows = self.git.check_worktree(work["data"]["entries"])
+                digest_now = digest(resolved_bundle(self.home, self.config))
+                for row in rows:
+                    row["config_digest"] = digest_now
+                    self.state.evidence(work["id"], row, run["id"])
+                result = summarize_check(rows)
+                if not rows:
+                    result["error"] = "No check commands are configured"
+            except (GitFailure, OSError, ValueError) as error:
+                result = {"passed": False, "error": str(error)[:2000]}
+            answer_check(assignment, request_id, result)
+
     def _collect(self, work):
         run = self.state.get_run(work["current_run"])
         assignment = run["assignment"]
         if run["session"] is None:
             self._launch(run)
             return
+        self._service_checks(work, run)
         observation = self.harness.observe(run["session"], assignment)
         self.tracer.ingest(run)
         if observation.get("failure") or observation["state"] in {
@@ -498,6 +527,14 @@ class Engine:
             "candidate": work["data"].get("entries"),
             "evaluation": evaluation,
         }
+        snapshot["verification_policy"] = (
+            "Workers run in a sandbox that cannot reach Docker, databases or "
+            "other host services, so missing worker-side verification of "
+            "that kind is not a reason to defer: advance to checking "
+            "(the factory runs the configured checks outside the sandbox) "
+            "or revise with a concrete correction. Defer only for a "
+            "genuine human decision."
+        )
         if evaluation in {"acceptance", "handoff"}:
             snapshot["evidence"] = self._current_evidence(work)
         if evaluation == "handoff":

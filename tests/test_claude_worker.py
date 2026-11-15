@@ -304,3 +304,73 @@ def test_unreadable_claude_config_blocks_launch(
         launch(tmp_path, trust_registered_repositories=True)
     assert error.value.failure["code"] == "harness.trust_failed"
     assert (isolated_claude_config / ".claude.json").read_text() == "{not json"
+
+
+def test_check_tool_listed_for_implementers_only(tmp_path):
+    def names(role):
+        reply = claude_worker.handle_message(
+            assignment(tmp_path, role=role),
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        return [tool["name"] for tool in reply["result"]["tools"]]
+
+    assert names("implementer") == ["factory_report", "factory_check"]
+    assert names("reviewer") == ["factory_report"]
+
+
+def test_factory_check_round_trip(tmp_path, monkeypatch):
+    import threading
+
+    item = assignment(tmp_path)
+    box = {}
+
+    def call():
+        box["reply"] = claude_worker.handle_message(
+            item,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "factory_check", "arguments": {}},
+            },
+        )
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    import time
+
+    for _ in range(100):
+        pending = claude_worker.pending_checks(item)
+        if pending:
+            break
+        time.sleep(0.05)
+    assert len(pending) == 1
+    rows = [
+        {
+            "repository": "sample",
+            "command": ["make", "check"],
+            "passed": False,
+            "exit_code": 2,
+            "stdout": "x" * 10000 + "tail",
+            "stderr": "",
+        }
+    ]
+    claude_worker.answer_check(
+        item, pending[0], claude_worker.summarize_check(rows)
+    )
+    thread.join(5)
+    result = box["reply"]["result"]
+    assert result["isError"] is True
+    body = json.loads(result["content"][0]["text"])
+    assert body["passed"] is False
+    assert body["results"][0]["output_tail"].endswith("tail")
+    assert len(body["results"][0]["output_tail"]) <= claude_worker.OUTPUT_LIMIT
+    assert claude_worker.pending_checks(item) == []
+
+
+def test_check_tool_is_allowed_for_implementer_launch(tmp_path):
+    _, _, call = launch(tmp_path)
+    allowed = call[call.index("--allowedTools") + 1]
+    assert "mcp__factory__factory_check" in allowed
+    _, _, call = launch(tmp_path, role="reviewer")
+    assert "factory_check" not in call[call.index("--allowedTools") + 1]

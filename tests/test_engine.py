@@ -958,3 +958,70 @@ def test_repeated_working_observations_append_one_event(tmp_path):
         assert [item["state"] for item in observed()] == ["working", "idle"]
     finally:
         engine.state.close()
+
+
+def test_worker_check_runs_on_worktree_snapshot_and_records_evidence(tmp_path):
+    from pluto_factory import claude_worker
+
+    home, prepared = prepare_demo(tmp_path / "check")
+    engine = Engine(home)
+    work_id = prepared["submitted"]["id"]
+    try:
+        work = engine.state.get_work(work_id)
+        entries = engine.git.prepare(work_id, work["payload"]["repositories"])
+        writable = next(e for e in entries if e["access"] == "write")
+        worktree = Path(writable["worktree"])
+        (worktree / "wip.txt").write_text("uncommitted\n")
+        before = git(worktree, "status", "--porcelain")
+        engine.state.update_work(
+            work_id, data={"entries": entries, "workspace_id": work_id}
+        )
+        folder = tmp_path / "assignment"
+        run = engine.state.create_run(
+            work_id,
+            "implementer",
+            {"id": "run-check", "assignment_path": str(folder / "a.json")},
+        )
+        assignment = engine.state.get_run(run["id"])["assignment"]
+        (folder / "checks").mkdir(parents=True)
+        request = "a" * 32
+        (folder / "checks" / f"{request}.request.json").write_text("{}")
+        engine._service_checks(
+            engine.state.get_work(work_id), engine.state.get_run(run["id"])
+        )
+        answer = json.loads(
+            (folder / "checks" / f"{request}.result.json").read_text()
+        )
+        assert claude_worker.pending_checks(assignment) == []
+        assert answer["results"]
+        assert git(worktree, "status", "--porcelain") == before
+        rows = [
+            json.loads(row["data"])
+            for row in engine.state.db.execute(
+                "SELECT data FROM evidence WHERE work_id=?", (work_id,)
+            )
+        ]
+        assert rows and all(row["kind"] == "worker_check" for row in rows)
+    finally:
+        engine.state.close()
+
+
+def test_coordinator_sees_verification_policy_against_deferral(tmp_path):
+    home, prepared = prepare_demo(tmp_path / "policy")
+    engine = Engine(home)
+    try:
+        seen = []
+
+        class Judge:
+            def decide(self, snapshot, allowed, prompt):
+                seen.append(snapshot)
+                return Decision(action="defer", rationale="x")
+
+        engine.coordinator = Judge()
+        work = engine.state.get_work(prepared["submitted"]["id"])
+        engine._decide(work, {"defer", "advance"}, "advance")
+        policy = seen[0]["verification_policy"]
+        assert "not a reason to defer" in policy
+        assert "genuine human decision" in policy
+    finally:
+        engine.state.close()

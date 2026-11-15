@@ -840,7 +840,12 @@ class ClaudeHarness(PiHarness):
     def _worker_command(
         self, assignment: dict, assignment_path: Path
     ) -> list[str]:
-        from .claude_worker import QUALIFIED_TOOL, hook_settings, mcp_config
+        from .claude_worker import (
+            QUALIFIED_CHECK_TOOL,
+            QUALIFIED_TOOL,
+            hook_settings,
+            mcp_config,
+        )
 
         profile = self._profile(assignment["role"])
         folder = assignment_path.parent
@@ -901,7 +906,17 @@ class ClaudeHarness(PiHarness):
             "--tools",
             ",".join(tools),
             "--allowedTools",
-            ",".join([*tools, QUALIFIED_TOOL]),
+            ",".join(
+                [
+                    *tools,
+                    QUALIFIED_TOOL,
+                    *(
+                        [QUALIFIED_CHECK_TOOL]
+                        if assignment["role"] == "implementer"
+                        else []
+                    ),
+                ]
+            ),
             "--mcp-config",
             str(mcp_path),
             "--strict-mcp-config",
