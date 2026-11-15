@@ -222,7 +222,11 @@ class Engine:
                 "reviewing": "reviewer",
                 "qa": "qa",
             }[phase]
-            self._dispatch(work, role)
+            notes = None
+            if role == "implementer":
+                notes = self._synchronize_for_dispatch(work)
+                work = self.state.get_work(work["id"])
+            self._dispatch(work, role, notes)
         elif phase == "checking":
             operation = self.state.begin_operation(work_id, "git.snapshot", {})
             data["entries"] = self.git.snapshot(
@@ -270,7 +274,51 @@ class Engine:
             )
         return changed
 
-    def _dispatch(self, work, role):
+    def _synchronize_for_dispatch(self, work):
+        """Merge the latest default branch before an implementer starts.
+
+        Resumed or revised candidates may predate fixes on the default
+        branch. A conflict leaves the merge prepared in the worktree for the
+        implementer to resolve; returns packet notes describing what changed.
+        """
+        work_id = work["id"]
+        data = work["data"]
+        before = {entry["name"]: entry["base"] for entry in data["entries"]}
+        if self.github:
+            self.github.adapter.refresh_defaults(data["entries"])
+        conflict = None
+        try:
+            data["entries"], changed = self.git.sync(data["entries"])
+        except GitFailure as error:
+            if error.code != "git.conflict":
+                raise
+            conflict, changed = error.summary, False
+        if changed:
+            self.state.update_work(
+                work_id, data=data, event="candidate.synchronized"
+            )
+        merged = [
+            entry["name"]
+            for entry in data["entries"]
+            if entry["base"] != before[entry["name"]]
+        ]
+        if not (merged or conflict):
+            return None
+        notes = {
+            "default_branch_merged": merged,
+            "guidance": (
+                "The latest default branch was merged into your candidate "
+                "worktree since earlier work or runs. Repository docs "
+                "(AGENTS.md, README, contributing guides) and code may have "
+                "changed: re-read them before continuing, and re-check "
+                "earlier conclusions, since problems may already be fixed."
+            ),
+        }
+        if conflict:
+            notes["merge_conflict"] = conflict
+        return notes
+
+    def _dispatch(self, work, role, notes=None):
         work_id = work["id"]
         run_id = identity("run")
         directory = self.home / "assignments" / run_id
@@ -345,6 +393,7 @@ class Engine:
                 "The coordinator independently validates frozen candidates."
             ),
             "execution_guidance": self._execution_guidance(),
+            "default_branch_sync": notes,
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),

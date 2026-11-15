@@ -686,6 +686,10 @@ class GitWorkspace:
             entry = dict(original)
             repo, managed, worktree = self._entry(entry)
             self._candidate(entry)
+            if self._merging(worktree):
+                # A merge awaits the worker's resolution; keep it intact.
+                result.append(entry)
+                continue
             latest = self._text(
                 managed, "rev-parse", f"refs/heads/{entry['default_branch']}"
             )
