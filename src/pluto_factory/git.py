@@ -732,6 +732,17 @@ class GitWorkspace:
             entry = dict(original)
             repo, managed, worktree = self._entry(entry)
             # A merge awaiting resolution is legitimately dirty.
+            if self._merging(worktree):
+                # The factory's own merge commit (made at snapshot) may sit
+                # under a newly prepared merge; that movement is expected.
+                head = self._text(worktree, "rev-parse", "HEAD")
+                if head != entry["candidate"] and self._contains(
+                    managed, entry["candidate"], head
+                ):
+                    entry["candidate"] = head
+                    entry["tree"] = self._text(
+                        worktree, "rev-parse", "HEAD^{tree}"
+                    )
             self._candidate(entry, clean=not self._merging(worktree))
             if self._merging(worktree):
                 # A merge awaits the worker's resolution; keep it intact.

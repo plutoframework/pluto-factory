@@ -1553,3 +1553,103 @@ def test_dirty_pr_clean_sync_revalidates_and_is_bounded(tmp_path):
         assert work["control"] == "deferred"
     finally:
         engine.state.close()
+
+
+def _resolve(writable, text="merged\n"):
+    (Path(writable["worktree"]) / "shared.txt").write_text(text)
+
+
+def _git_out(path, *args):
+    return subprocess.run(
+        ["git", "-C", str(path), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _awaiting_with_acceptance(tmp_path):
+    engine, work_id, writable = _awaiting(tmp_path)
+    data = engine.state.get_work(work_id)["data"]
+    data.update(
+        acceptance_decision={"action": "complete"},
+        acceptance_candidate={"core": "74ce7a0"},
+        acceptance_config_digest="old",
+        publication_acceptance={"candidates": {"core": "74ce7a0"}},
+        pull_requests=[{"repository": "core", "state": "open"}],
+    )
+    engine.state.update_work(work_id, data=data)
+    return engine, work_id, writable
+
+
+def test_conflict_revision_resets_acceptance_and_publication(tmp_path):
+    engine, work_id, _ = _awaiting_with_acceptance(tmp_path)
+    try:
+        work = engine.state.get_work(work_id)
+        with pytest.raises(GitFailure) as raised:
+            engine._resync_pull_requests(work, STALE)
+        assert engine._conflict_revision(work, raised.value)
+        data = engine.state.get_work(work_id)["data"]
+        for key in (
+            "acceptance_decision",
+            "acceptance_candidate",
+            "acceptance_config_digest",
+            "publication_acceptance",
+        ):
+            assert key not in data
+    finally:
+        engine.state.close()
+
+
+def test_resolved_conflict_flows_to_checking_with_merge_commit(tmp_path):
+    engine, work_id, writable = _awaiting_with_acceptance(tmp_path)
+    try:
+        work = engine.state.get_work(work_id)
+        with pytest.raises(GitFailure) as raised:
+            engine._resync_pull_requests(work, STALE)
+        engine._conflict_revision(work, raised.value)
+        old = engine.state.get_work(work_id)["data"]["entries"][0]["candidate"]
+        # Worker resolves; factory hands off to checking.
+        _resolve(writable)
+        engine.state.update_work(work_id, phase="checking", control="ready")
+        engine.tick()
+        work = engine.state.get_work(work_id)
+        entry = work["data"]["entries"][0]
+        worktree = writable["worktree"]
+        assert entry["candidate"] == _git_out(worktree, "rev-parse", "HEAD")
+        assert entry["candidate"] != old
+        assert len(_git_out(worktree, "rev-parse", "HEAD^@").split()) == 2
+        assert work["phase"] == "reviewing"
+        assert work["control"] != "deferred"
+        assert "acceptance_candidate" not in work["data"]
+        assert work["data"]["checks_candidate"] == {
+            item["name"]: item["candidate"] for item in work["data"]["entries"]
+        }
+    finally:
+        engine.state.close()
+
+
+def test_second_conflict_after_resolution_keeps_merge_commit(tmp_path):
+    engine, work_id, writable = _awaiting_with_acceptance(tmp_path)
+    try:
+        work = engine.state.get_work(work_id)
+        with pytest.raises(GitFailure) as raised:
+            engine._resync_pull_requests(work, STALE)
+        engine._conflict_revision(work, raised.value)
+        _resolve(writable)
+        # The default branch moves again while the worker resolved.
+        _commit_default(Path(writable["managed"]), "shared.txt", "newer\n")
+        engine.state.update_work(work_id, phase="checking", control="ready")
+        engine.tick()
+        work = engine.state.get_work(work_id)
+        assert work["phase"] == "implementing"
+        assert work["data"]["conflict_revision"]
+        launched = []
+        engine._launch = launched.append
+        engine.tick()
+        events = [e["kind"] for e in engine.state.inspect()["events"]]
+        assert "failure.observed" not in events
+        assert engine.state.get_work(work_id)["control"] != "deferred"
+        assert launched
+    finally:
+        engine.state.close()

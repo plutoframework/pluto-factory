@@ -326,6 +326,9 @@ class Engine:
                 data["entries"], data.get("workspace_id", work_id)
             )
             self.state.finish_operation(operation, {"entries": data["entries"]})
+            # Persist the snapshot (the factory's merge commit) before
+            # synchronizing: a new conflict must not lose it.
+            self.state.update_work(work_id, data=data)
             if not self._synchronize(work_id, data, None):
                 self.state.update_work(work_id, data=data)
             self._validate(work_id, "checks", "reviewing")
@@ -478,6 +481,19 @@ class Engine:
             }
             data.pop("checks_candidate", None)
             data.pop("qa_candidate", None)
+            # The resolved candidate is new: earlier acceptance and
+            # publication describe the old one and must be earned again.
+            for key in (
+                "acceptance_decision",
+                "acceptance_candidate",
+                "acceptance_config_digest",
+            ):
+                data.pop(key, None)
+            if not any(
+                pr.get("state") == "merged"
+                for pr in data.get("pull_requests", [])
+            ):
+                data.pop("publication_acceptance", None)
             self.state.update_work(
                 work["id"],
                 phase="implementing",
