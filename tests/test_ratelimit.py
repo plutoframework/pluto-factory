@@ -123,7 +123,7 @@ def test_rate_limit_does_not_spend_recoveries_or_defer():
 
 
 def test_coordinator_subscription_limit_is_rate_limited(tmp_path, monkeypatch):
-    from tests.test_engine import _claude_coordinator, _result
+    from test_engine import _claude_coordinator, _result
 
     coordinator, _ = _claude_coordinator(
         tmp_path,
@@ -140,9 +140,10 @@ def test_coordinator_subscription_limit_is_rate_limited(tmp_path, monkeypatch):
 
 
 def test_engine_waits_out_limit_without_deferring_or_spending_budget(tmp_path):
+    from test_engine import ObservedHarness
+
     from pluto_factory.demo import prepare_demo
     from pluto_factory.engine import Engine
-    from tests.test_engine import ObservedHarness
 
     home, prepared = prepare_demo(tmp_path / "limited")
     harness = ObservedHarness()
