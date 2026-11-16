@@ -704,6 +704,7 @@ class Engine:
         self.check_framework_gaps()
         apply_due_autos(self.state)
         self.process_decisions()
+        self.sweep_orphans()
         self.advise_pending()
         self.flush_upstream()
         self.propagate()
@@ -742,7 +743,88 @@ class Engine:
                 )
                 continue
             applied.append(decision["id"])
+            if decision["work_id"]:
+                self.sweep_orphans(only=decision["work_id"])
         return applied
+
+    # -- orphaned deferrals ----------------------------------------------
+
+    def _deferral_reason(self, work):
+        row = self.state.db.execute(
+            "SELECT message FROM notifications WHERE work_id=? AND "
+            "incident_key LIKE 'deferred:%' ORDER BY created DESC LIMIT 1",
+            (work["id"],),
+        ).fetchone()
+        return (
+            (row["message"] if row else "")
+            or work["data"].get("revision_reason")
+            or "Deferred with no recorded reason"
+        )
+
+    def _has_owner(self, work, decisions):
+        """Someone is acting: a live decision, a dependency or a wake time."""
+        if any(
+            d["work_id"] == work["id"]
+            and d["state"] in {"open", "answered", "auto_pending"}
+            for d in decisions
+        ):
+            return True
+        if work["wake_at"] and work["wake_at"] > time.time():
+            return True
+        try:
+            return not self.state.dependency_status(work["id"])["ready"]
+        except ValueError:
+            return False
+
+    def sweep_orphans(self, only=None):
+        """A deferred item must always have someone acting on it.
+
+        Orphans (no live decision, no unmet dependency, no scheduled wake)
+        would never resume and never reach Needs-you. If the decision that
+        parked the item was already resolved, resume it under the autonomy
+        rules; otherwise run the advisor on the last block reason by filing
+        a decision.
+        """
+        decisions = list_decisions(self.state)
+        handled = []
+        for work in self.state.list_work():
+            if work["control"] != "deferred" or (only and work["id"] != only):
+                continue
+            if self._has_owner(work, decisions):
+                continue
+            work = self.state.get_work(work["id"])
+            reason = self._deferral_reason(work)
+            history = [d for d in decisions if d["work_id"] == work["id"]]
+            resolved = bool(history) and history[-1]["state"] in {
+                "withdrawn",
+                "applied",
+            }
+            auto = self.config.autonomy.mode == "auto_obvious"
+            if resolved and auto:
+                action = "resumed"
+                try:
+                    self.state.add_guidance(
+                        work["id"],
+                        "Resumed automatically: the decision that blocked "
+                        "this item was resolved but the item was never "
+                        f"resumed. Earlier block: {terse(reason, 30)}",
+                        "coordinator",
+                    )
+                    self.state.resume(work["id"])
+                except StateConflict:
+                    continue
+            else:
+                action = "decision"
+                self._ask_owner(work, reason)
+            self.state.event(
+                "work.orphan_deferred",
+                work["id"],
+                {"action": action, "reason": reason[:300]},
+                f"orphan-deferred:{work['id']}:{work['generation']}:{action}:"
+                f"{len(history)}",
+            )
+            handled.append(work["id"])
+        return handled
 
     def _apply_decision(self, decision):
         text = guidance_text(decision)
