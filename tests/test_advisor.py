@@ -975,8 +975,9 @@ def test_pull_request_advice_never_needs_a_framework_payload(tmp_path):
     assert source == "model" and len(seen) == 1
     assert [o.locus for o in result.options] == ["app", "app"]
     assert "pull_request" in seen[0]["item_kind"]
-    # Work blocks keep the strict rule.
-    _result, source = advisor.advise({"block_reason": "x"})
-    assert (
-        source == "fallback" and "upstream" in advisor.last_failure["message"]
-    )
+    # Work blocks: a framework option with no usable payload is downgraded
+    # to app and the change is reported, not rejected.
+    result, source = advisor.advise({"block_reason": "x"})
+    assert source == "model"
+    assert result.options[0].locus == "app"
+    assert any("downgraded" in c for c in advisor.last_sanitized)

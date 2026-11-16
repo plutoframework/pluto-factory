@@ -934,6 +934,15 @@ class Engine:
             advice, source = self.advisor.advise(
                 packet, pull_request=decision["work_id"] is None
             )
+            if getattr(self.advisor, "last_sanitized", None):
+                self.state.event(
+                    "advice.sanitized",
+                    decision["work_id"] or "factory",
+                    {
+                        "decision": decision["id"],
+                        "changes": list(self.advisor.last_sanitized),
+                    },
+                )
             ok, _why = (
                 auto_verdict(self.config.autonomy, advice, packet=packet)
                 if source == "model"

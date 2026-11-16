@@ -333,59 +333,11 @@ def _clip_words(value, limit):
     return value if len(pieces) <= limit else " ".join(pieces[:limit])
 
 
-def app_only(advice):
-    """Pull-request items have no framework fix to file: force app locus."""
-    if not isinstance(advice, dict):
-        return advice
-    options = []
-    for option in advice.get("options") or []:
-        if isinstance(option, dict):
-            option = {
-                **option,
-                "locus": "app",
-                "fix": "",
-                "upstream": None,
-            }
-        options.append(option)
-    return {**advice, "options": options}
+def clip_advice(advice, *, pull_request=False):
+    """Sanitized copy of a model reply (see sanitize.py); never raises."""
+    from .sanitize import sanitize_advice
 
-
-def clip_advice(advice):
-    """Shorten over-long prose to the advisor caps instead of rejecting it.
-
-    Long issues make the model write long rationales; the caps exist for
-    terse display, so clipping keeps a useful decision where strict
-    validation used to drop the whole triage into the fallback.
-    """
-    if not isinstance(advice, dict):
-        return advice
-    clipped = dict(advice)
-    clipped["problem"] = _clip_words(clipped.get("problem"), PROBLEM_WORDS)
-    clipped["why"] = _clip_words(clipped.get("why"), WHY_WORDS)
-    if isinstance(clipped.get("details"), list):
-        clipped["details"] = [
-            _clip_words(d, DETAIL_WORDS) for d in clipped["details"][:6]
-        ]
-    options = []
-    for option in clipped.get("options") or []:
-        if isinstance(option, dict):
-            option = {
-                **option,
-                "label": _clip_words(option.get("label"), LABEL_WORDS),
-                "effect": _clip_words(option.get("effect"), EFFECT_WORDS),
-                "tradeoff": _clip_words(option.get("tradeoff"), TRADEOFF_WORDS),
-            }
-            locus = str(option.get("locus") or "app").strip()
-            if not locus.startswith("framework:"):
-                # Receiving repos are frameworks: an app option with a fix
-                # note is reasonable. Sanitize rather than reject.
-                option.pop("fix", None)
-                option.pop("upstream", None)
-            elif option.get("fix"):
-                option["fix"] = _clip_words(option["fix"], FIX_WORDS)
-        options.append(option)
-    clipped["options"] = options
-    return clipped
+    return sanitize_advice(advice, pull_request=pull_request)[0]
 
 
 def terse(text: str, limit: int = PROBLEM_WORDS) -> str:
@@ -493,6 +445,7 @@ class Advisor:
         self.runner = runner
         self.sleep = sleep
         self.last_failure = None
+        self.last_sanitized = []
 
     def advise(self, packet: dict, *, pull_request=False):
         """(Advice, source): source is 'model' or 'fallback'.
@@ -504,6 +457,7 @@ class Advisor:
         """
         reason = packet.get("block_reason", "")
         self.last_failure = None
+        self.last_sanitized = []
         if self.runner is None and self.config.coordinator == "rules":
             return fallback_advice(
                 reason, pull_request=pull_request
@@ -530,9 +484,11 @@ class Advisor:
                 if isinstance(reply, str):
                     reply = json.loads(reply)
                 if isinstance(reply, dict):
-                    reply = clip_advice(reply)
-                    if pull_request:
-                        reply = app_only(reply)
+                    from .sanitize import sanitize_advice
+
+                    reply, self.last_sanitized = sanitize_advice(
+                        reply, pull_request=pull_request
+                    )
                 if not isinstance(reply, Advice):
                     reply = Advice.model_validate(reply)
                 self._known_libraries(reply, packet)
