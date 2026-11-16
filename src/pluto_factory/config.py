@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tomllib
+import uuid
 from pathlib import Path
 
 from .models import FactoryConfig
@@ -197,7 +198,11 @@ def digest(value: dict) -> str:
 
 def atomic_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    # Unique per call: parallel worker threads share one process id and may
+    # write the same target (e.g. a configuration revision) at once.
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:12]}.tmp"
+    )
     with temporary.open("w") as stream:
         json.dump(value, stream, indent=2)
         stream.flush()

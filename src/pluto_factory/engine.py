@@ -372,10 +372,17 @@ class Engine:
         done = [
             wid for wid, (future, _) in self._running.items() if future.done()
         ]
-        for wid in done:
-            future, _ = self._running.pop(wid)
+        futures = [self._running.pop(wid)[0] for wid in done]
+        for future in futures:
             future.result()
         return len(done)
+
+    def shutdown(self):
+        """Let in-flight steps finish, then release the step pool."""
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self._running.clear()
 
     def drain(self):
         """Wait for every in-flight step to finish."""
