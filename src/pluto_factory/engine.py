@@ -57,6 +57,7 @@ from .improvements import propose
 from .models import (
     WRITER_ROLES,
     Failure,
+    Submission,
     WorkerReport,
     workable_repositories,
 )
@@ -807,6 +808,14 @@ class Engine:
                 raise ValueError("work item could not be completed")
             mark_applied(self.state, decision["id"], detail)
             return
+        local = self._local_repository(framework_library(option))
+        if framework_library(option) and local:
+            detail["local_work"] = self._local_gap(decision, option, local)[
+                "id"
+            ]
+            enqueue_issue_comment(self.state, decision, "answered")
+            mark_applied(self.state, decision["id"], detail)
+            return
         if framework_library(option):
             # Parked until the gap decision is answered or the pin moves.
             gap = record_framework_gap(
@@ -969,6 +978,76 @@ class Engine:
                     continue
                 self._auto_upstream(get_decision(self.state, decision["id"]))
         return done
+
+    def _local_repository(self, library):
+        """The repository of THIS factory a framework library maps to."""
+
+        def norm(name):
+            name = name.strip().lower().removeprefix("@plutoframework/")
+            return name.removeprefix("pluto-")
+
+        wanted = norm(library)
+        for repo in workable_repositories(self.config):
+            names = {getattr(repo, "name", "") or ""}
+            slug = getattr(repo, "github", "") or getattr(repo, "repo", "")
+            names.add(slug.rsplit("/", 1)[-1])
+            if wanted in {norm(n) for n in names if n}:
+                return getattr(repo, "name", "") or slug.rsplit("/", 1)[-1]
+        return ""
+
+    def _local_gap(self, decision, option, repo_name):
+        """A gap in one of our own repositories is work, not an upstream issue.
+
+        The gap becomes a normal submission (its spec the advisor's payload)
+        and the blocked item waits on it through ``depends_on``.
+        """
+        payload = option.get("upstream") or {}
+        fix = option.get("fix") or option["label"]
+        blocked = (
+            self.state.get_work(decision["work_id"])
+            if decision["work_id"]
+            else None
+        )
+        lines = [
+            f"Framework gap in {repo_name}: {fix}",
+            "",
+            f"Problem: {payload.get('problem') or decision['question']}",
+        ]
+        if payload.get("repro"):
+            lines += ["", f"Repro: {payload['repro']}"]
+        lines += ["", f"Proposed fix: {payload.get('fix') or fix}"]
+        if blocked:
+            lines += [
+                "",
+                f"Blocks work item {blocked['id']}: {blocked['title']}.",
+            ]
+        item = self.state.submit(
+            Submission(
+                title=terse(payload.get("title") or f"{repo_name}: {fix}", 15)[
+                    :200
+                ],
+                instruction="\n".join(lines),
+                acceptance=payload.get("acceptance") or [fix],
+                repositories=[repo_name],
+                source="framework_gap",
+                delivery_key=decision["id"],
+            )
+        )
+        if blocked:
+            self.state.add_dependency(blocked["id"], item["id"])
+            self.state.add_guidance(
+                blocked["id"],
+                f"Waiting on {item['id']} ({repo_name}): {fix}",
+                "coordinator",
+            )
+            if blocked["control"] in {"deferred", "quarantined", "backoff"}:
+                self.state.resume(blocked["id"])
+        self.state.event(
+            "framework_gap.local_work",
+            decision["work_id"] or "factory",
+            {"decision": decision["id"], "work": item["id"], "repo": repo_name},
+        )
+        return item
 
     def _auto_upstream(self, decision):
         """Under file_upstream=auto, a framework-locus recommendation files."""
