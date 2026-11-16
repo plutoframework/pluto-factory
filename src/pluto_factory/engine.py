@@ -4,7 +4,7 @@ import copy
 import json
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
@@ -74,6 +74,7 @@ from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .scheduler import Scheduler
 from .state import State, StateConflict, identity
+from .steppool import StepPool
 from .trace import Tracer
 from .triage import Triager, TriageRunner
 from .upstream import (
@@ -87,6 +88,7 @@ from .upstream import (
 
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
+SHUTDOWN_DRAIN_SECONDS = 10
 REAP_INTERVAL_SECONDS = 300
 # Times the coordinator is re-asked with the validation error before deferring.
 CONTRACT_RETRIES = 2
@@ -219,6 +221,7 @@ class Engine:
         self.scheduler = Scheduler(self.config)
         # Parallel steps: work id -> (future, phase of the step in flight).
         self._executor = None
+        self._stopping = Event()
         self._running = {}
         self._skips = {}
         # Coordinator model calls are serialized unless the config allows
@@ -283,6 +286,8 @@ class Engine:
         return True
 
     def _guarded_step(self, work):
+        if self._stopping.is_set():
+            return
         try:
             self._step(work)
         except StateConflict:
@@ -366,9 +371,7 @@ class Engine:
     def _submit(self, work):
         if self._executor is None:
             size = self.config.concurrency.max_workers * 2 + 2
-            self._executor = ThreadPoolExecutor(
-                max_workers=size, thread_name_prefix="factory-step"
-            )
+            self._executor = StepPool(size)
         future = self._executor.submit(self._guarded_step, work)
         self._running[work["id"]] = (future, work["phase"])
 
@@ -379,24 +382,56 @@ class Engine:
         ]
         futures = [self._running.pop(wid)[0] for wid in done]
         for future in futures:
-            future.result()
+            if not future.cancelled():
+                future.result()
         return len(done)
 
-    def shutdown(self):
-        """Let in-flight steps finish, then release the step pool."""
+    def shutdown(self, wait_for_steps=False):
+        """Stop dispatching and release the step pool without blocking.
+
+        Steps still in flight are abandoned (daemon threads): worker
+        sessions outlive the coordinator and are reconciled on next start.
+        """
+        self._stopping.set()
         executor, self._executor = self._executor, None
         if executor is not None:
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=wait_for_steps, cancel_futures=True)
         self._running.clear()
 
-    def drain(self):
-        """Wait for every in-flight step to finish."""
+    def drain(self, timeout=None):
+        """Wait for in-flight steps; True when none remain.
+
+        With a timeout (or once stopping) the wait is bounded: ``False``
+        means steps are still running and are being abandoned.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         while self._running:
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                return False
             wait(
                 [future for future, _ in self._running.values()],
+                timeout=remaining,
                 return_when=FIRST_COMPLETED,
             )
             self._reap_steps()
+        return True
+
+    def _stop_for_exit(self):
+        """Termination: stop dispatching, bound the drain, keep the lock."""
+        self._stopping.set()
+        executor = self._executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        drained = self.drain(SHUTDOWN_DRAIN_SECONDS)
+        self.state.event(
+            "coordinator.interrupted",
+            "factory",
+            {"abandoned_steps": sorted(self._running), "drained": drained},
+        )
+        self.shutdown()
 
     def active_runs(self):
         """Work items currently holding a worker slot."""
@@ -421,59 +456,69 @@ class Engine:
                     "coordinator": self.config.coordinator,
                 },
             )
-            self.reap_sessions()
-            while not self.state.is_paused():
-                if max_seconds is not None and (
-                    time.monotonic() - started >= max_seconds
-                ):
-                    break
-                if time.monotonic() - self._reaped_at >= REAP_INTERVAL_SECONDS:
-                    self.reap_sessions()
-                self.attention(force=once)
-                if self.github:
-                    self.github.poll(force=once)
-                progressed = self.tick()
-                if once:
-                    self.drain()
-                    break
-                work = self.state.list_work()
-                pending = [
-                    item
-                    for item in work
-                    if item["phase"] != "completed"
-                    and item["control"]
-                    not in {
-                        "deferred",
-                        "paused",
-                        "quarantined",
-                    }
-                ]
-                if not pending and not watching:
-                    break
-                if not progressed and self._running:
-                    wait(
-                        [f for f, _ in self._running.values()],
-                        timeout=1,
-                        return_when=FIRST_COMPLETED,
-                    )
-                    continue
-                if not progressed:
-                    future = [
-                        item["wake_at"]
-                        for item in pending
-                        if item["wake_at"] > time.time()
-                    ]
-                    until = self.state.rate_limited_until()
-                    if until > time.time():
-                        future.append(until)
-                    if not future and not watching:
+            try:
+                self.reap_sessions()
+                while not self.state.is_paused():
+                    if max_seconds is not None and (
+                        time.monotonic() - started >= max_seconds
+                    ):
                         break
-                    delay = (
-                        max(min(future) - time.time(), 0.01) if future else 1
-                    )
-                    Event().wait(min(delay, 1))
-            self.drain()
-            self.flush_notifications()
+                    if (
+                        time.monotonic() - self._reaped_at
+                        >= REAP_INTERVAL_SECONDS
+                    ):
+                        self.reap_sessions()
+                    self.attention(force=once)
+                    if self.github:
+                        self.github.poll(force=once)
+                    progressed = self.tick()
+                    if once:
+                        self.drain()
+                        break
+                    work = self.state.list_work()
+                    pending = [
+                        item
+                        for item in work
+                        if item["phase"] != "completed"
+                        and item["control"]
+                        not in {
+                            "deferred",
+                            "paused",
+                            "quarantined",
+                        }
+                    ]
+                    if not pending and not watching:
+                        break
+                    if not progressed and self._running:
+                        wait(
+                            [f for f, _ in self._running.values()],
+                            timeout=1,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        continue
+                    if not progressed:
+                        future = [
+                            item["wake_at"]
+                            for item in pending
+                            if item["wake_at"] > time.time()
+                        ]
+                        until = self.state.rate_limited_until()
+                        if until > time.time():
+                            future.append(until)
+                        if not future and not watching:
+                            break
+                        delay = (
+                            max(min(future) - time.time(), 0.01)
+                            if future
+                            else 1
+                        )
+                        Event().wait(min(delay, 1))
+                self.drain()
+                self.flush_notifications()
+            except BaseException:
+                # SIGTERM/SIGINT or a failure: never join stuck steps.
+                self._stop_for_exit()
+                raise
         return self.state.inspect()
 
     def _step(self, work):
