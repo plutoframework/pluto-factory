@@ -871,3 +871,98 @@ def test_serial_factories_have_no_merge_queue(tmp_path):
     # BEHIND only resyncs when the repo requires up-to-date branches.
     assert advance(flow, state, second, "BEHIND") == []
     state.close()
+
+
+# -- transactional work-data updates -----------------------------------------
+
+
+def make_work(tmp_path):
+    state = State(tmp_path / "home")
+    item = state.submit(
+        Submission(
+            title="T",
+            instruction="I",
+            acceptance=["a"],
+            repositories=["core"],
+            source="test",
+            delivery_key="1",
+        )
+    )
+    return state, item["id"]
+
+
+def test_concurrent_mutations_of_different_keys_lose_nothing(tmp_path):
+    state, work_id = make_work(tmp_path)
+    rounds = 150
+    errors = []
+
+    def writer(name):
+        try:
+            for index in range(rounds):
+                state.update_work(
+                    work_id,
+                    mutate=lambda data, i=index: data.__setitem__(name, i),
+                )
+        except Exception as error:  # pragma: no cover
+            errors.append(error)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in "abcd"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    data = state.get_work(work_id)["data"]
+    assert {k: data[k] for k in "abcd"} == dict.fromkeys("abcd", rounds - 1)
+    state.close()
+
+
+def test_plain_data_writes_never_undo_other_writers_keys(tmp_path):
+    state, work_id = make_work(tmp_path)
+    rounds = 100
+    barrier = threading.Barrier(2, timeout=10)
+
+    def writer(name):
+        for index in range(rounds):
+            work = state.get_work(work_id)  # read a snapshot...
+            barrier.wait()  # ...so both threads hold stale copies
+            work["data"][name] = index
+            state.update_work(work_id, data=work["data"])
+            barrier.wait()
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in "xy"]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    data = state.get_work(work_id)["data"]
+    assert data["x"] == data["y"] == rounds - 1
+    state.close()
+
+
+def test_plain_write_applies_removals_and_keeps_concurrent_keys(tmp_path):
+    state, work_id = make_work(tmp_path)
+    state.update_work(work_id, mutate=lambda d: d.update(keep=1, drop=2))
+    work = state.get_work(work_id)
+    state.update_work(work_id, mutate=lambda d: d.update(other=3))
+    del work["data"]["drop"]
+    work["data"]["mine"] = 4
+    state.update_work(work_id, data=work["data"])
+    data = state.get_work(work_id)["data"]
+    assert data == {"keep": 1, "other": 3, "mine": 4}
+    with pytest.raises(ValueError):
+        state.update_work(work_id, data={}, mutate=lambda d: None)
+    state.close()
+
+
+def test_serial_factory_starts_no_extra_threads(tmp_path):
+    home, _ids = build(tmp_path, ["a", "b"])
+    engine = Engine(home)
+    before = threading.active_count()
+    try:
+        snapshot = engine.run(max_seconds=120)
+        assert threading.active_count() == before
+        assert engine._executor is None
+        assert [w["phase"] for w in snapshot["work"]] == ["completed"] * 2
+    finally:
+        close(engine)

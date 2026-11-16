@@ -381,7 +381,8 @@ class ConcurrencyPolicy(Contract):
 class MergeManagerPolicy(Contract):
     """Role that resolves merge conflicts with the moving default branch.
 
-    Empty provider/model/reasoning inherit the reviewer's profile. ``enabled``
+    Default model: empty provider/model/reasoning inherit the reviewer's
+    profile (set the reviewer to a Fable-tier model, or override here). ``enabled``
     unset follows parallelism: on when ``concurrency.max_workers > 1``, so
     serial factories keep routing conflicts to the implementer.
     """

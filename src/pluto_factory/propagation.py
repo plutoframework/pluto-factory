@@ -57,8 +57,13 @@ def _comment_once(adapter, slug, number, marker, text):
 
 
 def _save(state, work_id, work, prop):
-    data = {**work["data"], "propagation": prop}
     with state.db:
+        state.db.execute("BEGIN IMMEDIATE")
+        row = state.db.execute(
+            "SELECT data FROM work WHERE id=?", (work_id,)
+        ).fetchone()
+        # Re-read inside the write transaction: only this key changes.
+        data = {**json.loads(row["data"]), "propagation": prop}
         state.db.execute(
             "UPDATE work SET data=? WHERE id=?", (encode(data), work_id)
         )

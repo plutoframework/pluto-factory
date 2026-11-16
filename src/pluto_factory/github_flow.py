@@ -96,12 +96,15 @@ class GitHubFlow:
             },
             "surfaced": False,
         }
-        data["observed_issue_digest"] = observed_digest
-        data["issue_change"] = change
+
+        def record(current):
+            current["observed_issue_digest"] = observed_digest
+            current["issue_change"] = change
+
         try:
             self.state.update_work(
                 existing["id"],
-                data=data,
+                mutate=record,
                 event="intake.issue_observed",
             )
         except StateConflict:
