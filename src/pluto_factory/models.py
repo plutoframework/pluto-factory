@@ -301,7 +301,7 @@ class FactoryConfig(Contract):
     command_timeout_seconds: int = Field(default=120, ge=1)
     # Pull-request tracking: poll cadence and bounded self-healing.
     pr_poll_seconds: int = Field(default=300, ge=1)
-    pr_max_repairs: int = Field(default=2, ge=0, le=20)
+    pr_max_repairs: int = Field(default=3, ge=0, le=20)
     pr_max_repairs_total: int = Field(default=6, ge=0, le=100)
     retry_base_seconds: float = Field(default=5, ge=0)
     self_improvement: ImprovementPolicy = Field(
