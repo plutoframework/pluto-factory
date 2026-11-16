@@ -804,6 +804,10 @@
     const buttons = [];
     const send = (answer, note, button, pendingText) =>
       answerDecision({ ...decision, factory: factoryId }, answer, note, button, buttons, error, pendingText);
+    // Placeholder options are never offered while the advisor is working.
+    const analysing = decision.advice_state === "analysing";
+    if (analysing) card.append(node("p", "secondary-line decision-advisor", "Advisor analysing…"));
+    if (decision.advice_state === "unavailable") card.append(node("p", "secondary-line decision-advisor", "Advisor unavailable: generic fallback options."));
     for (const option of decision.options) {
       const shown = option.approves && decision.proposal
         ? `Apply: ${decision.proposal.key} = ${decision.proposal.value}` : option.label;
@@ -813,11 +817,14 @@
       if (option.recommended) button.append(node("span", "badge decision-recommended", "Recommended"));
       const tag = frameworkTag(option);
       if (tag) button.append(tag);
-      button.disabled = state.answering.has(decision.id);
+      button.disabled = analysing || state.answering.has(decision.id);
       // One click records this option; the box text rides along as the note.
-      button.addEventListener("click", () => send(option.label, field.value.trim(), button, "Sending…"));
-      buttons.push(button);
+      if (!analysing) {
+        button.addEventListener("click", () => send(option.label, field.value.trim(), button, "Sending…"));
+        buttons.push(button);
+      }
       options.append(button);
+      if (analysing) continue;
       const line = [option.effect, option.tradeoff && `Tradeoff: ${option.tradeoff}`, option.fix && `Framework fix: ${option.fix}`,
         option.recommended && decision.why && `Why: ${decision.why}`].filter(Boolean).join(" ");
       if (line) effects.append(node("li", "", `${shown}: ${line}`));

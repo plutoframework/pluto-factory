@@ -328,3 +328,37 @@ def test_auto_decisions_are_listed_apart_from_needs_you(world):
     needs = data.state()["needs_you"]
     assert [d["id"] for d in needs["auto"]] == [auto["id"]]
     assert [d["id"] for d in needs["decisions"]] == [decision["id"]]
+
+
+def test_advice_state_is_exposed_for_the_drawer(world):
+    from pluto_factory.dashboard_data import _advice_state
+
+    state, data, _factory, decision = world
+    base = {"state": "open"}
+    assert _advice_state({**base, "advice": "pending"}) == "analysing"
+    assert _advice_state({**base, "advice": "fallback"}) == "unavailable"
+    assert _advice_state({**base, "advice": "model"}) == "ready"
+    assert _advice_state({**base, "advice": "none"}) == "none"
+    state.db.execute(
+        "UPDATE decisions SET advice='pending' WHERE id=?", (decision["id"],)
+    )
+    state.db.commit()
+    (shown,) = data.state()["needs_you"]["decisions"]
+    assert shown["advice_state"] == "analysing"
+    state.db.execute(
+        "UPDATE decisions SET advice='fallback' WHERE id=?", (decision["id"],)
+    )
+    state.db.commit()
+    (shown,) = data.state()["needs_you"]["decisions"]
+    assert shown["advice_state"] == "unavailable"
+
+
+def test_drawer_disables_options_while_the_advisor_runs():
+    from importlib.resources import files
+
+    js = files("pluto_factory").joinpath("dashboard/app.js").read_text()
+    assert "Advisor analysing…" in js and "Advisor unavailable" in js
+    assert 'decision.advice_state === "analysing"' in js
+    assert "button.disabled = analysing ||" in js
+    # Custom answers stay available while analysing.
+    assert "Send custom answer" in js

@@ -221,6 +221,16 @@ def _read(database, selected=None):
 CONTEXT_LINE_LIMIT = 600
 
 
+def _advice_state(decision):
+    """analysing | unavailable | ready | none: what the options mean."""
+    advice = decision.get("advice", "none")
+    if advice == "pending" and decision["state"] == "open":
+        return "analysing"
+    if advice == "fallback":
+        return "unavailable"
+    return "none" if advice in {"none", "skipped"} else "ready"
+
+
 def _project_decision(decision, factory_id, name):
     """Terse problem first; raw block text is separate collapsed evidence."""
     now = time.time()
@@ -267,6 +277,7 @@ def _project_decision(decision, factory_id, name):
         "answer": text(decision["answer"], 500),
         "custom": bool(decision.get("custom")),
         "advice": decision.get("advice", "none"),
+        "advice_state": _advice_state(decision),
         "auto": (
             {
                 "category": text(decision["auto"].get("category"), 100),
