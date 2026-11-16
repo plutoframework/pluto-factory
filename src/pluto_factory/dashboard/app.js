@@ -761,14 +761,15 @@
       card.append(raw);
     }
     if (decision.state === "answered") {
-      card.append(node("p", "secondary-line", `Answered: ${decision.answer}. Waiting for the coordinator.`));
+      card.append(node("p", "secondary-line", `Answered${decision.custom ? " (custom)" : ""}: ${decision.answer}. Waiting for the coordinator.`));
       return card;
     }
     if (decision.state === "applied") {
-      card.append(node("p", "secondary-line", `Applied: ${decision.answer}.`));
+      card.append(node("p", "secondary-line", `Applied${decision.custom ? " (custom)" : ""}: ${decision.answer}.`));
       return card;
     }
-    const freeText = decision.kind === "free_text";
+    // Config changes stay options-only; every other kind takes a custom answer.
+    const freeText = decision.kind !== "config";
     const field = node("textarea", "decision-text");
     field.rows = 2; field.maxLength = 4000;
     field.placeholder = freeText ? "Or write your own answer" : "Optional note, sent with the option you click";

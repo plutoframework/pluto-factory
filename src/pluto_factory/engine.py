@@ -579,7 +579,11 @@ class Engine:
             self.triage.apply_answer(decision)
             mark_applied(self.state, decision["id"], detail)
             return
-        if proposal.get("pr") and decision["answer"].startswith("Grant"):
+        if (
+            proposal.get("pr")
+            and not decision["custom"]
+            and decision["answer"].startswith("Grant")
+        ):
             slug, _, number = proposal["pr"].rpartition("#")
             self.tracker.grant(slug, int(number))
         option = chosen_option(decision)

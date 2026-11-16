@@ -118,7 +118,6 @@ def test_http_answer_records_only_the_answer(world):
         ("bad-json", 400),
         ("not-object", 400),
         ("extra-field", 400),
-        ("not-an-option", 400),
         ("bad-host", 403),
     ],
 )
@@ -149,8 +148,6 @@ def test_write_path_refuses_untrusted_requests(world, case, expected):
         raw = b'["A"]'
     elif case == "extra-field":
         body = {"answer": "A", "state": "applied"}
-    elif case == "not-an-option":
-        body = {"answer": "Z"}
     elif case == "bad-host":
         headers["Host"] = "evil.example"
     with server(data) as serving:
@@ -252,3 +249,20 @@ def test_config_decision_projects_key_value_and_approving_option(world):
     assert shown["proposal"] == {"key": "phase_timeout_seconds", "value": 3600}
     approves = {o["label"]: o["approves"] for o in shown["options"]}
     assert approves == {"Apply": True, "Decline": False}
+
+
+def test_http_free_text_is_custom_except_for_config(world):
+    state, data, factory, decision = world
+    config = add_decision(
+        state,
+        question="Raise timeout?",
+        kind="config",
+        proposal={"key": "phase_timeout_seconds", "value": 3600},
+    )
+    with server(data) as serving:
+        assert post(serving, route(factory, config), {"answer": "99"})[0] == 400
+        status, _ = post(serving, route(factory, decision), {"answer": "Z"})
+    assert status == 200
+    assert get_decision(state, config["id"])["state"] == "open"
+    answered = get_decision(state, decision["id"])
+    assert answered["answer"] == "Z" and answered["custom"] == 1

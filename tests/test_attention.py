@@ -573,8 +573,8 @@ def test_decision_create_dedupe_and_options(tmp_path):
         add_decision(
             engine.state, question="x", kind="choice", options=["only"]
         )
-    with pytest.raises(AttentionError):
-        answer_decision(engine.state, first["id"], "not an option")
+    # Free text is a custom answer; only config decisions are options-only.
+    assert answer_decision(engine.state, first["id"], "my own")["custom"] == 1
 
 
 def test_decision_answered_via_cli_resumes_work_with_guidance(tmp_path, capsys):

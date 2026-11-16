@@ -265,6 +265,7 @@ def _project_decision(decision, factory_id, name):
         ],
         "state": decision["state"],
         "answer": text(decision["answer"], 500),
+        "custom": bool(decision.get("custom")),
         "advice": decision.get("advice", "none"),
         "created": decision["created"],
         "age": max(0, now - decision["created"]),

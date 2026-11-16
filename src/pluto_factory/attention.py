@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     created REAL NOT NULL, answered_at REAL, applied_at REAL,
     details TEXT NOT NULL DEFAULT '[]', why TEXT NOT NULL DEFAULT '',
     advice TEXT NOT NULL DEFAULT 'none', block_key TEXT,
-    answered_by TEXT
+    answered_by TEXT, custom INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS external_issues (
     key TEXT PRIMARY KEY, slug TEXT NOT NULL, number INTEGER NOT NULL,
@@ -125,6 +125,7 @@ DECISION_COLUMNS = {
     "advice": "TEXT NOT NULL DEFAULT 'none'",
     "block_key": "TEXT",
     "answered_by": "TEXT",
+    "custom": "INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -328,15 +329,21 @@ def answer_decision(state, decision_id, answer, note="", via="cli", by="owner"):
         if decision["state"] != "open":
             raise DecisionConflict(f"decision is already {decision['state']}")
         labels = [option["label"] for option in decision["options"]]
-        if (
-            decision["kind"] in {"choice", "config", "framework_gap"}
-            and answer not in labels
-        ):
+        # Config changes stay options-only; every other kind takes free text.
+        if decision["kind"] == "config" and answer not in labels:
             raise AttentionError("answer must be one of the listed options")
+        custom = int(answer not in labels)
         state.db.execute(
             "UPDATE decisions SET state='answered',answer=?,note=?,"
-            "answered_at=?,answered_by=? WHERE id=?",
-            (answer, note, time.time(), _clip(by, 200) or "owner", decision_id),
+            "answered_at=?,answered_by=?,custom=? WHERE id=?",
+            (
+                answer,
+                note,
+                time.time(),
+                _clip(by, 200) or "owner",
+                custom,
+                decision_id,
+            ),
         )
         state._event(
             "decision.answered",
@@ -344,6 +351,7 @@ def answer_decision(state, decision_id, answer, note="", via="cli", by="owner"):
             {
                 "id": decision_id,
                 "answer": answer[:200],
+                "custom": bool(custom),
                 "via": via,
                 "by": _clip(by, 200) or "owner",
             },
@@ -890,7 +898,10 @@ def comment_body(decision, kind, extra=None):
             "%Y-%m-%d %H:%M:%SZ", time.gmtime(decision["answered_at"] or 0)
         )
         lines.append(f"**Decision answered:** {decision['question']}")
-        lines.append(f"- Answer: {decision['answer']}")
+        lines.append(
+            f"- Answer: {decision['answer']}"
+            + (" (custom answer)" if decision.get("custom") else "")
+        )
         if decision.get("note"):
             lines.append(f"- Custom feedback: {decision['note']}")
         lines.append(f"- By: {decision.get('answered_by') or 'owner'}")

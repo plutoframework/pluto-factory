@@ -628,7 +628,7 @@ def test_decision_buttons_answer_in_one_click_with_clear_styling():
             "let needsReturnFocus"
         )[0]
     )
-    assert 'decision.kind === "free_text"' in js and "Send custom answer" in js
+    assert 'decision.kind !== "config"' in js and "Send custom answer" in js
     # Recommended is primary and readable; the rest are secondary.
     assert 'option.recommended ? "button-primary" : "button-secondary"' in js
     assert (
@@ -685,3 +685,121 @@ def test_stale_coordinator_prompts_still_get_the_terse_rule():
 
     assert TERSE_STYLE in _styled("old prompt")
     assert _styled(ROLE_TEXT["orchestrator"]) == ROLE_TEXT["orchestrator"]
+
+
+# --- custom answers ---------------------------------------------------------
+
+
+def _framework_decision(engine):
+    work = make_work_with_issue(engine)
+    engine._defer(engine.state.get_work(work["id"]), "rbac denies")
+    engine.advisor.runner = lambda p, q: FRAMEWORK
+    engine.advise_pending()
+    (decision,) = list_decisions(engine.state, {"open"})
+    return work, decision
+
+
+def test_custom_answer_resumes_work_with_it_as_guidance(tmp_path):
+    engine, _gh = build(tmp_path)
+    work, decision = _framework_decision(engine)
+    answered = answer_decision(
+        engine.state, decision["id"], "Use the v2 endpoint instead"
+    )
+    assert answered["custom"] == 1
+    engine.process_decisions()
+    (note,) = engine.state.guidance(work["id"])
+    assert "Use the v2 endpoint instead" in note["text"]
+    assert engine.state.get_work(work["id"])["control"] != "deferred"
+    queued = engine.state.db.execute(
+        "SELECT 1 FROM issue_comments WHERE decision_id=? AND kind='answered'",
+        (decision["id"],),
+    ).fetchone()
+    assert queued
+
+
+def test_custom_answer_never_files_upstream_or_records_a_gap(tmp_path):
+    engine, _gh = build(tmp_path)
+    _work, decision = _framework_decision(engine)
+    answer_decision(engine.state, decision["id"], "Pin rbac and retry")
+    engine.process_decisions()
+    assert not [
+        d for d in list_decisions(engine.state) if d["kind"] == "framework_gap"
+    ]
+    assert not engine.state.db.execute(
+        "SELECT 1 FROM upstream_issues"
+    ).fetchall()
+
+
+def test_listed_option_is_not_custom_and_still_parks_the_gap(tmp_path):
+    engine, _gh = build(tmp_path)
+    _work, decision = _framework_decision(engine)
+    answered = answer_decision(engine.state, decision["id"], "Fix pluto-rbac")
+    assert answered["custom"] == 0
+
+
+def test_choice_and_framework_gap_decisions_accept_free_text(tmp_path):
+    engine, _gh = build(tmp_path)
+    choice = attention.add_decision(
+        engine.state,
+        question="Pick?",
+        kind="choice",
+        options=[{"label": "A", "recommended": True}, {"label": "B"}],
+    )
+    assert answer_decision(engine.state, choice["id"], "C, actually")["custom"]
+    gap = attention.add_decision(
+        engine.state,
+        question="Gap?",
+        kind="framework_gap",
+        options=[
+            {"label": attention.GAP_RESUME, "recommended": True},
+            {"label": attention.GAP_WITHDRAW},
+        ],
+        proposal={"library": "pluto-rbac", "pin": "1"},
+    )
+    assert answer_decision(engine.state, gap["id"], "wait a week")["custom"]
+
+
+def test_config_decisions_stay_options_only(tmp_path):
+    engine, _gh = build(tmp_path)
+    decision = attention.add_decision(
+        engine.state,
+        question="Raise?",
+        kind="config",
+        proposal={"key": "phase_timeout_seconds", "value": 3600},
+    )
+    with pytest.raises(attention.AttentionError):
+        answer_decision(engine.state, decision["id"], "set it to 99999")
+
+
+def test_custom_answer_is_marked_in_the_issue_comment(tmp_path):
+    engine, _gh = build(tmp_path)
+    _work, decision = _framework_decision(engine)
+    answered = answer_decision(engine.state, decision["id"], "Do it by hand")
+    body = attention.comment_body(answered, "answered")
+    assert "Do it by hand (custom answer)" in body
+    listed = attention.get_decision(engine.state, decision["id"])
+    listed["custom"] = 0
+    assert "(custom answer)" not in attention.comment_body(listed, "answered")
+
+
+def test_custom_grant_text_does_not_reset_a_pr_budget(tmp_path):
+    from test_attention import build as build_tracker
+    from test_attention import tracked
+
+    engine, gh = build_tracker(tmp_path)
+    tracked(engine, gh)
+    called = []
+    engine.tracker.grant = lambda *a: called.append(a)
+    decision = attention.add_decision(
+        engine.state,
+        question="PR still fails",
+        kind="choice",
+        options=[
+            {"label": "Grant another repair attempt", "recommended": True},
+            {"label": "I will fix it myself"},
+        ],
+        proposal={"pr": "plutoframework/cli#5"},
+    )
+    answer_decision(engine.state, decision["id"], "Grant nothing, I am on it")
+    engine.process_decisions()
+    assert not called
