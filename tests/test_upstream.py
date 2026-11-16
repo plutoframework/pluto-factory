@@ -179,12 +179,52 @@ def test_auto_mode_ignores_app_locus_recommendations(tmp_path):
     assert engine.flush_upstream() == 0 and not gh.created
 
 
-def test_unmapped_library_files_nothing_and_says_so(tmp_path):
-    engine, gh, _ = setup(tmp_path, mapped=False)
+def test_unmapped_library_files_nothing_but_asks_the_owner(tmp_path):
+    engine, gh, work = setup(tmp_path, mapped=False)
     choose_framework(engine)
     assert engine.flush_upstream() == 0 and not gh.created
     kinds = [e["kind"] for e in engine.state.inspect()["events"]]
     assert "upstream.unmapped" in kinds
+    (ask,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_repo_for")
+    ]
+    assert ask["question"] == "Upstream repo unknown for pluto-rbac."
+    assert ask["options"][-1]["label"] == "Withdraw; handle in the app"
+    # Withdrawing drops the gap and resumes the work with guidance.
+    answer_decision(engine.state, ask["id"], "Withdraw; handle in the app")
+    engine.process_decisions()
+    assert engine.state.get_work(work["id"])["control"] == "ready"
+    assert not [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if d["kind"] == "framework_gap"
+    ]
+
+
+def test_owner_can_pick_a_mapped_repo_for_an_unmapped_library(tmp_path):
+    engine, gh, work = setup(tmp_path, mapped=False)
+    engine.config.framework.upstream = {"pluto-core": UPSTREAM}
+    choose_framework(engine)
+    (ask,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_repo_for")
+    ]
+    assert f"File in {UPSTREAM}" in [o["label"] for o in ask["options"]]
+    answer_decision(engine.state, ask["id"], f"File in {UPSTREAM}")
+    engine.process_decisions()
+    assert engine.flush_upstream() == 1
+    assert gh.created[0]["slug"] == UPSTREAM
+    assert engine.state.get_work(work["id"])["control"] == "deferred"
+
+
+def test_library_names_normalize_the_pluto_prefix():
+    policy = FrameworkPolicy(upstream={"pluto-cli": "plutoframework/cli"})
+    for name in ("cli", "pluto-cli", "CLI", "@plutoframework/cli"):
+        assert policy.repository(name) == "plutoframework/cli"
+    assert policy.repository("auth") == ""
 
 
 def test_framework_config_validates_repositories():

@@ -49,10 +49,75 @@ def upstream_marker(state, decision_id):
     return f"<!-- pluto-factory:upstream:{digest} -->"
 
 
-def request_upstream(state, config, decision, option):
+REPO_FILE = "File in "
+REPO_WITHDRAW = "Withdraw; handle in the app"
+
+
+def _ask_repo(state, config, decision, library):
+    """Never park silently: the owner picks a repository or withdraws."""
+    mapped = sorted(set(config.framework.upstream.values()))
+    attention.add_decision(
+        state,
+        work_id=decision["work_id"],
+        kind="free_text",
+        question=f"Upstream repo unknown for {library}.",
+        context=(
+            f"The advisor chose a framework fix in '{library}' but "
+            "[framework].upstream has no repository for it. Pick where to "
+            "file it, type an owner/name repository, or withdraw. "
+            f"Mapped: {', '.join(mapped) or 'none'}."
+        ),
+        options=[
+            *[
+                {
+                    "label": f"{REPO_FILE}{repo}",
+                    "effect": f"File the upstream issue in {repo}.",
+                    "recommended": index == 0,
+                }
+                for index, repo in enumerate(mapped)
+            ],
+            {
+                "label": REPO_WITHDRAW,
+                "effect": "Drop the framework fix; resume the work.",
+                "recommended": not mapped,
+            },
+        ],
+        proposal={"upstream_repo_for": decision["id"], "library": library},
+        block_key=f"upstream-repo:{decision['id']}:{library}",
+        notify=True,
+    )
+
+
+def apply_repo_answer(state, config, decision):
+    """Owner chose a repository (or withdrew) for an unmapped library.
+
+    Returns the withdraw flag; filing keeps the work parked on the gap.
+    """
+    proposal = decision["proposal"]
+    origin = attention.get_decision(state, proposal["upstream_repo_for"])
+    answer = decision["answer"].strip()
+    slug = answer.removeprefix(REPO_FILE).strip()
+    if answer == REPO_WITHDRAW or not SLUG.fullmatch(slug):
+        return True
+    option = next(
+        (
+            o
+            for o in origin["options"]
+            if attention.framework_library(o).lower()
+            == proposal["library"].lower()
+        ),
+        None,
+    )
+    if option is None:
+        return True
+    request_upstream(state, config, origin, option, repo=slug)
+    return False
+
+
+def request_upstream(state, config, decision, option, repo=None):
     """Queue (idempotently) an upstream issue for a framework option."""
     library = attention.framework_library(option)
-    repo = config.framework.repository(library)
+    repo = repo or config.framework.repository(library)
     if not repo:
         state.event(
             "upstream.unmapped",
@@ -60,6 +125,7 @@ def request_upstream(state, config, decision, option):
             {"library": library, "hint": "add [framework].upstream"},
             f"upstream-unmapped:{decision['id']}:{library}",
         )
+        _ask_repo(state, config, decision, library)
         return False
     with state.db:
         cursor = state.db.execute(
