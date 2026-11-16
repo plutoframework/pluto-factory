@@ -146,13 +146,17 @@ def test_advisor_retries_with_the_violation_then_accepts(tmp_path):
 
     def runner(prompt, payload):
         calls.append(json.loads(payload))
-        return advice(problem="w " * 50) if len(calls) == 1 else advice()
+        return (
+            advice(options=[option("Only", True)])
+            if len(calls) == 1
+            else advice()
+        )
 
     _result, source = Advisor(engine.home, engine.config, runner).advise(
         {"block_reason": "x"}
     )
     assert source == "model" and len(calls) == 2
-    assert "40" in calls[1]["contract_error"]["problems"]
+    assert "at least 2" in calls[1]["contract_error"]["problems"]
 
 
 def test_advisor_falls_back_after_repeated_violations(tmp_path):
@@ -866,3 +870,113 @@ def test_drawer_cards_use_each_decisions_own_factory_id():
     assert ".map(decisionCard)" not in js
     assert "owner.map(decision => decisionCard(decision))" in js
     assert "autos.map(decision => decisionCard(decision))" in js
+
+
+# --- advisor failure reasons, retries and clipping -------------------------
+
+
+class Crash(Exception):
+    def __init__(self):
+        super().__init__("claude exited unexpectedly")
+        self.exit_code = 1
+        self.stderr = "boom: out of memory"
+
+
+def test_overlong_prose_is_clipped_not_rejected(tmp_path):
+    engine, _ = build(tmp_path)
+    long = " ".join(["w"] * 80)
+    reply = advice(
+        problem=long,
+        details=[long],
+        why=long,
+        options=[
+            {**option("A", True), "effect": long},
+            option("B"),
+        ],
+    )
+    calls = []
+
+    def runner(prompt, payload):
+        calls.append(1)
+        return reply
+
+    result, source = Advisor(engine.home, engine.config, runner).advise(
+        {"block_reason": "x"}
+    )
+    assert source == "model" and len(calls) == 1
+    assert len(result.problem.split()) == 40
+    assert len(result.details[0].split()) == 15
+    assert len(result.options[0].effect.split()) == 25
+
+
+def test_fallback_records_a_bounded_failure_reason(tmp_path):
+    engine, _ = build(tmp_path)
+    naps = []
+
+    def runner(prompt, payload):
+        raise Crash()
+
+    advisor = Advisor(engine.home, engine.config, runner, sleep=naps.append)
+    _result, source = advisor.advise({"block_reason": "x"})
+    assert source == "fallback" and naps == [5, 20]
+    failure = advisor.last_failure
+    assert failure["kind"] == "crash" and failure["exit_code"] == 1
+    assert failure["attempts"] == 3
+    assert failure["stderr_tail"] == "boom: out of memory"
+
+
+def test_failure_reaches_event_and_decision_context(tmp_path):
+    engine, _ = build(tmp_path)
+    work = make_work_with_issue(engine)
+    engine._defer(engine.state.get_work(work["id"]), "flaky")
+
+    def runner(prompt, payload):
+        raise RuntimeError("provider down")
+
+    engine.advisor.runner = runner
+    engine.advise_pending()
+    (decision,) = list_decisions(engine.state, {"open"})
+    assert decision["advice"] == "fallback"
+    assert decision["context"].startswith("Advisor failed: error RuntimeError")
+    events = [
+        e
+        for e in engine.state.inspect()["events"]
+        if e["kind"] == "decision.advised"
+    ]
+    data = events[-1]["data"]
+    data = json.loads(data) if isinstance(data, str) else data
+    assert data["source"] == "fallback"
+    assert data["failure"]["exception"] == "RuntimeError"
+    assert "provider down" in data["failure"]["message"]
+
+
+def test_pull_request_advice_never_needs_a_framework_payload(tmp_path):
+    """Real failure: a PR option labelled framework:* had no upstream payload."""
+    engine, _ = build(tmp_path)
+    reply = advice(
+        options=[
+            option(
+                "Review and merge",
+                True,
+                locus="framework:pluto-auth",
+                fix="Approve and merge #25.",
+            ),
+            option("Re-check later"),
+        ]
+    )
+    seen = []
+
+    def runner(prompt, payload):
+        seen.append(json.loads(payload))
+        return reply
+
+    advisor = Advisor(engine.home, engine.config, runner)
+    result, source = advisor.advise({"block_reason": "x"}, pull_request=True)
+    assert source == "model" and len(seen) == 1
+    assert [o.locus for o in result.options] == ["app", "app"]
+    assert "pull_request" in seen[0]["item_kind"]
+    # Work blocks keep the strict rule.
+    _result, source = advisor.advise({"block_reason": "x"})
+    assert (
+        source == "fallback" and "upstream" in advisor.last_failure["message"]
+    )

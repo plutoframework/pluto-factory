@@ -982,7 +982,9 @@ def _waiting_on(connection, decision):
     return {"slug": row[0], "number": row[1], "url": row[2]}
 
 
-def apply_advice(state, decision_id, advice, source, announce=True):
+def apply_advice(
+    state, decision_id, advice, source, announce=True, failure=None
+):
     """Replace a pending decision's headline/options with advisor output."""
     options = normalize_options(
         [
@@ -999,16 +1001,25 @@ def apply_advice(state, decision_id, advice, source, announce=True):
             for o in advice.options
         ]
     )
+    current = get_decision(state, decision_id)
+    context = current["context"]
+    if failure:
+        from .advisor import failure_reason
+
+        lead = failure_reason(failure).replace("Triage", "Advisor", 1)
+        context = _clip(f"{lead}\n{context}", CONTEXT_LIMIT)
     with state.db:
         changed = state.db.execute(
             "UPDATE decisions SET question=?,details=?,options=?,why=?,"
-            "advice=? WHERE id=? AND state='open' AND advice='pending'",
+            "advice=?,context=? WHERE id=? AND state='open' "
+            "AND advice='pending'",
             (
                 _clip(advice.problem, QUESTION_LIMIT),
                 json.dumps(advice.details),
                 json.dumps(options),
                 advice.why,
                 source,
+                context,
                 decision_id,
             ),
         ).rowcount
@@ -1022,7 +1033,11 @@ def apply_advice(state, decision_id, advice, source, announce=True):
             state._event(
                 "decision.advised",
                 get_decision(state, decision_id)["work_id"] or "factory",
-                {"id": decision_id, "source": source},
+                {
+                    "id": decision_id,
+                    "source": source,
+                    **({"failure": failure} if failure else {}),
+                },
             )
     if changed and announce:
         enqueue_issue_comment(

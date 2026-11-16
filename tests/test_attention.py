@@ -212,9 +212,35 @@ def test_review_and_branch_protection_need_the_owner(tmp_path):
     tracked(engine, gh)
     gh.views[("plutoframework/cli", 5)] = view(reviewDecision="REVIEW_REQUIRED")
     row = observe(engine)
-    assert row["state"] == "needs_owner" and "review" in row["reason"]
+    assert row["state"] == "needs_owner"
+    assert row["reason"] == "Ready: needs your approval + merge"
     gh.views[("plutoframework/cli", 5)] = view(mergeStateStatus="BLOCKED")
-    assert observe(engine)["state"] == "needs_owner"
+    row = observe(engine)
+    assert row["state"] == "needs_owner"
+    assert row["reason"] == "Ready: needs your approval + merge"
+    # Nothing to choose: it is a PR item with a link, never a decision.
+    assert not list_decisions(engine.state)
+
+
+def test_approval_wait_withdraws_an_earlier_fallback_decision(tmp_path):
+    engine, gh = build(tmp_path)
+    tracked(engine, gh)
+    gh.views[("plutoframework/cli", 5)] = view(
+        mergeStateStatus="DIRTY", head=SHA
+    )
+    engine.tracker.config.github_required_checks = []
+    row = get_pr(engine.state, "plutoframework/cli", 5)
+    set_pr(engine.state, row, origin="tracked")
+    observe(engine)
+    (stale,) = list_decisions(engine.state, {"open"})
+    gh.views[("plutoframework/cli", 5)] = view(
+        reviewDecision="REVIEW_REQUIRED", head=SHA
+    )
+    observe(engine)
+    assert not list_decisions(engine.state, {"open"})
+    assert attention.get_decision(engine.state, stale["id"])["state"] == (
+        "withdrawn"
+    )
 
 
 def test_codeql_failure_is_not_code_fixable(tmp_path):

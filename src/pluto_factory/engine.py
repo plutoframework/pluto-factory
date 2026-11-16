@@ -917,7 +917,14 @@ class Engine:
                 else (False, "fallback advice")
             )
             if apply_advice(
-                self.state, decision["id"], advice, source, announce=not ok
+                self.state,
+                decision["id"],
+                advice,
+                source,
+                announce=not ok,
+                failure=self.advisor.last_failure
+                if source == "fallback"
+                else None,
             ):
                 done += 1
                 if ok:

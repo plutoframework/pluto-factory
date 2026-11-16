@@ -286,14 +286,17 @@ def test_proxy_child_dies_when_parent_is_killed(tmp_path):
     child = int(parent.stdout.readline())
     os.kill(parent.pid, signal.SIGKILL)
     parent.wait()
-    for _ in range(50):
+    # Wait on the condition (child gone or zombie), not on a fixed budget:
+    # under load the kernel can take far longer than a few seconds.
+    deadline = time.monotonic() + 60
+    while True:
         try:
             stat = Path(f"/proc/{child}/stat").read_text()
             if stat.split(") ")[-1][:1] == "Z":
                 break
         except FileNotFoundError:
             break
-        time.sleep(0.1)
-    else:
-        os.kill(child, signal.SIGKILL)
-        raise AssertionError("child survived its parent")
+        if time.monotonic() > deadline:
+            os.kill(child, signal.SIGKILL)
+            raise AssertionError("child survived its parent")
+        time.sleep(0.05)

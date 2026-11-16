@@ -13,7 +13,6 @@ comments and labels (which bump ``updated_at``) never retrigger triage;
 ``updated_at`` is recorded for audit.
 """
 
-import contextlib
 import json
 import time
 from types import SimpleNamespace
@@ -23,15 +22,15 @@ from pydantic import Field, field_validator, model_validator
 
 from . import attention, structured
 from .advisor import (
-    DETAIL_WORDS,
-    EFFECT_WORDS,
-    FIX_WORDS,
-    LABEL_WORDS,
+    BACKOFF_SECONDS,
     LOCUS,
-    PROBLEM_WORDS,
-    TRADEOFF_WORDS,
-    WHY_WORDS,
+    TRANSIENT,
+    TRANSIENT_RETRIES,
     Advice,
+    _tail,
+    clip_advice,
+    failure_reason,
+    failure_record,
     fallback_advice,
     terse,
     words,
@@ -110,45 +109,6 @@ class Rejection(Contract):
         return value
 
 
-def _clip_words(value, limit):
-    if not isinstance(value, str):
-        return value
-    pieces = value.split()
-    return value if len(pieces) <= limit else " ".join(pieces[:limit])
-
-
-def clip_advice(advice):
-    """Shorten over-long prose to the advisor caps instead of rejecting it.
-
-    Long issues make the model write long rationales; the caps exist for
-    terse display, so clipping keeps a useful decision where strict
-    validation used to drop the whole triage into the fallback.
-    """
-    if not isinstance(advice, dict):
-        return advice
-    clipped = dict(advice)
-    clipped["problem"] = _clip_words(clipped.get("problem"), PROBLEM_WORDS)
-    clipped["why"] = _clip_words(clipped.get("why"), WHY_WORDS)
-    if isinstance(clipped.get("details"), list):
-        clipped["details"] = [
-            _clip_words(d, DETAIL_WORDS) for d in clipped["details"][:6]
-        ]
-    options = []
-    for option in clipped.get("options") or []:
-        if isinstance(option, dict):
-            option = {
-                **option,
-                "label": _clip_words(option.get("label"), LABEL_WORDS),
-                "effect": _clip_words(option.get("effect"), EFFECT_WORDS),
-                "tradeoff": _clip_words(option.get("tradeoff"), TRADEOFF_WORDS),
-            }
-            if option.get("fix"):
-                option["fix"] = _clip_words(option["fix"], FIX_WORDS)
-        options.append(option)
-    clipped["options"] = options
-    return clipped
-
-
 class TriageResult(Contract):
     outcome: Literal["ACCEPT", "NEEDS_HUMAN", "REJECT"]
     spec: Spec | None = None
@@ -206,89 +166,8 @@ def render_spec(spec, url):
     return "\n".join(lines)
 
 
-TRANSIENT = {"timeout", "rate_limit", "crash"}
-TRANSIENT_RETRIES = 2
-BACKOFF_SECONDS = (5, 20)
 RETRY = "Retry triage"
 ACCEPT_AS_WRITTEN = "Accept as written"
-STDERR_TAIL = 500
-MESSAGE_LIMIT = 400
-
-
-def _tail(value, limit):
-    value = str(value or "")
-    return value if len(value) <= limit else "…" + value[-limit:]
-
-
-def classify(error):
-    """schema | timeout | rate_limit | crash | unavailable | error."""
-    name = type(error).__name__
-    message = str(error).lower()
-    if isinstance(error, (TimeoutError,)) or "timeout" in name.lower():
-        return "timeout"
-    if (
-        "ratelimit" in name.lower()
-        or "rate limit" in message
-        or "429" in message
-    ):
-        return "rate_limit"
-    if (
-        getattr(error, "exit_code", None) is not None
-        or getattr(error, "returncode", None) is not None
-        or "ProcessError" in name
-    ):
-        return "crash"
-    if name in {"UnexpectedModelBehavior", "ValidationError"} or isinstance(
-        error, (ValueError, TypeError)
-    ):
-        return "schema"
-    if "unavailable" in message:
-        return "unavailable"
-    return "error"
-
-
-def failure_record(error, attempts):
-    """Bounded, redacted account of why a model triage failed."""
-    from .dashboard_data import text
-
-    exit_code = getattr(error, "exit_code", None)
-    if exit_code is None:
-        exit_code = getattr(error, "returncode", None)
-    cause = error.__cause__ or error.__context__
-    record = {
-        "kind": classify(error),
-        "exception": type(error).__name__,
-        "message": text(_tail(str(error), MESSAGE_LIMIT), MESSAGE_LIMIT + 20),
-        "attempts": attempts,
-    }
-    if cause is not None:
-        record["cause"] = text(
-            f"{type(cause).__name__}: {_tail(str(cause), 300)}", 340
-        )
-    if hasattr(error, "errors") and callable(error.errors):
-        with contextlib.suppress(Exception):
-            record["validation_errors"] = text(
-                json.dumps(error.errors(include_url=False), default=str)[:1200],
-                1200,
-            )
-    if exit_code is not None:
-        record["exit_code"] = exit_code
-    stderr = getattr(error, "stderr", None)
-    if stderr:
-        record["stderr_tail"] = text(
-            _tail(stderr, STDERR_TAIL), STDERR_TAIL + 20
-        )
-    return record
-
-
-def failure_reason(record):
-    """One terse line for owners: 'Triage failed: <reason>'."""
-    parts = [record["kind"], record["exception"]]
-    if record.get("message"):
-        parts.append(record["message"])
-    if record.get("exit_code") is not None:
-        parts.append(f"exit {record['exit_code']}")
-    return "Triage failed: " + terse(" ".join(parts), 30)
 
 
 class Triager:
