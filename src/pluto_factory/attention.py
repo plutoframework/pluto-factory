@@ -130,14 +130,21 @@ DECISION_COLUMNS = {
 }
 
 
+PR_COLUMNS = {"head_changed": "REAL NOT NULL DEFAULT 0"}
+
+
 def ensure_schema(db):
     db.executescript(SCHEMA)
-    present = {row[1] for row in db.execute("PRAGMA table_info(decisions)")}
-    for column, definition in DECISION_COLUMNS.items():
-        if column not in present:
-            db.execute(
-                f"ALTER TABLE decisions ADD COLUMN {column} {definition}"
-            )
+    for table, columns in (
+        ("decisions", DECISION_COLUMNS),
+        ("pull_requests", PR_COLUMNS),
+    ):
+        present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        for column, definition in columns.items():
+            if column not in present:
+                db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
 
 
 def _id(prefix):
@@ -871,6 +878,8 @@ def set_pr(ledger, row, **fields):
     }
     previous = row["state"]
     new = fields.get("state", previous)
+    if fields.get("head") and row["head"] and fields["head"] != row["head"]:
+        stored["head_changed"] = now  # someone pushed
     if new != previous:
         stored["state_since"] = now
     stored["updated"] = now

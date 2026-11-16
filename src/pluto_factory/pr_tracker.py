@@ -27,6 +27,8 @@ from .github_checks import merge_check_status
 from .models import Submission, workable_repositories
 from .state import StateConflict
 
+# Someone actively pushing: don't race them with a repair.
+HEAD_QUIET_SECONDS = 600
 EXCERPT_LIMIT = 3000
 LOG_RUNS = 2
 # A repository with no CI at all must not wait forever for checks.
@@ -544,7 +546,52 @@ class PRTracker:
                 return other
         return None
 
+    def refresh_head(self, row):
+        """Re-read the PR head from GitHub; a moved head resets the record.
+
+        The tracker only observes every ``pr_poll_seconds``; repairs must not
+        compare against a head that stale. A new head gets a fresh repair
+        budget (budgets are per head) and is re-evaluated from scratch.
+        """
+        view = self.view(row)
+        head = view.get("headRefOid") or row["head"]
+        if head == row["head"]:
+            return row
+        updates = {"head": head, "failing": [], "log_excerpt": ""}
+        if row["state"] in {"failed", "repairing", "needs_owner"}:
+            updates.update(state="pending", reason="New head observed")
+        set_pr(self.state, row, **updates)
+        self.state.event(
+            "pr.head_moved",
+            row["work_id"] or "factory",
+            {
+                "pr": f"{row['slug']}#{row['number']}",
+                "from": row["head"],
+                "to": head,
+            },
+        )
+        return get_pr(self.state, row["slug"], row["number"])
+
     def _repair(self, row):
+        try:
+            fresh = self.refresh_head(row)
+        except GitHubFailure as error:
+            self._poll_failed(f"{row['slug']}#{row['number']}", error)
+            return row
+        if fresh["head"] != row["head"]:
+            return fresh  # restart from the new head on the next observation
+        age = time.time() - (row.get("head_changed") or 0)
+        if age < HEAD_QUIET_SECONDS:
+            set_pr(
+                self.state,
+                row,
+                reason=(
+                    f"Head changed {int(age)}s ago; waiting "
+                    f"{int(HEAD_QUIET_SECONDS - age)}s for pushes to settle "
+                    "before repairing"
+                ),
+            )
+            return get_pr(self.state, row["slug"], row["number"])
         stacked = self._stacked_on(row)
         if stacked:
             set_pr(

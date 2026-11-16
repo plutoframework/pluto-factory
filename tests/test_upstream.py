@@ -438,12 +438,36 @@ def _leak(engine, **fields):
     engine.state.db.commit()
 
 
+def commit_in(path):
+    """A real commit in a throwaway repository; returns its SHA."""
+    run = lambda *a: subprocess.run(
+        ["git", "-C", str(path), *a],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    run("init", "-q")
+    run(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "private work",
+    )
+    return run("rev-parse", "HEAD").stdout.strip()
+
+
 def test_scrubber_blocks_filing_and_creates_a_hold_decision(tmp_path):
     engine, gh, work = setup(tmp_path)
+    sha = commit_in(tmp_path / "checkout")[:12]
     _leak(
         engine,
         problem=f"Okta in test breaks, see owner/core#12 and #12, "
-        f"{work['id']}, commit abcdef1 at {tmp_path}/checkout/x.",
+        f"{work['id']}, commit {sha} at {tmp_path}/checkout/x.",
     )
     assert not _filed(engine, gh)
     row = engine.state.db.execute("SELECT * FROM upstream_issues").fetchone()
@@ -453,7 +477,7 @@ def test_scrubber_blocks_filing_and_creates_a_hold_decision(tmp_path):
         for d in list_decisions(engine.state, {"open"})
         if (d["proposal"] or {}).get("upstream_hold")
     ]
-    for hit in ("private term: test", "owner/core#12", "#12", "abcdef1"):
+    for hit in ("private term: test", "owner/core#12", "#12", sha):
         assert hit in hold["context"]
     assert [o["label"] for o in hold["options"]] == [
         "Edit and file",
@@ -618,3 +642,20 @@ def test_library_names_normalize_for_own_repositories(tmp_path):
         assert engine._local_repository(name) == "core"
     assert engine._local_repository("pluto-rbac") == ""
     assert engine._local_repository("cli") == "t-plutoframework-cli"
+
+
+def test_hex_looking_words_are_not_private_shas(tmp_path):
+    from pluto_factory.upstream import scrub
+
+    engine, gh, _ = setup(tmp_path)
+    real = commit_in(tmp_path / "checkout")
+    text = "Use ed25519 keys; deadbeef and abcdef1 are just words."
+    hits = scrub(engine.state, gh, engine.config, UPSTREAM, [text])
+    assert not [h for h in hits if "commit SHA" in h]
+    private = scrub(
+        engine.state, gh, engine.config, UPSTREAM, [f"see {real[:10]}"]
+    )
+    assert f"commit SHA: {real[:10]}" in private
+    # A real private commit also resolves in full form and is flagged.
+    full = scrub(engine.state, gh, engine.config, UPSTREAM, [real])
+    assert f"commit SHA: {real}" in full
