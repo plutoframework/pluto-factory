@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -48,11 +49,12 @@ class State:
         self.home.mkdir(parents=True, exist_ok=True)
         # Optional debug Tracer; durable events are mirrored into its trace.
         self.tracer = None
-        self.db = sqlite3.connect(self.home / "state.sqlite3", timeout=10)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
+        # One SQLite connection per thread: parallel workers step on pool
+        # threads, and a connection may only be used by its creator.
+        self._local = threading.local()
+        self._connections = []
+        self._connections_lock = threading.Lock()
         self.db.execute("PRAGMA journal_mode = WAL")
-        self.db.execute("PRAGMA busy_timeout = 10000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, 1):
             raise ValueError(f"unsupported database schema version {version}")
@@ -128,8 +130,32 @@ class State:
         ):
             (self.home / folder).mkdir(exist_ok=True)
 
+    @property
+    def db(self):
+        connection = getattr(self._local, "db", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self.home / "state.sqlite3",
+                timeout=10,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            self._local.db = connection
+            with self._connections_lock:
+                self._connections.append(connection)
+        return connection
+
     def close(self):
-        self.db.close()
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        self._local = threading.local()
 
     @contextmanager
     def writer(self):

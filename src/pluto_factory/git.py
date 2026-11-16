@@ -11,13 +11,32 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .config import atomic_json
 from .models import FactoryConfig, Repository, workable_repositories
+
+_REPO_LOCKS: dict[str, threading.RLock] = {}
+_REPO_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def repo_lock(managed):
+    """Serialize mutations of one managed clone across worker threads.
+
+    Parallel work items share a managed clone per repository. Cloning,
+    adding or removing worktrees (which share ``.git/worktrees``) and
+    fast-forwarding the default checkout must not interleave.
+    """
+    key = str(Path(managed).resolve())
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 class GitFailure(RuntimeError):
@@ -233,90 +252,97 @@ class GitWorkspace:
                 self.home / "repositories" / name,
                 self.home / "repositories",
             )
-            default = self._default_branch(source)
-            if not managed.exists():
-                managed.parent.mkdir(parents=True, exist_ok=True)
-                self._git(
-                    managed.parent,
-                    "clone",
-                    "--no-local",
-                    "--no-hardlinks",
-                    "--template=",
-                    "--",
-                    str(source),
-                    str(managed),
+            with repo_lock(managed):
+                entries.append(
+                    self._prepare_repository(repo, source, managed, key)
                 )
-                if self._git(
+        self._save(entries)
+        return entries
+
+    def _prepare_repository(self, repo, source, managed, key) -> dict:
+        name = repo.name
+        default = self._default_branch(source)
+        if not managed.exists():
+            managed.parent.mkdir(parents=True, exist_ok=True)
+            self._git(
+                managed.parent,
+                "clone",
+                "--no-local",
+                "--no-hardlinks",
+                "--template=",
+                "--",
+                str(source),
+                str(managed),
+            )
+            if self._git(
+                managed,
+                "show-ref",
+                "--verify",
+                f"refs/heads/{default}",
+                check=False,
+            ).returncode:
+                self._git(
+                    managed, "checkout", "-b", default, f"origin/{default}"
+                )
+            else:
+                self._git(managed, "checkout", default)
+        else:
+            origin = self._text(managed, "remote", "get-url", "origin")
+            if Path(origin).resolve() != source:
+                raise GitFailure("scope.denied", "Managed clone changed")
+        base = self._text(managed, "rev-parse", f"refs/heads/{default}")
+        worktree = self._owned(
+            self.home / "worktrees" / key / name,
+            self.home / "worktrees",
+        )
+        branch = f"factory/{key}"
+        if not worktree.exists():
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            if repo.access == "read":
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    base,
+                )
+            elif (
+                self._git(
                     managed,
                     "show-ref",
                     "--verify",
-                    f"refs/heads/{default}",
+                    f"refs/heads/{branch}",
                     check=False,
-                ).returncode:
-                    self._git(
-                        managed, "checkout", "-b", default, f"origin/{default}"
-                    )
-                else:
-                    self._git(managed, "checkout", default)
+                ).returncode
+                == 0
+            ):
+                self._git(managed, "worktree", "add", str(worktree), branch)
             else:
-                origin = self._text(managed, "remote", "get-url", "origin")
-                if Path(origin).resolve() != source:
-                    raise GitFailure("scope.denied", "Managed clone changed")
-            base = self._text(managed, "rev-parse", f"refs/heads/{default}")
-            worktree = self._owned(
-                self.home / "worktrees" / key / name,
-                self.home / "worktrees",
-            )
-            branch = f"factory/{key}"
-            if not worktree.exists():
-                worktree.parent.mkdir(parents=True, exist_ok=True)
-                if repo.access == "read":
-                    self._git(
-                        managed,
-                        "worktree",
-                        "add",
-                        "--detach",
-                        str(worktree),
-                        base,
-                    )
-                elif (
-                    self._git(
-                        managed,
-                        "show-ref",
-                        "--verify",
-                        f"refs/heads/{branch}",
-                        check=False,
-                    ).returncode
-                    == 0
-                ):
-                    self._git(managed, "worktree", "add", str(worktree), branch)
-                else:
-                    self._git(
-                        managed,
-                        "worktree",
-                        "add",
-                        "-b",
-                        branch,
-                        str(worktree),
-                        base,
-                    )
-            entry = {
-                "name": name,
-                "source": str(source),
-                "managed": str(managed),
-                "worktree": str(worktree),
-                "branch": branch,
-                "default_branch": default,
-                "base": base,
-                "candidate": base,
-                "tree": self._text(managed, "rev-parse", f"{base}^{{tree}}"),
-                "access": repo.access,
-                "work_key": key,
-            }
-            self._entry(entry)
-            entries.append(entry)
-        self._save(entries)
-        return entries
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(worktree),
+                    base,
+                )
+        entry = {
+            "name": name,
+            "source": str(source),
+            "managed": str(managed),
+            "worktree": str(worktree),
+            "branch": branch,
+            "default_branch": default,
+            "base": base,
+            "candidate": base,
+            "tree": self._text(managed, "rev-parse", f"{base}^{{tree}}"),
+            "access": repo.access,
+            "work_key": key,
+        }
+        self._entry(entry)
+        return entry
 
     def snapshot(self, entries: list[dict], work_id: str) -> list[dict]:
         result = []
@@ -447,14 +473,15 @@ class GitWorkspace:
         for entry in entries:
             _, managed, _ = self._entry(entry)
             root = batch / entry["name"]
-            self._git(
-                managed,
-                "worktree",
-                "add",
-                "--detach",
-                str(root),
-                candidates[entry["name"]],
-            )
+            with repo_lock(managed):
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(root),
+                    candidates[entry["name"]],
+                )
             roots[entry["name"]] = root
         return roots
 
