@@ -14,6 +14,12 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .attention import (
+    OWNER_PR_STATES,
+    UnknownDecision,
+    answer_decision,
+    read_attention,
+)
 from .dependencies import canonical_existing, graph
 from .inventory import _snapshot, list_factories
 
@@ -175,6 +181,7 @@ def _read(database, selected=None):
             },
             "current_runs": current_runs,
             "observations": observations,
+            "owner": read_attention(connection),
         }
         if selected is not None:
             result["notices"] = [
@@ -208,6 +215,48 @@ def _read(database, selected=None):
         return result
     finally:
         connection.close()
+
+
+def _project_decision(decision, factory_id, name):
+    """Terse problem first; raw block text is separate collapsed evidence."""
+    now = time.time()
+    return {
+        "factory": factory_id,
+        "factory_name": text(name, 200),
+        "id": decision["id"],
+        "work_id": decision["work_id"],
+        "kind": decision["kind"],
+        "question": text(decision["question"], 500),
+        "details": [text(d, 300) for d in decision["details"][:8]],
+        "why": text(decision.get("why"), 300),
+        "evidence": text(decision["context"], 6000),
+        "options": [
+            {
+                "label": text(o["label"], 200),
+                "effect": text(o.get("effect") or o.get("description"), 300),
+                "tradeoff": text(o.get("tradeoff"), 300),
+                "locus": text(o.get("locus") or "app", 200),
+                "fix": text(o.get("fix"), 300),
+                "recommended": bool(o["recommended"]),
+            }
+            for o in decision["options"][:10]
+        ],
+        "state": decision["state"],
+        "answer": text(decision["answer"], 500),
+        "advice": decision.get("advice", "none"),
+        "created": decision["created"],
+        "age": max(0, now - decision["created"]),
+    }
+
+
+def _work_decision(owner, work_id, factory_id, name):
+    """The newest open or answered decision blocking this work item."""
+    rows = [
+        d
+        for d in owner["decisions"]
+        if d["work_id"] == work_id and d["state"] in {"open", "answered"}
+    ]
+    return _project_decision(rows[-1], factory_id, name) if rows else None
 
 
 def _agent_activity(item, snapshot, coordinator_running):
@@ -404,6 +453,7 @@ class DashboardData:
     def state(self):
         registry = self._entries()
         factories = []
+        needs = {"pull_requests": [], "decisions": []}
         for entry in registry["factories"][:100]:
             home = Path(entry["location"])
             projected = {
@@ -426,9 +476,19 @@ class DashboardData:
                 snapshot = _snapshot(home, _read)
                 if snapshot:
                     projected["paused"] = snapshot["paused"]
+                    self._owner_items(
+                        needs, projected["id"], entry["name"], snapshot["owner"]
+                    )
                     projected["work"] = [
-                        _summary(
-                            item, snapshot, entry.get("coordinator_running")
+                        self._with_decision(
+                            _summary(
+                                item,
+                                snapshot,
+                                entry.get("coordinator_running"),
+                            ),
+                            snapshot["owner"],
+                            projected["id"],
+                            entry["name"],
                         )
                         for item in snapshot["work"]
                     ]
@@ -464,8 +524,68 @@ class DashboardData:
             "generated_at": time.time(),
             "root": str(self.root),
             "factories": factories,
+            "needs_you": {
+                **needs,
+                "count": len(needs["pull_requests"])
+                + sum(item["state"] == "open" for item in needs["decisions"]),
+            },
             "errors": registry["errors"],
         }
+
+    @staticmethod
+    def _with_decision(summary, owner, factory_id, name):
+        decision = _work_decision(owner, summary["id"], factory_id, name)
+        summary["decision"] = decision
+        if decision:
+            # The card shows the terse problem, never the raw paragraph.
+            summary["latest_failure"] = decision["question"]
+        return summary
+
+    @staticmethod
+    def _owner_items(needs, factory_id, name, owner):
+        """Aggregate PRs and decisions that wait on the owner."""
+        now = time.time()
+        for pr in owner["pull_requests"]:
+            if pr["state"] not in OWNER_PR_STATES:
+                continue
+            needs["pull_requests"].append(
+                {
+                    "factory": factory_id,
+                    "factory_name": text(name, 200),
+                    "repo": text(pr["slug"], 200),
+                    "number": pr["number"],
+                    "title": text(pr["title"], 500),
+                    "state": pr["state"],
+                    "reason": text(pr["reason"], 1000),
+                    "failing": [text(n, 200) for n in pr["failing"][:20]],
+                    "url": _url(pr["url"]),
+                    "since": pr["state_since"],
+                    "age": max(0, now - pr["state_since"]),
+                }
+            )
+        for decision in owner["decisions"]:
+            needs["decisions"].append(
+                _project_decision(decision, factory_id, name)
+            )
+        needs["decisions"].sort(key=lambda item: item["created"])
+        needs["pull_requests"].sort(key=lambda item: -item["age"])
+
+    def answer(self, factory_id, decision_id, answer, note="", by="owner"):
+        """Record an owner's answer in the factory ledger; nothing else."""
+        from .state import State
+
+        home, _entry = self._home(factory_id)
+        if not (home / "state.sqlite3").is_file():
+            raise KeyError("Factory has no state to answer in.")
+        state = State(home)
+        try:
+            return answer_decision(
+                state, decision_id, answer, note, via="dashboard", by=by
+            )
+        except UnknownDecision as error:
+            raise KeyError("Decision was not found.") from error
+        finally:
+            state.close()
 
     def detail(self, factory_id, work_id):
         home, entry = self._home(factory_id)
@@ -480,7 +600,12 @@ class DashboardData:
         )
         if item is None:
             raise KeyError("Work item was not found.")
-        summary = _summary(item, snapshot, entry.get("coordinator_running"))
+        summary = self._with_decision(
+            _summary(item, snapshot, entry.get("coordinator_running")),
+            snapshot["owner"],
+            factory_id,
+            entry["name"],
+        )
         runs = snapshot["runs"]
         reports = []
         for run in runs:

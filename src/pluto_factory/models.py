@@ -32,6 +32,97 @@ class Repository(Contract):
     )
 
 
+class TrackedRepository(Contract):
+    """An extra GitHub repository whose open PRs the factory watches.
+
+    ``local_path`` is the checkout workers repair from; ``checks``/``qa``
+    mirror ``[[repositories]]``.
+    """
+
+    repo: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    local_path: str = ""
+    checks: list[list[str]] = Field(default_factory=list)
+    qa: list[list[str]] = Field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        slug = re.sub(r"[^a-z0-9_-]+", "-", self.repo.lower())
+        return ("t-" + slug)[:32]
+
+
+ANTHROPIC_ADVISOR_MODEL = "claude-opus-5-5"
+OPENAI_ADVISOR_MODEL = "gpt-6.1-sol"
+
+
+class AdvisorPolicy(Contract):
+    """Read-only advisor: reasoning effort and extra framework sources.
+
+    ``reference_paths`` are local checkouts of Pluto libraries (CLI,
+    pluto-core/rbac/auth/jobs, the TypeScript SDK) added to the sources
+    resolved from the Go module cache and node_modules at pinned versions.
+    """
+
+    reasoning: str = "high"
+    reference_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("reference_paths")
+    @classmethod
+    def _paths(cls, paths):
+        for raw in paths:
+            if not raw or "\0" in raw or ".." in Path(raw).parts:
+                raise ValueError(f"invalid reference path: {raw!r}")
+            if not os.path.isabs(os.path.expanduser(raw)):
+                raise ValueError(f"reference path must be absolute: {raw!r}")
+        return paths
+
+
+class FrameworkPolicy(Contract):
+    """Where framework gaps go: library name -> upstream GitHub repository."""
+
+    upstream: dict[str, str] = Field(default_factory=dict)
+    # Informational only: a foreign factory never marks upstream work ready.
+    proposed_label: str = Field(default="factory:proposed", min_length=1)
+    file_upstream: Literal["on_decision", "auto"] = "on_decision"
+
+    @field_validator("upstream")
+    @classmethod
+    def _repos(cls, mapping):
+        for library, repo in mapping.items():
+            if not library.strip() or not re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo
+            ):
+                raise ValueError(
+                    f"upstream {library!r} needs an owner/name repository"
+                )
+        return mapping
+
+    def repository(self, library: str) -> str:
+        def norm(name):
+            return name.lower().removeprefix("@plutoframework/")
+
+        for name, repo in self.upstream.items():
+            if norm(name) == norm(library):
+                return repo
+        return ""
+
+
+class TriagePolicy(Contract):
+    """Optional receiving-side triage of new issues (off by default).
+
+    Model, provider and reasoning default to the strongest tier like the
+    advisor. ``trusted_authors`` may be auto-accepted, as may repository
+    collaborators with write access; everyone else is capped at NEEDS_HUMAN.
+    """
+
+    enabled: bool = False
+    provider: str = ""
+    model: str = ""
+    reasoning: str = "high"
+    watch_label: str = ""
+    reject_label: str = Field(default="factory:rejected", min_length=1)
+    trusted_authors: list[str] = Field(default_factory=list)
+
+
 class ModelProfile(Contract):
     provider: str = "openai"
     model: str = "gpt-6.1-sol"
@@ -84,7 +175,16 @@ DOMAIN = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$"
 )
 # Variables that would hand a worker a host control channel.
-FORBIDDEN_ENV = {"HC_TERMINAL_SOCKET", "DOCKER_HOST", "SSH_AUTH_SOCK"}
+FORBIDDEN_ENV = {
+    "HC_TERMINAL_SOCKET",
+    "DOCKER_HOST",
+    "SSH_AUTH_SOCK",
+    # Workers never publish: no GitHub credentials may reach them.
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+}
 
 
 class SandboxPolicy(Contract):
@@ -156,6 +256,7 @@ class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     repositories: list[Repository] = Field(min_length=1)
+    tracked_repositories: list[TrackedRepository] = Field(default_factory=list)
     harness: Literal["pi", "claude", "fixture"] = "pi"
     coordinator: Literal["model", "rules"] = "model"
     coordinator_runtime: Literal["pydantic_ai", "claude_agent_sdk"] = (
@@ -166,6 +267,11 @@ class FactoryConfig(Contract):
     api_key_env: str = "OPENAI_API_KEY"
     worker: ModelProfile = Field(default_factory=ModelProfile)
     reviewer: ModelProfile = Field(default_factory=ModelProfile)
+    # Strongest tier by default; set to e.g. "claude-fable-5-2" to override.
+    advisor_model: str = ""
+    advisor: AdvisorPolicy = Field(default_factory=lambda: AdvisorPolicy())
+    framework: FrameworkPolicy = Field(default_factory=FrameworkPolicy)
+    triage: TriagePolicy = Field(default_factory=TriagePolicy)
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"
@@ -193,12 +299,89 @@ class FactoryConfig(Contract):
     # Implementers legitimately run longer; unset falls back to the above.
     implementer_phase_timeout_seconds: int | None = Field(default=None, ge=1)
     command_timeout_seconds: int = Field(default=120, ge=1)
+    # Pull-request tracking: poll cadence and bounded self-healing.
+    pr_poll_seconds: int = Field(default=300, ge=1)
+    pr_max_repairs: int = Field(default=3, ge=0, le=20)
+    pr_max_repairs_total: int = Field(default=6, ge=0, le=100)
     retry_base_seconds: float = Field(default=5, ge=0)
     self_improvement: ImprovementPolicy = Field(
         default_factory=ImprovementPolicy
     )
     debug: DebugPolicy = Field(default_factory=DebugPolicy)
     sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
+
+    @model_validator(mode="after")
+    def _labels_never_ready(self):
+        labels = {
+            self.github_issue_label,
+            self.framework.proposed_label,
+            self.triage.reject_label,
+        }
+        if len(labels) != 3:
+            raise ValueError(
+                "ready, proposed and rejected issue labels must all differ"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _advisor_model(self):
+        if self.advisor_model:
+            if not re.fullmatch(r"[A-Za-z0-9._:/-]+", self.advisor_model):
+                raise ValueError("advisor_model has invalid characters")
+            if self.advisor_provider == "anthropic" and not (
+                self.advisor_model.startswith("claude-")
+            ):
+                raise ValueError(
+                    "advisor_model must be a claude-* model on Anthropic"
+                )
+        return self
+
+    @property
+    def advisor_provider(self) -> str:
+        anthropic = (
+            self.coordinator_runtime == "claude_agent_sdk"
+            or self.harness == "claude"
+        )
+        return "anthropic" if anthropic else "openai"
+
+    def triage_model_name(self) -> str:
+        """Triage model: override, else the provider's strongest default."""
+        if self.triage.model:
+            return self.triage.model
+        saved, self.advisor_model = self.advisor_model, ""
+        try:
+            return self.advisor_model_name()
+        finally:
+            self.advisor_model = saved
+
+    def advisor_model_name(self) -> str:
+        """Configured override, else the provider's strongest default."""
+        if self.advisor_model:
+            return self.advisor_model
+        if self.advisor_provider == "anthropic":
+            return ANTHROPIC_ADVISOR_MODEL
+        prefix, sep, _ = self.coordinator_model.partition(":")
+        return (
+            f"{prefix}:{OPENAI_ADVISOR_MODEL}" if sep else OPENAI_ADVISOR_MODEL
+        )
+
+
+def workable_repositories(config) -> list[Repository]:
+    """Registered repositories plus tracked ones with a local checkout."""
+    extra = [
+        Repository(
+            name=item.name,
+            path=item.local_path,
+            access="write",
+            github=item.repo,
+            checks=item.checks,
+            qa=item.qa,
+        )
+        for item in getattr(config, "tracked_repositories", [])
+        if item.local_path
+    ]
+    known = {repo.name for repo in config.repositories}
+    return [*config.repositories, *(r for r in extra if r.name not in known)]
 
 
 class Finding(Contract):
@@ -248,7 +431,10 @@ class CriterionAssessment(Contract):
 
 class Decision(Contract):
     action: Literal["advance", "revise", "retry", "defer", "complete"]
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(
+        min_length=1,
+        description="Telegraphic, minimal words, bullets over prose.",
+    )
     acceptance: list[CriterionAssessment] = Field(default_factory=list)
 
 

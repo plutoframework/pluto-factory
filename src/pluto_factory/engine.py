@@ -13,19 +13,54 @@ from .acceptance import (
     citable_ids,
     current_evidence,
 )
+from .advisor import Advisor, evidence_packet, fallback_advice, terse
+from .attention import (
+    GAP_RESUME,
+    add_decision,
+    answer_decision,
+    apply_advice,
+    apply_config_change,
+    approved,
+    chosen_option,
+    enqueue_issue_comment,
+    flush_issue_comments,
+    framework_library,
+    get_decision,
+    get_pr,
+    guidance_text,
+    list_decisions,
+    mark_applied,
+    record_framework_gap,
+    set_pr,
+    withdraw_decision,
+)
 from .config import atomic_json, digest, load_config, resolved_bundle
 from .coordinator import Coordinator, CoordinatorError
+from .framework_sources import pins
 from .git import GitFailure, GitWorkspace
 from .github import GitHubFailure
 from .harness import HarnessError, make_harness
 from .improvements import propose
-from .models import Failure, WorkerReport
+from .models import Failure, WorkerReport, workable_repositories
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
+from .pr_tracker import (
+    REPAIR_RULES,
+    REVIEW_CHECKLIST,
+    PRTracker,
+    parse_repair_source,
+)
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
+from .triage import Triager, TriageRunner
+from .upstream import (
+    fixed_guidance,
+    flush_upstream,
+    poll_external,
+    request_upstream,
+)
 
 # Sweeping Core for orphaned worker terminals lists every terminal, so it runs
 # on coordinator start and then at this interval rather than on every tick.
@@ -126,6 +161,14 @@ class Engine:
             from .github_flow import GitHubFlow
 
             self.github = GitHubFlow(self.state, self.config)
+        self.tracker = PRTracker(self)
+        self.advisor = Advisor(self.home, self.config)
+        self.triage = TriageRunner(
+            self.state,
+            self.tracker.adapter,
+            self.config,
+            Triager(self.home, self.config),
+        )
 
     def _ready(self, work):
         if work["phase"] == "completed" or work["control"] in {
@@ -197,7 +240,11 @@ class Engine:
 
     def run(self, once=False, max_seconds=None, watch=None):
         started = time.monotonic()
-        watching = bool(self.github) if watch is None else watch
+        watching = (
+            bool(self.github or self.config.tracked_repositories)
+            if watch is None
+            else watch
+        )
         with self.state.writer():
             self.state.event(
                 "coordinator.started",
@@ -215,6 +262,7 @@ class Engine:
                     break
                 if time.monotonic() - self._reaped_at >= REAP_INTERVAL_SECONDS:
                     self.reap_sessions()
+                self.attention(force=once)
                 if self.github:
                     self.github.poll(force=once)
                 progressed = self.tick()
@@ -259,11 +307,16 @@ class Engine:
         work_id = work["id"]
         data = work["data"]
         phase = work["phase"]
-        if phase in {"qa_checks", "qa"} and self._synchronize(
-            work_id, data, None
+        repair = self._repair_target(work)
+        if (
+            phase in {"qa_checks", "qa"}
+            and not repair
+            and self._synchronize(work_id, data, None)
         ):
             return
-        if phase == "queued":
+        if phase == "queued" and repair:
+            self._prepare_repair(work, repair)
+        elif phase == "queued":
             for name in work["payload"]["repositories"]:
                 repo = self.git.repositories.get(name)
                 if repo is None:
@@ -304,7 +357,7 @@ class Engine:
                 "qa": "qa",
             }[phase]
             notes = None
-            if role == "implementer":
+            if role == "implementer" and not repair:
                 notes = self._synchronize_for_dispatch(work)
                 work = self.state.get_work(work["id"])
                 pending = work["data"].get("conflict_revision")
@@ -329,9 +382,16 @@ class Engine:
             # Persist the snapshot (the factory's merge commit) before
             # synchronizing: a new conflict must not lose it.
             self.state.update_work(work_id, data=data)
+            if repair:
+                # Judged by CI on the PR branch, not rebased; an independent
+                # reviewer must clear it before anything is pushed.
+                self._validate(work_id, "checks", "reviewing")
+                return
             if not self._synchronize(work_id, data, None):
                 self.state.update_work(work_id, data=data)
             self._validate(work_id, "checks", "reviewing")
+        elif phase == "pushing" and repair:
+            self._push_repair(work, repair)
         elif phase == "preparing":
             self._synchronize(work_id, data, "qa_checks")
         elif phase == "qa_checks":
@@ -350,6 +410,339 @@ class Engine:
             )
         else:
             raise ValueError(f"unsupported phase {phase}")
+
+    # -- PR repair, tracking and owner decisions -------------------------
+
+    def _repair_target(self, work):
+        """(slug, number) when this work item repairs a tracked PR."""
+        return parse_repair_source(work["payload"].get("source"))
+
+    def _prepare_repair(self, work, target):
+        slug, number = target
+        work_id = work["id"]
+        data = work["data"]
+        row = get_pr(self.state, slug, number)
+        if row is None or not row["head"]:
+            raise GitFailure("scope.denied", "Repair target is not tracked")
+        name = work["payload"]["repositories"][0]
+        repo = self.git.repositories.get(name)
+        if repo is None or repo.github != slug or not repo.checks:
+            raise GitFailure(
+                "validation.unconfigured",
+                f"Configure a checkout and checks for {slug} before repair",
+            )
+        operation = self.state.begin_operation(
+            work_id, "git.prepare", work["payload"], f"prepare:{work_id}"
+        )
+        entries = self.git.prepare(work_id, [name])
+        entry = entries[0]
+        tip = self.tracker.adapter.fetch_pr_head(
+            entry, slug, row["branch"], number
+        )
+        if tip != row["head"]:
+            self.state.event(
+                "pr.repair_stale",
+                work_id,
+                {"expected": row["head"], "tip": tip},
+            )
+            raise GitFailure(
+                "git.candidate_changed", "PR head moved before repair started"
+            )
+        self.git._git(Path(entry["worktree"]), "reset", "--hard", tip)
+        entry.update(
+            base=tip,
+            candidate=tip,
+            tree=self.git._text(
+                Path(entry["worktree"]), "rev-parse", "HEAD^{tree}"
+            ),
+            pr_branch=row["branch"],
+        )
+        self.git._save(entries)
+        data["workspace_id"] = work_id
+        data["entries"] = entries
+        data["repair"] = {"slug": slug, "number": number, "head": tip}
+        self.state.finish_operation(operation, {"entries": entries})
+        self.state.update_work(
+            work_id,
+            phase="implementing",
+            control="ready",
+            data=data,
+            event="work.prepared",
+        )
+
+    def _push_repair(self, work, target):
+        slug, number = target
+        data = work["data"]
+        entry = data["entries"][0]
+        repair = data["repair"]
+        row = get_pr(self.state, slug, number)
+        if entry["candidate"] == repair["head"]:
+            self._defer(work, "The repair produced no changes to push")
+            if row:
+                set_pr(
+                    self.state,
+                    row,
+                    state="needs_owner",
+                    reason="Repair worker made no changes; needs a human",
+                )
+            return
+        operation = self.state.begin_operation(
+            work["id"], "github.push_repair", {"candidate": entry["candidate"]}
+        )
+        pushed = self.tracker.adapter.push_repair(
+            entry, slug, entry["pr_branch"], repair["head"]
+        )
+        self.state.finish_operation(operation, {"pushed": pushed})
+        if row:
+            set_pr(
+                self.state,
+                row,
+                state="pending",
+                head=pushed,
+                reason="Repair pushed; waiting for checks",
+                failing=[],
+                log_excerpt="",
+            )
+        self.state.update_work(
+            work["id"],
+            phase="completed",
+            control="settled",
+            data=data,
+            event="work.completed",
+            notice={
+                "kind": "completed",
+                "message": f"Repair pushed to {slug}#{number}",
+                "incident_key": f"completed:{work['id']}",
+            },
+        )
+
+    def attention(self, force=False):
+        """Apply answered decisions, then poll tracked pull requests."""
+        self.check_framework_gaps()
+        self.process_decisions()
+        self.advise_pending()
+        self.flush_upstream()
+        self.flush_issue_comments()
+        if self.state.is_paused():
+            return
+        try:
+            self.triage.poll(force=force)
+        except GitHubFailure as error:
+            self.state.event(
+                "triage.poll_failed", "factory", {"code": error.code}
+            )
+        poll_external(
+            self.state,
+            self.tracker.adapter,
+            self.config,
+            self._upstream_fixed,
+            force=force,
+        )
+        try:
+            self.tracker.poll(force=force)
+        except GitHubFailure as error:
+            self.state.event("pr.poll_failed", "factory", {"code": error.code})
+
+    def process_decisions(self):
+        applied = []
+        for decision in list_decisions(self.state, {"answered"}):
+            try:
+                self._apply_decision(decision)
+            except (ValueError, OSError, StateConflict) as error:
+                self.state.event(
+                    "decision.apply_failed",
+                    decision["work_id"] or "factory",
+                    {"id": decision["id"], "error": str(error)[:500]},
+                    f"decision-apply-failed:{decision['id']}:{str(error)[:60]}",
+                )
+                continue
+            applied.append(decision["id"])
+        return applied
+
+    def _apply_decision(self, decision):
+        text = guidance_text(decision)
+        detail = {}
+        proposal = decision["proposal"] or {}
+        if decision["kind"] == "config":
+            if approved(decision):
+                detail["backup"] = apply_config_change(
+                    self.home, proposal["key"], proposal["value"]
+                )
+                self._reload_config()
+                text += (
+                    f". factory.toml updated: {proposal['key']} = "
+                    f"{proposal['value']}"
+                )
+            else:
+                text += ". No configuration change was made."
+        if proposal.get("triage"):
+            self.triage.apply_answer(decision)
+            mark_applied(self.state, decision["id"], detail)
+            return
+        if proposal.get("pr") and decision["answer"].startswith("Grant"):
+            slug, _, number = proposal["pr"].rpartition("#")
+            self.tracker.grant(slug, int(number))
+        option = chosen_option(decision)
+        if framework_library(option):
+            # Parked until the gap decision is answered or the pin moves.
+            gap = record_framework_gap(
+                self.state,
+                decision,
+                option,
+                pins(self.advisor.sources()),
+            )
+            detail["framework_gap"] = gap["id"]
+            request_upstream(self.state, self.config, decision, option)
+            enqueue_issue_comment(self.state, decision, "answered")
+            mark_applied(self.state, decision["id"], detail)
+            return
+        if decision["work_id"]:
+            work = self.state.get_work(decision["work_id"])
+            self.state.add_guidance(decision["work_id"], text, "owner")
+            if work["control"] in {"deferred", "quarantined", "backoff"}:
+                self.state.resume(decision["work_id"])
+        enqueue_issue_comment(self.state, decision, "answered")
+        if proposal.get("external"):
+            with self.state.db:
+                self.state.db.execute(
+                    "UPDATE external_issues SET state='waived' WHERE key=?",
+                    (proposal["external"],),
+                )
+        mark_applied(self.state, decision["id"], detail)
+
+    def _reload_config(self):
+        self.config = load_config(self.home)
+        self.git.config = self.config
+        self.tracker.config = self.config
+        self.advisor.config = self.config
+        self.triage.config = self.config
+        self.triage.triager.config = self.config
+        if hasattr(self.coordinator, "config"):
+            self.coordinator.config = self.config
+
+    def _ask_owner(self, work, reason):
+        """Every deferral a human must resolve becomes a durable decision.
+
+        Filed at once with a deterministic terse headline; the advisor
+        rewrites headline, options and rationale in place on a later tick.
+        Raw block text stays as collapsed evidence.
+        """
+        advice = fallback_advice(reason)
+        add_decision(
+            self.state,
+            work_id=work["id"],
+            kind="free_text",
+            notify=False,  # the deferral already raised action_required
+            question=f"{work['title']}: {terse(reason, 30)}"[:500],
+            context=(
+                f"Work '{work['title']}' ({work['id']}), phase "
+                f"{work['phase']}.\n{reason}"
+            ),
+            options=[
+                {
+                    "label": o.label,
+                    "effect": o.effect,
+                    "tradeoff": o.tradeoff,
+                    "locus": o.locus,
+                    "fix": o.fix,
+                    "description": o.effect,
+                    "recommended": o.recommended,
+                }
+                for o in advice.options
+            ],
+            why=advice.why,
+            advice="pending",
+            block_key=digest({"work": work["id"], "reason": reason})[:24],
+        )
+
+    def check_framework_gaps(self):
+        """A bumped library pin answers its open framework gap."""
+        open_gaps = [
+            d
+            for d in list_decisions(self.state, {"open"})
+            if d["kind"] == "framework_gap" and d["proposal"]
+        ]
+        if not open_gaps:
+            return
+        current = pins(self.advisor.sources())
+        for gap in open_gaps:
+            library, pinned = gap["proposal"]["library"], gap["proposal"]["pin"]
+            now = current.get(library)
+            if now and pinned != "unknown" and now != pinned:
+                answer_decision(
+                    self.state,
+                    gap["id"],
+                    GAP_RESUME,
+                    f"{library} pin bumped {pinned} -> {now}",
+                    via="coordinator",
+                    by="coordinator",
+                )
+
+    def advise_pending(self, limit=2):
+        """Run the advisor on decisions still carrying raw block text."""
+        if self._limited():
+            return 0
+        done = 0
+        rows = self.state.db.execute(
+            "SELECT id FROM decisions WHERE state='open' AND "
+            "advice='pending' ORDER BY created LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            decision = get_decision(self.state, row["id"])
+            packet = evidence_packet(self.state, decision, decision["context"])
+            advice, source = self.advisor.advise(
+                packet, pull_request=decision["work_id"] is None
+            )
+            if apply_advice(self.state, decision["id"], advice, source):
+                done += 1
+                self._auto_upstream(get_decision(self.state, decision["id"]))
+        return done
+
+    def _auto_upstream(self, decision):
+        """Under file_upstream=auto, a framework-locus recommendation files."""
+        if self.config.framework.file_upstream != "auto":
+            return
+        option = next(
+            (o for o in decision["options"] if o["recommended"]), None
+        )
+        if framework_library(option):
+            request_upstream(self.state, self.config, decision, option)
+
+    def flush_upstream(self):
+        try:
+            return flush_upstream(self.state, self.tracker.adapter, self.config)
+        except GitHubFailure as error:
+            self.state.event("upstream.failed", "factory", {"code": error.code})
+            return 0
+
+    def _upstream_fixed(self, work_id, slug, number, closing):
+        """An upstream issue closed as completed: resume the parked work."""
+        for gap in list_decisions(self.state, {"open"}):
+            if gap["kind"] == "framework_gap" and gap["work_id"] == work_id:
+                withdraw_decision(self.state, gap["id"])
+        work = self.state.get_work(work_id)
+        self.state.add_guidance(
+            work_id, fixed_guidance(slug, number, closing), "coordinator"
+        )
+        if work["control"] in {"deferred", "quarantined", "backoff"}:
+            self.state.resume(work_id)
+
+    def flush_issue_comments(self):
+        allowed = {
+            repo.github
+            for repo in workable_repositories(self.config)
+            if repo.github
+        }
+        try:
+            return flush_issue_comments(
+                self.state, self.tracker.adapter, allowed
+            )
+        except GitHubFailure as error:
+            self.state.event(
+                "issue_comment.failed", "factory", {"code": error.code}
+            )
+            return 0
 
     def _resync_pull_requests(self, work, stale):
         """Bring a published candidate up to date with the default branch.
@@ -642,6 +1035,7 @@ class Engine:
             "prior_reports": work["data"].get("reports", {}),
             "pull_requests": work["data"].get("pull_requests", []),
             "revision_reason": work["data"].get("revision_reason"),
+            "pr_repair": self._repair_packet(work, role),
             "conflict_revision": work["data"].get("conflict_revision"),
             "evidence": bound_evidence(
                 [json.loads(row["data"]) for row in evidence]
@@ -656,6 +1050,30 @@ class Engine:
         atomic_json(Path(assignment["assignment_path"]), run["assignment"])
         self.tracer.provenance(work, run)
         self._launch(run)
+
+    def _repair_packet(self, work, role="implementer"):
+        target = self._repair_target(work)
+        row = get_pr(self.state, *target) if target else None
+        if row is None:
+            return None
+        return {
+            "pull_request": f"{row['slug']}#{row['number']}",
+            "branch": row["branch"],
+            "head": row["head"],
+            "failing_checks": row["failing"],
+            "log_excerpt": row["log_excerpt"],
+            "rules": REPAIR_RULES,
+            **(
+                {"review_checklist": REVIEW_CHECKLIST}
+                if role == "reviewer"
+                else {}
+            ),
+            "guidance": (
+                "Your worktree is the PR branch at its failing head. Fix "
+                "it in place; the factory commits, validates and pushes to "
+                "the same branch. Do not rebase or merge the default branch."
+            ),
+        }
 
     def _guidance(self, work_id):
         entries = self.state.guidance(work_id)
@@ -923,13 +1341,19 @@ class Engine:
         if evaluation == "handoff":
             next_phase = {
                 "implementing": "checking",
-                "reviewing": "preparing",
+                "reviewing": "pushing"
+                if self._repair_target(work)
+                else "preparing",
                 "qa": "integrating",
             }[work["phase"]]
             advance_meanings = {
                 "checking": (
                     "Snapshot the implementation and execute independent "
                     "checks; this grants neither integration nor completion."
+                ),
+                "pushing": (
+                    "Push the reviewed repair to the PR branch; CI then "
+                    "judges it."
                 ),
                 "preparing": (
                     "Synchronize the reviewed candidate and run required QA; "
@@ -1129,14 +1553,18 @@ class Engine:
         work = self.state.update_work(work["id"], current_run=None, data=data)
         if not keep:
             self._close_session(work["id"], run, "completed")
+        repair = self._repair_target(work)
         if action in {"revise", "retry"}:
-            self._revise(work, rationale)
+            if repair and run["role"] == "reviewer":
+                self._repair_rejected(work, repair, rationale)
+            else:
+                self._revise(work, rationale)
         elif action == "defer":
             self._defer(work, rationale)
         else:
             phase = {
                 "implementer": "checking",
-                "reviewer": "preparing",
+                "reviewer": "pushing" if repair else "preparing",
                 "qa": "integrating",
             }[run["role"]]
             self.state.update_work(
@@ -1351,6 +1779,18 @@ class Engine:
                 },
             )
 
+    def _repair_rejected(self, work, target, reason):
+        """Review rejection spends repair budget; exhaustion escalates."""
+        if self.tracker.reject_repair(*target, reason):
+            self._revise(work, f"Review rejected the repair: {reason}")
+            return
+        self.state.update_work(
+            work["id"],
+            phase="completed",
+            control="settled",
+            event="work.repair_abandoned",
+        )
+
     def _revise(self, work, reason):
         if work["revisions"] >= self.config.max_revisions:
             self._defer(work, "Revision budget exhausted: " + reason)
@@ -1386,6 +1826,7 @@ class Engine:
                 ),
             },
         )
+        self._ask_owner(work, reason)
 
     def _failure(self, work_id, failure):
         work = self.state.get_work(work_id)
@@ -1510,6 +1951,9 @@ class Engine:
                         "message": "Worker termination is unconfirmed; preserved worktree",
                         "incident_key": f"quarantine:{run_id}",
                     },
+                )
+                self._ask_owner(
+                    work, "Worker termination is unconfirmed; worktree kept"
                 )
                 self.state.event(
                     "recovery.action_failed", work_id, error.failure

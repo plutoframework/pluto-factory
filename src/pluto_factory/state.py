@@ -9,6 +9,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from .attention import TrackingRequired, ensure_schema, ensure_tracked
 from .dependencies import (
     canonical_existing,
     validate_graph,
@@ -32,6 +33,9 @@ def encode(value) -> str:
 
 # Seconds between worker.observed events for an unchanged observation.
 OBSERVATION_HEARTBEAT = 60.0
+
+
+DELIVERY_PHASES = {"awaiting_merge", "completed"}
 
 
 class StateConflict(RuntimeError):
@@ -112,6 +116,7 @@ class State:
             );
             PRAGMA user_version = 1;
         """)
+        ensure_schema(self.db)
         for folder in (
             "assignments",
             "artifacts",
@@ -272,7 +277,9 @@ class State:
                 if row:
                     existing = self.get_work(row["id"])
                     existing_payload = self._normalize_submission(
-                        Submission.model_validate(existing["payload"])
+                        Submission.model_validate(
+                            self.original_payload(existing)
+                        )
                     ).model_dump()
                     if existing_payload != submission.model_dump():
                         raise ValueError(
@@ -306,7 +313,58 @@ class State:
 
     def dependency_status(self, work_id: str) -> dict:
         """Resolve durable symbolic prerequisites without assuming intake order."""
-        return graph_dependency_status(self.list_work(), work_id)
+        return graph_dependency_status(
+            self.list_work(), work_id, self.satisfied_external()
+        )
+
+    def satisfied_external(self) -> frozenset:
+        """External issue keys that are closed-as-completed or waived."""
+        return frozenset(
+            row[0]
+            for row in self.db.execute(
+                "SELECT key FROM external_issues "
+                "WHERE state IN ('completed','waived')"
+            )
+        )
+
+    def original_payload(self, work: dict) -> dict:
+        """The accepted submission without factory-added upstream deps."""
+        payload = dict(work["payload"])
+        added = set(work["data"].get("upstream_dependencies", []))
+        payload["depends_on_sources"] = [
+            key
+            for key in payload.get("depends_on_sources", [])
+            if key not in added
+        ]
+        return payload
+
+    def add_dependency_source(self, work_id: str, key: str) -> bool:
+        """Make a work item wait for an external issue (e.g. upstream)."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            work = self.get_work(work_id)
+            payload = work["payload"]
+            if key in payload.get("depends_on_sources", []):
+                return False
+            payload["depends_on_sources"] = [
+                *payload.get("depends_on_sources", []),
+                key,
+            ]
+            data = work["data"]
+            data["upstream_dependencies"] = [
+                *data.get("upstream_dependencies", []),
+                key,
+            ]
+            self.db.execute(
+                "UPDATE work SET payload=?,data=?,updated=? WHERE id=?",
+                (encode(payload), encode(data), time.time(), work_id),
+            )
+            self._event(
+                "dependency.added",
+                work_id,
+                {"source": key, "origin": "upstream"},
+            )
+        return True
 
     def get_work(self, work_id: str) -> dict:
         row = self.db.execute(
@@ -345,6 +403,8 @@ class State:
             current = self.get_work(work_id)
             if current["control"] == "paused" or self.is_paused():
                 raise StateConflict("factory or work item is paused")
+            if values.get("phase") in DELIVERY_PHASES:
+                self._require_tracking(current, values)
             self.db.execute(
                 f"UPDATE work SET {query} WHERE id=?",
                 (*stored.values(), work_id),
@@ -353,6 +413,21 @@ class State:
             if notice:
                 self._notify(work_id, **notice)
         return self.get_work(work_id)
+
+    def _require_tracking(self, current, values):
+        """Delivery never advances without a tracker row for each PR."""
+        data = values.get("data", current["data"])
+        pull_requests = data.get("pull_requests") or []
+        if values["phase"] == "awaiting_merge" and not pull_requests:
+            from .config import load_config
+
+            try:
+                github = load_config(self.home).integration == "github"
+            except (OSError, ValueError):
+                github = False
+            if github:
+                raise TrackingRequired("awaiting_merge requires tracked PRs")
+        ensure_tracked(self, pull_requests)
 
     def list_work(self) -> list[dict]:
         rows = self.db.execute(

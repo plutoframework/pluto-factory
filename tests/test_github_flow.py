@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from pluto_factory.attention import track_pr
 from pluto_factory.config import digest, resolved_bundle, write_config
 from pluto_factory.engine import Engine
 from pluto_factory.github_flow import GitHubFlow
@@ -60,8 +61,14 @@ def test_publication_waits_for_merge_and_changed_head_cannot_complete(tmp_path):
     work = merged_work(state, config)
     flow = GitHubFlow(state, config)
     prs = [
-        {"url": "https://github.com/owner/core/pull/1", "head_changed": False}
+        {
+            "slug": "owner/core",
+            "number": 1,
+            "url": "https://github.com/owner/core/pull/1",
+            "head_changed": False,
+        }
     ]
+    track_pr(state, "owner/core", 1, origin="factory")
     flow.adapter = SimpleNamespace(publish=lambda _work, _entries: prs)
     flow.publish(work, work["data"]["entries"], [])
     current = state.get_work(work["id"])
@@ -134,6 +141,8 @@ def merged_work(state, config, *, count=1, incomplete=False):
         for index, (entry, repo) in enumerate(zip(entries, config.repositories))
         if repo.access == "write"
     ]
+    for pr in prs:
+        track_pr(state, pr["slug"], pr["number"], origin="factory")
     return state.update_work(
         work["id"],
         phase="awaiting_merge",

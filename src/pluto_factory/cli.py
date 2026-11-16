@@ -228,6 +228,41 @@ def parser() -> argparse.ArgumentParser:
                 help="Deliver configured outbound notifications",
             )
 
+    decisions = commands.add_parser(
+        "decisions", help="List, show, answer or file owner decisions"
+    )
+    _common(decisions)
+    decisions.add_argument(
+        "operation", choices=["list", "show", "answer", "add"], nargs="?"
+    )
+    decisions.add_argument("id", nargs="?")
+    decisions.add_argument("--state", action="append", default=[])
+    decisions.add_argument("--answer")
+    decisions.add_argument("--note", default="")
+    decisions.add_argument("--question")
+    decisions.add_argument("--context", default="")
+    decisions.add_argument("--work", help="Work item the decision blocks")
+    decisions.add_argument(
+        "--kind", choices=["choice", "free_text", "config"], default=None
+    )
+    decisions.add_argument(
+        "--option",
+        action="append",
+        default=[],
+        help="Option as 'label' or 'label=description' (repeatable)",
+    )
+    decisions.add_argument("--recommended", help="Label of the default option")
+    decisions.add_argument("--config-key", help="factory.toml key to change")
+    decisions.add_argument("--config-value", help="Proposed numeric value")
+
+    prs = commands.add_parser("prs", help="List or manage tracked PRs")
+    _common(prs)
+    prs.add_argument(
+        "operation", choices=["list", "track", "untrack"], nargs="?"
+    )
+    prs.add_argument("target", nargs="?", help="owner/name#N")
+    prs.add_argument("--state", action="append", default=[])
+
     trace = commands.add_parser(
         "trace", help="Show the debug trace for a work item"
     )
@@ -1198,6 +1233,14 @@ def execute(args: argparse.Namespace) -> dict:
             if args.operation == "activate":
                 return activate(state, config, args.id)
             return rollback(state, args.id)
+        finally:
+            state.close()
+    if args.command in {"decisions", "prs"}:
+        from .cli_attention import run
+
+        state = State(home)
+        try:
+            return run(state, args)
         finally:
             state.close()
     if args.command in {"submit", "inspect"} or (

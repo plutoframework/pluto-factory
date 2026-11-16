@@ -1,7 +1,6 @@
 """GitHub intake and PR waiting are independent of worker execution."""
 
 import copy
-import json
 import time
 
 from .acceptance import acceptance_intent, citable_ids, current_evidence
@@ -20,6 +19,7 @@ class GitHubFlow:
         self.state = state
         self.config = config
         self.adapter = GitHubAdapter(state.home, config)
+        self.adapter._state = state
 
     def poll(self, *, force=False):
         row = self.state.db.execute(
@@ -67,14 +67,14 @@ class GitHubFlow:
 
     def _observe_change(self, existing, submission):
         """Record each distinct edited issue state once; scope stays frozen."""
+        work = self.state.get_work(existing["id"])
         accepted = Submission.model_validate(
-            json.loads(existing["payload"])
+            self.state.original_payload(work)
         ).model_dump()
         observed = submission.model_dump()
         if accepted == observed:
             return
         observed_digest = digest(observed)
-        work = self.state.get_work(existing["id"])
         data = work["data"]
         if data.get("observed_issue_digest") == observed_digest:
             return
@@ -191,8 +191,22 @@ class GitHubFlow:
             return
         status = result["state"]
         if status == "changes_requested":
+            reviewed = any(
+                pr.get("review_decision") == "CHANGES_REQUESTED"
+                for pr in result["pull_requests"]
+            )
+            if not reviewed:
+                # Failing checks only: the PR tracker owns CI repair (bounded
+                # per head SHA, with the failure log) and revises this work.
+                self.state.update_work(
+                    work["id"],
+                    data=data,
+                    control="backoff",
+                    wake_at=time.time() + self.config.github_poll_seconds,
+                )
+                return
             work = self.state.update_work(work["id"], data=data)
-            revise(work, "GitHub review or checks require changes")
+            revise(work, "GitHub review requires changes")
             return
         if status == "closed":
             defer(work, "A required pull request was closed without merging")

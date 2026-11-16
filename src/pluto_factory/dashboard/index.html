@@ -50,6 +50,17 @@
         <div id="notice" class="notice" role="status" hidden></div>
         <div id="factory-state" class="factory-state" hidden></div>
 
+        <section id="needs-you" class="needs-surface" aria-labelledby="needs-heading" hidden>
+          <div class="section-topline">
+            <h2 id="needs-heading">Needs you <span id="needs-count" class="needs-count"></span></h2>
+            <span class="muted">Across all factories</span>
+          </div>
+          <div class="needs-grid">
+            <div><h3>Pull requests</h3><ul id="needs-prs" class="needs-list"></ul></div>
+            <div><h3>Decisions</h3><div id="needs-decisions" class="needs-list"></div></div>
+          </div>
+        </section>
+
         <section class="pipeline-surface" aria-labelledby="pipeline-heading">
           <div class="section-topline">
             <h2 id="pipeline-heading">Work in orbit</h2>
