@@ -31,6 +31,7 @@ from .models import (
     Repository,
     Submission,
 )
+from .tailnet import unwind_on_termination
 
 
 def _common(parser: argparse.ArgumentParser, *, root: bool = False) -> None:
@@ -1295,7 +1296,8 @@ def main(argv: list[str] | None = None) -> int:
         if argument.startswith("--")
     }
     try:
-        result = execute(args)
+        with unwind_on_termination():
+            result = execute(args)
         if args.command == "open" and not args.json:
             from .visibility import render_open
 

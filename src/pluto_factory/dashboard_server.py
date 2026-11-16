@@ -19,7 +19,12 @@ from urllib.parse import urlsplit
 
 from .attention import AttentionError, DecisionConflict
 from .dashboard_data import DashboardData
-from .tailnet import TailnetAccess, TailnetProxy, discover
+from .tailnet import (
+    TailnetAccess,
+    TailnetProxy,
+    discover,
+    unwind_on_termination,
+)
 from .visibility import VisibilityError
 
 STATIC = {
@@ -352,12 +357,15 @@ def serve(
         discover(tailscale_port, tailscale_allow or []) if tailscale else None
     )
     data = DashboardData(root, extra_home)
-    with DashboardServer(data, port, tailnet=access) as server:
+    with (
+        unwind_on_termination(),
+        DashboardServer(data, port, tailnet=access) as server,
+    ):
         proxy = None
-        if access:
-            proxy = TailnetProxy(access, server.server_address[1])
-            proxy.start()
         try:
+            if access:
+                proxy = TailnetProxy(access, server.server_address[1])
+                proxy.start()
             print(
                 f"Factory dashboard: http://127.0.0.1:{server.server_address[1]}",
                 file=sys.stderr,

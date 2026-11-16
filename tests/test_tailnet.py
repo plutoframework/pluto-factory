@@ -1,8 +1,10 @@
 import http.client
 import json
 import subprocess
+import sys
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -182,3 +184,116 @@ def test_cross_site_link_opens_page_but_not_data(tmp_path):
             assert status_of(live, [*host, *link], "/api/state") == 403
             assert status_of(live, [*host, *fetch], "/api/state") == 403
             assert status_of(live, [*host, *fetch], "/") == 403
+
+
+# --- shutdown ----------------------------------------------------------------
+
+
+def free_port():
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_sigterm_unwinds_serve_and_stops_the_proxy(tmp_path, monkeypatch):
+    import os
+    import signal
+    import threading
+
+    from pluto_factory import dashboard_server
+
+    stopped = []
+
+    class Proxy:
+        def __init__(self, access, port):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setattr(dashboard_server, "TailnetProxy", Proxy)
+    monkeypatch.setattr(
+        dashboard_server,
+        "discover",
+        lambda port, allow: TailnetAccess("n.ts.net", 443, frozenset({"a"})),
+    )
+    threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM)).start()
+    before = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt):
+        dashboard_server.serve(tmp_path, port=free_port(), tailscale=True)
+    assert stopped == [True]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_proxy_start_failure_still_stops_via_finally(tmp_path, monkeypatch):
+    from pluto_factory import dashboard_server
+
+    stopped = []
+
+    class Proxy:
+        def __init__(self, access, port):
+            pass
+
+        def start(self):
+            raise TailnetError("boom")
+
+        def stop(self):
+            stopped.append(True)
+
+    monkeypatch.setattr(dashboard_server, "TailnetProxy", Proxy)
+    monkeypatch.setattr(
+        dashboard_server,
+        "discover",
+        lambda port, allow: TailnetAccess("n.ts.net", 443, frozenset({"a"})),
+    )
+    with pytest.raises(TailnetError):
+        dashboard_server.serve(tmp_path, port=free_port(), tailscale=True)
+    assert stopped == [True]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux"
+)
+def test_proxy_child_dies_when_parent_is_killed(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import textwrap
+    import time
+
+    script = tmp_path / "parent.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import subprocess, sys
+            from pluto_factory.tailnet import die_with_parent
+            child = subprocess.Popen(
+                ["sleep", "60"], preexec_fn=die_with_parent
+            )
+            print(child.pid, flush=True)
+            import time; time.sleep(60)
+            """
+        )
+    )
+    parent = subprocess.Popen(
+        [sys.executable, str(script)], stdout=subprocess.PIPE, text=True
+    )
+    child = int(parent.stdout.readline())
+    os.kill(parent.pid, signal.SIGKILL)
+    parent.wait()
+    for _ in range(50):
+        try:
+            stat = Path(f"/proc/{child}/stat").read_text()
+            if stat.split(") ")[-1][:1] == "Z":
+                break
+        except FileNotFoundError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, signal.SIGKILL)
+        raise AssertionError("child survived its parent")

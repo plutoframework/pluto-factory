@@ -7,10 +7,14 @@ dashboard accepts proxied requests only for this node's tailnet name and only
 from allowed tailnet logins (``Tailscale-User-Login``).
 """
 
+import contextlib
+import ctypes
 import json
 import queue
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 
@@ -92,6 +96,49 @@ def discover(https_port: int, allow: list[str]) -> TailnetAccess:
     return TailnetAccess(dns_name, https_port, frozenset(logins))
 
 
+PR_SET_PDEATHSIG = 1
+
+
+def die_with_parent():
+    """preexec_fn: the kernel SIGTERMs this child if the parent dies (Linux).
+
+    Covers SIGKILL and crashes, where no handler or ``finally`` can run.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def unwind_on_termination():
+    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so ``finally`` blocks run.
+
+    A no-op off the main thread, where handlers cannot be installed.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    names = ("SIGTERM", "SIGHUP")
+    previous = {}
+    for name in names:
+        number = getattr(signal, name, None)
+        if number is not None:
+            previous[number] = signal.signal(number, handler)
+    try:
+        yield
+    finally:
+        for number, old in previous.items():
+            signal.signal(number, old)
+
+
 class TailnetProxy:
     """Foreground ``tailscale serve``; stopping it removes the exposure."""
 
@@ -111,6 +158,8 @@ class TailnetProxy:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            # Started before the server spawns threads; prctl is async-safe.
+            preexec_fn=die_with_parent,  # noqa: PLW1509
         )
         lines: queue.Queue = queue.Queue()
 
