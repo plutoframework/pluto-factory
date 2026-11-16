@@ -10,6 +10,7 @@ is used, so a blocked item is never left without a decision.
 import json
 import re
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -153,7 +154,37 @@ class AdviceOption(Contract):
         return _capped(value, TRADEOFF_WORDS, "option tradeoff")
 
 
+AUTO_CATEGORIES = (
+    "upstream_issue",
+    "resume_after_fix",
+    "app_fix",
+    "config_change",
+)
+OWNER_CATEGORIES = (
+    "security",
+    "credentials_spend",
+    "acceptance_scope",
+    "public_release",
+    "product_ux",
+    "other",
+)
+Category = Literal[AUTO_CATEGORIES + OWNER_CATEGORIES]  # type: ignore[valid-type]
+
+
+class ConfigChange(Contract):
+    key: str
+    value: float
+
+
 class Advice(Contract):
+    # Autonomy: the model proposes, deterministic policy decides. Owner-only
+    # categories can never auto-apply whatever the model claims.
+    category: Category = "other"
+    autonomy: Literal["auto", "owner"] = "owner"
+    autonomy_reason: str = ""
+    confidence: Literal["high", "medium", "low"] = "low"
+    reversible: bool = False
+    config_change: ConfigChange | None = None
     problem: str
     details: list[str] = Field(default_factory=list, max_length=6)
     options: list[AdviceOption] = Field(min_length=2, max_length=4)
@@ -168,6 +199,27 @@ class Advice(Contract):
     @classmethod
     def _details(cls, values):
         return [_capped(v, DETAIL_WORDS, "detail bullet") for v in values]
+
+    @field_validator("autonomy_reason")
+    @classmethod
+    def _autonomy_reason(cls, value):
+        value = " ".join(value.split())
+        if words(value) > WHY_WORDS:
+            raise ValueError(f"autonomy_reason cap is {WHY_WORDS} words")
+        return value
+
+    @model_validator(mode="after")
+    def _autonomy_consistent(self):
+        if self.autonomy == "auto" and not self.autonomy_reason:
+            raise ValueError("autonomy 'auto' needs an autonomy_reason")
+        if (self.category == "config_change") != (
+            self.config_change is not None
+        ):
+            raise ValueError(
+                "config_change is required for (and only for) the "
+                "config_change category"
+            )
+        return self
 
     @field_validator("why")
     @classmethod

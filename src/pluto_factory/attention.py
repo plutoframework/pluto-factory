@@ -126,6 +126,7 @@ DECISION_COLUMNS = {
     "block_key": "TEXT",
     "answered_by": "TEXT",
     "custom": "INTEGER NOT NULL DEFAULT 0",
+    "auto": "TEXT",
 }
 
 
@@ -160,6 +161,7 @@ def _decision(row):
         json.loads(result["proposal"]) if result["proposal"] else None
     )
     result["details"] = json.loads(result.get("details") or "[]")
+    result["auto"] = json.loads(result["auto"]) if result.get("auto") else None
     return result
 
 
@@ -271,7 +273,7 @@ def add_decision(
         existing = state.db.execute(
             "SELECT * FROM decisions WHERE work_id IS ? AND "
             "(question=? OR (block_key IS NOT NULL AND block_key=?)) "
-            "AND state IN ('open','answered')",
+            "AND state IN ('open','answered','auto_pending')",
             (work_id, question, block_key),
         ).fetchone()
         if existing:
@@ -343,8 +345,22 @@ def answer_decision(state, decision_id, answer, note="", via="cli", by="owner"):
     with state.db:
         state.db.execute("BEGIN IMMEDIATE")
         decision = get_decision(state, decision_id)
-        if decision["state"] != "open":
+        auto = decision.get("auto") or {}
+        if (
+            decision["state"] == "applied"
+            and auto.get("status") == "applied"
+            and by != AUTO_BY
+        ):
+            return _override_applied(state, decision, answer, note, by)
+        if decision["state"] not in {"open", "auto_pending"}:
             raise DecisionConflict(f"decision is already {decision['state']}")
+        if decision["state"] == "auto_pending" and by != AUTO_BY:
+            # Owner answered inside the grace window: their answer wins.
+            auto["status"] = "overridden"
+            state.db.execute(
+                "UPDATE decisions SET auto=? WHERE id=?",
+                (json.dumps(auto), decision_id),
+            )
         labels = [option["label"] for option in decision["options"]]
         # Config changes stay options-only; every other kind takes free text.
         if decision["kind"] == "config" and answer not in labels:
@@ -374,6 +390,149 @@ def answer_decision(state, decision_id, answer, note="", via="cli", by="owner"):
             },
         )
     return get_decision(state, decision_id)
+
+
+AUTO_BY = "advisor (auto)"
+
+
+def _override_applied(state, decision, answer, note, by):
+    """Owner overrides an automatic decision that already took effect."""
+    auto = {**decision["auto"], "status": "overridden"}
+    text = (
+        f"Owner override of automatic decision '{decision['question']}': "
+        + (answer + (f". Note: {note}" if note else ""))
+    )
+    with state.db:
+        state.db.execute(
+            "UPDATE decisions SET auto=?,answer=?,note=?,custom=1,"
+            "answered_by=? WHERE id=?",
+            (
+                json.dumps(auto),
+                answer,
+                note,
+                _clip(by, 200) or "owner",
+                decision["id"],
+            ),
+        )
+        state._event(
+            "decision.overridden",
+            decision["work_id"] or "factory",
+            {"id": decision["id"], "answer": answer[:200]},
+        )
+    if decision["work_id"]:
+        work = state.get_work(decision["work_id"])
+        state.add_guidance(decision["work_id"], text, "owner")
+        if work["control"] in {"deferred", "quarantined", "backoff"}:
+            state.resume(decision["work_id"])
+    return get_decision(state, decision["id"])
+
+
+def auto_verdict(policy, advice, option_of=None, packet=None):
+    """Deterministic gate: (ok, why-not). The model never overrides it."""
+    from .advisor import AUTO_CATEGORIES
+
+    if policy.mode != "auto_obvious":
+        return False, "autonomy mode is ask_all"
+    if advice.autonomy != "auto":
+        return False, "advisor asked the owner"
+    if advice.category not in AUTO_CATEGORIES:
+        return False, f"category {advice.category} is owner-only"
+    if advice.confidence != "high":
+        return False, "confidence below high"
+    if not advice.reversible:
+        return False, "not reversible"
+    chosen = [o for o in advice.options if o.recommended]
+    if len(chosen) != 1:
+        return False, "no single recommended option"
+    option = chosen[0]
+    framework = option.locus.startswith("framework:")
+    if advice.category == "upstream_issue" and not framework:
+        return False, "upstream category needs a framework option"
+    if advice.category in {"app_fix", "config_change"} and framework:
+        return False, "category conflicts with a framework option"
+    if advice.category == "resume_after_fix" and not (packet or {}).get(
+        "fix_verified"
+    ):
+        return False, "framework fix is not verified by the factory"
+    if advice.category == "config_change":
+        change = advice.config_change
+        bound = policy.max_config.get(change.key)
+        if (
+            change.key not in CONFIG_KEYS
+            or bound is None
+            or change.value < 0
+            or change.value > bound
+        ):
+            return False, "config change outside max_config"
+    return True, ""
+
+
+def set_auto_pending(state, decision_id, advice, grace_seconds):
+    """Hold the advisor's recommended answer for the grace window."""
+    option = next(o for o in advice.options if o.recommended)
+    answer = option.label
+    kind, proposal, options = None, None, None
+    if advice.category == "config_change":
+        change = advice.config_change
+        proposal = validate_proposal({"key": change.key, "value": change.value})
+        kind, answer = "config", "Apply"
+        options = normalize_options(
+            [{"label": "Apply", "recommended": True}, {"label": "Decline"}]
+        )
+    auto = {
+        "category": advice.category,
+        "reason": advice.autonomy_reason,
+        "confidence": advice.confidence,
+        "answer": answer,
+        "apply_at": time.time() + grace_seconds,
+        "status": "pending",
+    }
+    with state.db:
+        if kind:
+            state.db.execute(
+                "UPDATE decisions SET kind=?,proposal=?,options=? WHERE id=?",
+                (kind, json.dumps(proposal), json.dumps(options), decision_id),
+            )
+        state.db.execute(
+            "UPDATE decisions SET state='auto_pending',auto=? "
+            "WHERE id=? AND state='open'",
+            (json.dumps(auto), decision_id),
+        )
+        state._event(
+            "decision.auto_pending",
+            get_decision(state, decision_id)["work_id"] or "factory",
+            {"id": decision_id, "category": advice.category, "answer": answer},
+        )
+    decision = get_decision(state, decision_id)
+    enqueue_issue_comment(state, decision, "auto")
+    return decision
+
+
+def apply_due_autos(state, now=None):
+    """Answer automatic decisions whose grace window has expired."""
+    now = time.time() if now is None else now
+    done = []
+    for decision in list_decisions(state, {"auto_pending"}):
+        auto = decision["auto"] or {}
+        if auto.get("apply_at", 0) > now:
+            continue
+        auto["status"] = "applied"
+        with state.db:
+            state.db.execute(
+                "UPDATE decisions SET state='open',auto=? WHERE id=? "
+                "AND state='auto_pending'",
+                (json.dumps(auto), decision["id"]),
+            )
+        answer_decision(
+            state,
+            decision["id"],
+            auto["answer"],
+            "",
+            via="auto",
+            by=AUTO_BY,
+        )
+        done.append(decision["id"])
+    return done
 
 
 def withdraw_decision(state, decision_id):
@@ -773,7 +932,7 @@ def read_attention(connection):
             _decision(row)
             for row in connection.execute(
                 "SELECT * FROM decisions WHERE state IN "
-                "('open','answered') OR (state='applied' AND applied_at>?) "
+                "('open','answered','auto_pending') OR (state='applied' AND applied_at>?) "
                 "ORDER BY created LIMIT 200",
                 (time.time() - 86400,),
             )
@@ -793,7 +952,7 @@ def read_attention(connection):
     return {"decisions": decisions, "pull_requests": prs}
 
 
-def apply_advice(state, decision_id, advice, source):
+def apply_advice(state, decision_id, advice, source, announce=True):
     """Replace a pending decision's headline/options with advisor output."""
     options = normalize_options(
         [
@@ -835,7 +994,7 @@ def apply_advice(state, decision_id, advice, source):
                 get_decision(state, decision_id)["work_id"] or "factory",
                 {"id": decision_id, "source": source},
             )
-    if changed:
+    if changed and announce:
         enqueue_issue_comment(
             state, get_decision(state, decision_id), "created"
         )
@@ -897,6 +1056,14 @@ def comment_body(decision, kind, extra=None):
         )
         lines.append(
             "Work stays parked until it closes; the factory resumes it then."
+        )
+    elif kind == "auto":
+        auto = decision.get("auto") or {}
+        lines.append(f"**Decided automatically:** {decision['question']}")
+        lines.append(f"- Answer: {auto.get('answer', '')}")
+        lines.append(f"- Reason: {auto.get('reason', '')}")
+        lines.append(
+            "- Applies after a grace period unless the owner overrides it."
         )
     elif kind == "created":
         lines.append(f"**Owner decision needed:** {decision['question']}")

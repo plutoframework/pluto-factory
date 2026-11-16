@@ -267,6 +267,17 @@ def _project_decision(decision, factory_id, name):
         "answer": text(decision["answer"], 500),
         "custom": bool(decision.get("custom")),
         "advice": decision.get("advice", "none"),
+        "auto": (
+            {
+                "category": text(decision["auto"].get("category"), 100),
+                "reason": text(decision["auto"].get("reason"), 300),
+                "answer": text(decision["auto"].get("answer"), 200),
+                "status": text(decision["auto"].get("status"), 20),
+                "apply_at": decision["auto"].get("apply_at"),
+            }
+            if decision.get("auto")
+            else None
+        ),
         "created": decision["created"],
         "age": max(0, now - decision["created"]),
     }
@@ -277,7 +288,8 @@ def _work_decision(owner, work_id, factory_id, name):
     rows = [
         d
         for d in owner["decisions"]
-        if d["work_id"] == work_id and d["state"] in {"open", "answered"}
+        if d["work_id"] == work_id
+        and d["state"] in {"open", "answered", "auto_pending"}
     ]
     return _project_decision(rows[-1], factory_id, name) if rows else None
 

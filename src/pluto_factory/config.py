@@ -96,6 +96,7 @@ BUNDLE_EXCLUDED = {
     "advisor",
     "triage",
     "framework",
+    "autonomy",
     "advisor_model",
     "tracked_repositories",
     "pr_poll_seconds",
@@ -206,6 +207,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "advisor",
             "framework",
             "triage",
+            "autonomy",
             "worker",
             "reviewer",
             "qa_model",
@@ -229,6 +231,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "advisor",
         "framework",
         "triage",
+        "autonomy",
     ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():

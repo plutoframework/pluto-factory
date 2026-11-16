@@ -20,7 +20,9 @@ from .attention import (
     answer_decision,
     apply_advice,
     apply_config_change,
+    apply_due_autos,
     approved,
+    auto_verdict,
     chosen_option,
     enqueue_issue_comment,
     flush_issue_comments,
@@ -31,6 +33,7 @@ from .attention import (
     list_decisions,
     mark_applied,
     record_framework_gap,
+    set_auto_pending,
     set_pr,
     withdraw_decision,
 )
@@ -520,6 +523,7 @@ class Engine:
     def attention(self, force=False):
         """Apply answered decisions, then poll tracked pull requests."""
         self.check_framework_gaps()
+        apply_due_autos(self.state)
         self.process_decisions()
         self.advise_pending()
         self.flush_upstream()
@@ -703,8 +707,23 @@ class Engine:
             advice, source = self.advisor.advise(
                 packet, pull_request=decision["work_id"] is None
             )
-            if apply_advice(self.state, decision["id"], advice, source):
+            ok, _why = (
+                auto_verdict(self.config.autonomy, advice, packet=packet)
+                if source == "model"
+                else (False, "fallback advice")
+            )
+            if apply_advice(
+                self.state, decision["id"], advice, source, announce=not ok
+            ):
                 done += 1
+                if ok:
+                    set_auto_pending(
+                        self.state,
+                        decision["id"],
+                        advice,
+                        self.config.autonomy.grace_seconds,
+                    )
+                    continue
                 self._auto_upstream(get_decision(self.state, decision["id"]))
         return done
 

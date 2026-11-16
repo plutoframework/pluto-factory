@@ -864,4 +864,5 @@ def test_drawer_cards_use_each_decisions_own_factory_id():
     root = files("pluto_factory").joinpath("dashboard")
     js = root.joinpath("app.js").read_text()
     assert ".map(decisionCard)" not in js
-    assert "needs.decisions.map(decision => decisionCard(decision))" in js
+    assert "owner.map(decision => decisionCard(decision))" in js
+    assert "autos.map(decision => decisionCard(decision))" in js

@@ -108,6 +108,20 @@ class FrameworkPolicy(Contract):
         return ""
 
 
+class AutonomyPolicy(Contract):
+    """When the advisor's recommendation may be applied without the owner.
+
+    ``auto_obvious`` lets a high-confidence, reversible recommendation in an
+    allowlisted category apply itself after ``grace_seconds`` (the owner can
+    override); ``ask_all`` always asks. ``max_config`` bounds the numeric
+    config keys an automatic config change may touch.
+    """
+
+    mode: Literal["auto_obvious", "ask_all"] = "auto_obvious"
+    grace_seconds: int = Field(default=600, ge=0, le=86400)
+    max_config: dict[str, float] = Field(default_factory=dict)
+
+
 class TriagePolicy(Contract):
     """Optional receiving-side triage of new issues (off by default).
 
@@ -274,6 +288,7 @@ class FactoryConfig(Contract):
     advisor: AdvisorPolicy = Field(default_factory=lambda: AdvisorPolicy())
     framework: FrameworkPolicy = Field(default_factory=FrameworkPolicy)
     triage: TriagePolicy = Field(default_factory=TriagePolicy)
+    autonomy: AutonomyPolicy = Field(default_factory=AutonomyPolicy)
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"
