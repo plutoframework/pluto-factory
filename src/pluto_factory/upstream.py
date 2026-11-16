@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import time
 
 from . import attention
@@ -203,6 +204,46 @@ def denylist(state, config):
     return terms, paths
 
 
+_COMMITS = {}
+
+
+def private_checkouts(config):
+    paths = [r.path for r in config.repositories]
+    paths += [t.local_path for t in config.tracked_repositories]
+    return [p for p in dict.fromkeys(paths) if p]
+
+
+def is_private_commit(paths, token):
+    """True if ``token`` names a commit in any configured local repository.
+
+    Results are cached per (path, token): a commit never stops existing, and
+    a miss is cheap to recompute only once per scrub.
+    """
+    for path in paths:
+        key = (path, token.lower())
+        if key not in _COMMITS:
+            try:
+                result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        path,
+                        "cat-file",
+                        "-e",
+                        f"{token}^{{commit}}",
+                    ],
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                _COMMITS[key] = result.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                _COMMITS[key] = False
+        if _COMMITS[key]:
+            return True
+    return False
+
+
 def _exists(adapter, argv, key, prefix):
     try:
         data = adapter._json(argv)
@@ -243,8 +284,11 @@ def scrub(state, adapter, config, upstream_slug, fields):
             number,
         ):
             hits.append(f"issue reference: #{number}")
+    checkouts = private_checkouts(config)
     for sha in sorted(set(SHA.findall(text))):
-        if not any(c.isdigit() for c in sha):
+        # Only a token that really is a commit in one of this factory's
+        # private repositories can leak one: ed25519 or deadbeef are words.
+        if not is_private_commit(checkouts, sha):
             continue
         if not _exists(
             adapter,
