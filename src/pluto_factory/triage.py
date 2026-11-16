@@ -28,7 +28,6 @@ from .advisor import (
     TRANSIENT_RETRIES,
     Advice,
     _tail,
-    clip_advice,
     failure_reason,
     failure_record,
     fallback_advice,
@@ -39,6 +38,7 @@ from .config import digest, triage_prompt
 from .dependencies import REFERENCE
 from .github import GitHubFailure
 from .models import Contract
+from .sanitize import sanitize_triage
 
 TITLE_LIMIT = 300
 BODY_LIMIT = 6000
@@ -117,10 +117,8 @@ class TriageResult(Contract):
 
     @model_validator(mode="before")
     @classmethod
-    def _lenient_advice(cls, data):
-        if isinstance(data, dict) and data.get("outcome") == "NEEDS_HUMAN":
-            return {**data, "advice": clip_advice(data.get("advice"))}
-        return data
+    def _lenient(cls, data):
+        return sanitize_triage(data)[0]
 
     @model_validator(mode="after")
     def _matches_outcome(self):
@@ -177,6 +175,7 @@ class Triager:
         self.runner = runner
         self.sleep = sleep
         self.last_failure = None
+        self.last_sanitized = []
 
     def sources(self):
         return [
@@ -191,6 +190,7 @@ class Triager:
         problem = None
         contract = transient = attempts = 0
         self.last_failure = None
+        self.last_sanitized = []
         while True:
             attempts += 1
             payload = dict(packet)
@@ -203,6 +203,8 @@ class Triager:
                 reply = runner(prompt, json.dumps(payload))
                 if isinstance(reply, str):
                     reply = json.loads(reply)
+                if isinstance(reply, dict):
+                    reply, self.last_sanitized = sanitize_triage(reply)
                 if not isinstance(reply, TriageResult):
                     reply = TriageResult.model_validate(reply)
                 self.last_failure = None  # a retry succeeded: nothing to report
@@ -350,6 +352,13 @@ class TriageRunner:
             "human_guidance": guidance,
         }
         result, source = self.triager.triage(packet)
+        sanitized = getattr(self.triager, "last_sanitized", None)
+        if sanitized:
+            self.state.event(
+                "triage.sanitized",
+                "factory",
+                {"issue": f"{slug}#{number}", "changes": list(sanitized)},
+            )
         now = time.time()
         with self.state.db:
             self.state.db.execute(

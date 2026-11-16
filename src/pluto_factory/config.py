@@ -75,7 +75,10 @@ ROLE_TEXT = {
         "the consuming project, its repositories, issues, work items, "
         "customers or vendors, product features, commit SHAs from private "
         "repositories or private file paths. Describe the need as a generic "
-        "use case (e.g. 'multi-tenant apps need per-tenant OIDC providers')."
+        "use case (e.g. 'multi-tenant apps need per-tenant OIDC providers'). "
+        "When the block is 'No changes to publish', the work may already "
+        "have landed through another merge: if the evidence says so, "
+        "recommend the option with completes=true (mark already satisfied)."
     ),
     "triage": (
         "Triage a new issue for a factory. Read-only: you may read the "
@@ -106,8 +109,24 @@ ROLE_TEXT = {
 }
 
 
-# Tracking policy never affects validation; keep it out of the config digest.
+# The acceptance digest covers only what changes validation outcomes:
+# repository checks/qa, worker/reviewer/qa models and prompts, sandbox and
+# check env, acceptance policy. Everything below is operational: editing it
+# must never make already-validated work look drifted.
 BUNDLE_EXCLUDED = {
+    "github_poll_seconds",
+    "github_max_resyncs",
+    "github_auto_merge",
+    "close_source_issues",
+    "herdr_space",
+    "slack_webhook_env",
+    "max_recoveries",
+    "max_revisions",
+    "phase_timeout_seconds",
+    "implementer_phase_timeout_seconds",
+    "retry_base_seconds",
+    "keep_finished_sessions",
+    "debug",
     "concurrency",
     "merge_manager",
     "advisor",

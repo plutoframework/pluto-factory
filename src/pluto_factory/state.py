@@ -374,6 +374,40 @@ class State:
         ]
         return payload
 
+    def add_dependency(self, work_id: str, dependency_id: str) -> bool:
+        """Make a work item wait for another work item (idempotent)."""
+        from .dependencies import validate_graph
+
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            work = self.get_work(work_id)
+            self.get_work(dependency_id)
+            payload = work["payload"]
+            if dependency_id in payload.get("depends_on", []):
+                return False
+            payload["depends_on"] = [
+                *payload.get("depends_on", []),
+                dependency_id,
+            ]
+            validate_graph(
+                [w for w in self.list_work() if w["id"] != work_id],
+                {
+                    "id": work_id,
+                    "source_key": work["source_key"],
+                    "payload": payload,
+                },
+            )
+            self.db.execute(
+                "UPDATE work SET payload=?,updated=? WHERE id=?",
+                (encode(payload), time.time(), work_id),
+            )
+            self._event(
+                "dependency.added",
+                work_id,
+                {"work": dependency_id, "origin": "framework_gap"},
+            )
+        return True
+
     def add_dependency_source(self, work_id: str, key: str) -> bool:
         """Make a work item wait for an external issue (e.g. upstream)."""
         with self.db:

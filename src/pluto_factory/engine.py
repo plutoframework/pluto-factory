@@ -57,6 +57,7 @@ from .improvements import propose
 from .models import (
     WRITER_ROLES,
     Failure,
+    Submission,
     WorkerReport,
     workable_repositories,
 )
@@ -68,7 +69,7 @@ from .pr_tracker import (
     PRTracker,
     parse_repair_source,
 )
-from .propagation import propagate
+from .propagation import already_satisfied, propagate
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .scheduler import Scheduler
@@ -799,6 +800,22 @@ class Engine:
             slug, _, number = proposal["pr"].rpartition("#")
             self.tracker.grant(slug, int(number))
         option = chosen_option(decision)
+        if proposal.get("no_changes") and (option or {}).get("completes"):
+            work = self.state.get_work(decision["work_id"])
+            if not self._complete_satisfied(
+                work, f"Owner confirmed: {decision['answer']}"
+            ):
+                raise ValueError("work item could not be completed")
+            mark_applied(self.state, decision["id"], detail)
+            return
+        local = self._local_repository(framework_library(option))
+        if framework_library(option) and local:
+            detail["local_work"] = self._local_gap(decision, option, local)[
+                "id"
+            ]
+            enqueue_issue_comment(self.state, decision, "answered")
+            mark_applied(self.state, decision["id"], detail)
+            return
         if framework_library(option):
             # Parked until the gap decision is answered or the pin moves.
             gap = record_framework_gap(
@@ -837,7 +854,7 @@ class Engine:
             self.coordinator.config = self.config
         self.scheduler.config = self.config
 
-    def _ask_owner(self, work, reason):
+    def _ask_owner(self, work, reason, no_changes=False):
         """Every deferral a human must resolve becomes a durable decision.
 
         Filed at once with a deterministic terse headline; the advisor
@@ -845,6 +862,19 @@ class Engine:
         Raw block text stays as collapsed evidence.
         """
         advice = fallback_advice(reason)
+        satisfied = {
+            "label": "Mark as already satisfied",
+            "effect": "Complete the item: the change already landed.",
+            "tradeoff": "Skips publishing; check main has the change.",
+            "completes": True,
+            "recommended": True,
+        }
+        hint = (
+            "\nThe candidate has no diff against the default branch: the "
+            "change may already have landed through another merge."
+            if no_changes
+            else ""
+        )
         add_decision(
             self.state,
             work_id=work["id"],
@@ -853,9 +883,11 @@ class Engine:
             question=f"{work['title']}: {terse(reason, 30)}"[:500],
             context=(
                 f"Work '{work['title']}' ({work['id']}), phase "
-                f"{work['phase']}.\n{reason}"
+                f"{work['phase']}.\n{reason}{hint}"
             ),
-            options=[
+            proposal={"no_changes": True} if no_changes else None,
+            options=([satisfied] if no_changes else [])
+            + [
                 {
                     "label": o.label,
                     "effect": o.effect,
@@ -863,7 +895,7 @@ class Engine:
                     "locus": o.locus,
                     "fix": o.fix,
                     "description": o.effect,
-                    "recommended": o.recommended,
+                    "recommended": o.recommended and not no_changes,
                 }
                 for o in advice.options
             ],
@@ -911,6 +943,15 @@ class Engine:
             advice, source = self.advisor.advise(
                 packet, pull_request=decision["work_id"] is None
             )
+            if getattr(self.advisor, "last_sanitized", None):
+                self.state.event(
+                    "advice.sanitized",
+                    decision["work_id"] or "factory",
+                    {
+                        "decision": decision["id"],
+                        "changes": list(self.advisor.last_sanitized),
+                    },
+                )
             ok, _why = (
                 auto_verdict(self.config.autonomy, advice, packet=packet)
                 if source == "model"
@@ -937,6 +978,76 @@ class Engine:
                     continue
                 self._auto_upstream(get_decision(self.state, decision["id"]))
         return done
+
+    def _local_repository(self, library):
+        """The repository of THIS factory a framework library maps to."""
+
+        def norm(name):
+            name = name.strip().lower().removeprefix("@plutoframework/")
+            return name.removeprefix("pluto-")
+
+        wanted = norm(library)
+        for repo in workable_repositories(self.config):
+            names = {getattr(repo, "name", "") or ""}
+            slug = getattr(repo, "github", "") or getattr(repo, "repo", "")
+            names.add(slug.rsplit("/", 1)[-1])
+            if wanted in {norm(n) for n in names if n}:
+                return getattr(repo, "name", "") or slug.rsplit("/", 1)[-1]
+        return ""
+
+    def _local_gap(self, decision, option, repo_name):
+        """A gap in one of our own repositories is work, not an upstream issue.
+
+        The gap becomes a normal submission (its spec the advisor's payload)
+        and the blocked item waits on it through ``depends_on``.
+        """
+        payload = option.get("upstream") or {}
+        fix = option.get("fix") or option["label"]
+        blocked = (
+            self.state.get_work(decision["work_id"])
+            if decision["work_id"]
+            else None
+        )
+        lines = [
+            f"Framework gap in {repo_name}: {fix}",
+            "",
+            f"Problem: {payload.get('problem') or decision['question']}",
+        ]
+        if payload.get("repro"):
+            lines += ["", f"Repro: {payload['repro']}"]
+        lines += ["", f"Proposed fix: {payload.get('fix') or fix}"]
+        if blocked:
+            lines += [
+                "",
+                f"Blocks work item {blocked['id']}: {blocked['title']}.",
+            ]
+        item = self.state.submit(
+            Submission(
+                title=terse(payload.get("title") or f"{repo_name}: {fix}", 15)[
+                    :200
+                ],
+                instruction="\n".join(lines),
+                acceptance=payload.get("acceptance") or [fix],
+                repositories=[repo_name],
+                source="framework_gap",
+                delivery_key=decision["id"],
+            )
+        )
+        if blocked:
+            self.state.add_dependency(blocked["id"], item["id"])
+            self.state.add_guidance(
+                blocked["id"],
+                f"Waiting on {item['id']} ({repo_name}): {fix}",
+                "coordinator",
+            )
+            if blocked["control"] in {"deferred", "quarantined", "backoff"}:
+                self.state.resume(blocked["id"])
+        self.state.event(
+            "framework_gap.local_work",
+            decision["work_id"] or "factory",
+            {"decision": decision["id"], "work": item["id"], "repo": repo_name},
+        )
+        return item
 
     def _auto_upstream(self, decision):
         """Under file_upstream=auto, a framework-locus recommendation files."""
@@ -2186,7 +2297,31 @@ class Engine:
             event="work.revision_requested",
         )
 
-    def _defer(self, work, reason):
+    def _complete_satisfied(self, work, reason):
+        """Close an item whose goal is already met; the chain continues."""
+        data = {**work["data"], "already_satisfied": reason}
+        try:
+            self.state.update_work(
+                work["id"],
+                phase="completed",
+                control="settled",
+                current_run=None,
+                data=data,
+                event="work.already_satisfied",
+                notice={
+                    "kind": "completed",
+                    "message": f"{work['title']}: already satisfied",
+                    "incident_key": f"completed:{work['id']}",
+                },
+            )
+        except (ValueError, StateConflict):
+            return False
+        self.state.event(
+            "work.already_satisfied", work["id"], {"reason": reason}
+        )
+        return True
+
+    def _defer(self, work, reason, no_changes=False):
         self.state.update_work(
             work["id"],
             control="deferred",
@@ -2202,7 +2337,7 @@ class Engine:
                 ),
             },
         )
-        self._ask_owner(work, reason)
+        self._ask_owner(work, reason, no_changes=no_changes)
 
     def _failure(self, work_id, failure):
         work = self.state.get_work(work_id)
@@ -2212,6 +2347,12 @@ class Engine:
             )
             return
         self.state.event("failure.observed", work_id, failure.model_dump())
+        if failure.code == "github.no_changes":
+            reason = already_satisfied(
+                self.state, self.tracker.adapter, self.config, work
+            )
+            if reason and self._complete_satisfied(work, reason):
+                return
         recovery = plan_recovery(
             failure,
             work["recoveries"],
@@ -2344,7 +2485,11 @@ class Engine:
         if recovery.action == "defer":
             if run_id != work["current_run"]:
                 work = self.state.update_work(work_id, current_run=run_id)
-            self._defer(work, failure.summary)
+            self._defer(
+                work,
+                failure.summary,
+                no_changes=failure.code == "github.no_changes",
+            )
             return
         if recovery.action == "revise":
             if run_id != work["current_run"]:

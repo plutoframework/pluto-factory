@@ -231,3 +231,30 @@ def test_report_not_blocked_by_inflight_check(tmp_path):
         )
         writer.close()
         server.join(15)
+
+
+def test_parallel_factory_check_runs_get_isolated_env_at_three_workers(
+    tmp_path,
+):
+    """factory_check runs through check_worktree: max_workers=3 isolates."""
+    probe = (
+        "import os,time;print(os.environ['GOLANGCI_LINT_CACHE'],"
+        "os.path.isdir(os.environ['GOLANGCI_LINT_CACHE']),"
+        "os.environ['TMPDIR']);time.sleep(0.2)"
+    )
+    manager, _ = workspace(tmp_path, concurrency={"max_workers": 3})
+    manager.repositories["source"].checks[:] = [[sys.executable, "-c", probe]]
+    entries = manager.prepare("item", ["source"])
+    outputs = []
+
+    def run():
+        outputs.append(manager.check_worktree(entries)[0]["stdout"].split())
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert len(outputs) == 3
+    caches = {o[0] for o in outputs}
+    assert len(caches) == 3  # a fresh directory per check run
+    assert all(o[1] == "True" and "check-runs" in o[0] for o in outputs)
+    assert all(o[2].endswith("/tmp") for o in outputs)

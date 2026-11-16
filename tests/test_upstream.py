@@ -3,7 +3,13 @@
 import json
 import subprocess
 
-from test_advisor import FRAMEWORK, IssueGh, advice, make_work_with_issue
+from test_advisor import (
+    FRAMEWORK,
+    UPSTREAM_PAYLOAD,
+    IssueGh,
+    advice,
+    make_work_with_issue,
+)
 from test_attention import build
 
 from pluto_factory import attention
@@ -11,6 +17,7 @@ from pluto_factory.attention import answer_decision, list_decisions
 from pluto_factory.models import FrameworkPolicy, Submission
 
 UPSTREAM = "plutoframework/pluto-core"
+UPSTREAM_ACCEPTANCE = UPSTREAM_PAYLOAD["acceptance"]
 KEY = "github:plutoframework/pluto-core:7"
 
 
@@ -541,3 +548,73 @@ def test_gap_needs_the_owner_when_nothing_was_filed(tmp_path):
     _owner, needs, _gaps, _ = _gap_view(engine)
     kinds = {d["kind"] for d in needs["decisions"]}
     assert "framework_gap" in kinds
+
+
+# --- gaps in this factory's own repositories ------------------------------
+
+
+def _local_setup(tmp_path):
+    """The advisor names 'pluto-core'; this factory owns a repo 'core'."""
+    engine, gh, work = setup(tmp_path, mapped=False)
+    return engine, gh, work
+
+
+def test_gap_in_an_own_repository_becomes_local_work(tmp_path):
+    engine, gh, work = _local_setup(tmp_path)
+    # The advisor's library 'pluto-rbac' is not ours; use our repo 'core'.
+    import json as j
+
+    (decision,) = list_decisions(engine.state, {"open"})
+    options = decision["options"]
+    options[0]["locus"] = "framework:pluto-core"
+    engine.state.db.execute(
+        "UPDATE decisions SET options=? WHERE id=?",
+        (j.dumps(options), decision["id"]),
+    )
+    engine.state.db.commit()
+    answer_decision(engine.state, decision["id"], "Fix pluto-rbac")
+    engine.process_decisions()
+    (item,) = [
+        w
+        for w in engine.state.list_work()
+        if w["payload"]["source"] == "framework_gap"
+    ]
+    assert item["payload"]["repositories"] == ["core"]
+    assert "scoped job grants" in item["payload"]["instruction"]
+    assert item["payload"]["acceptance"] == UPSTREAM_ACCEPTANCE
+    # The blocked item waits on it; nothing goes upstream or to the owner.
+    blocked = engine.state.get_work(work["id"])
+    assert item["id"] in blocked["payload"]["depends_on"]
+    assert blocked["control"] == "ready"
+    assert not engine.state.dependency_status(work["id"])["ready"]
+    assert not gh.created
+    assert not [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if d["kind"] == "framework_gap"
+        or (d["proposal"] or {}).get("upstream_repo_for")
+    ]
+    # Idempotent per decision.
+    engine.state.db.execute(
+        "UPDATE decisions SET state='answered' WHERE id=?", (decision["id"],)
+    )
+    engine.state.db.commit()
+    engine.process_decisions()
+    assert (
+        len(
+            [
+                w
+                for w in engine.state.list_work()
+                if w["payload"]["source"] == "framework_gap"
+            ]
+        )
+        == 1
+    )
+
+
+def test_library_names_normalize_for_own_repositories(tmp_path):
+    engine, _gh, _work = _local_setup(tmp_path)
+    for name in ("core", "pluto-core", "Core", "@plutoframework/core"):
+        assert engine._local_repository(name) == "core"
+    assert engine._local_repository("pluto-rbac") == ""
+    assert engine._local_repository("cli") == "t-plutoframework-cli"
