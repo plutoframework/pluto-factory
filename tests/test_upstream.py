@@ -497,3 +497,47 @@ def test_redact_terms_are_enforced(tmp_path):
     engine.advise_pending()
     _leak(engine, problem="Okta needs per-tenant providers.")
     assert not _filed(engine, gh)
+
+
+# --- framework gaps parked behind a tracked upstream issue -----------------
+
+
+def _gap_view(engine):
+    from pluto_factory.attention import read_attention
+    from pluto_factory.dashboard_data import DashboardData, _work_waiting
+
+    owner = read_attention(engine.state.db)
+    needs = {"pull_requests": [], "decisions": [], "auto": []}
+    DashboardData._owner_items(needs, "f", "test", owner)
+    gaps = [d for d in owner["decisions"] if d["kind"] == "framework_gap"]
+    return owner, needs, gaps, _work_waiting
+
+
+def test_gap_is_not_owner_work_while_the_upstream_issue_is_tracked(tmp_path):
+    engine, _gh, work = setup(tmp_path)
+    choose_framework(engine)
+    _owner, needs, gaps, _ = _gap_view(engine)
+    assert gaps and not gaps[0]["waiting_on"]  # nothing filed yet: owner
+    engine.flush_upstream()
+    owner, needs, (gap,), waiting = _gap_view(engine)
+    assert gap["waiting_on"]["number"] == 7
+    assert all(d["kind"] != "framework_gap" for d in needs["decisions"])
+    shown = waiting(owner, work["id"])
+    assert shown["label"] == f"Waiting on {UPSTREAM}#7"
+    # Closed as not planned: the owner is needed again.
+    engine.state.db.execute(
+        "UPDATE external_issues SET state='not_planned' WHERE key=?", (KEY,)
+    )
+    engine.state.db.commit()
+    owner, needs, (gap,), waiting = _gap_view(engine)
+    assert gap["waiting_on"] is None and waiting(owner, work["id"]) is None
+    assert any(d["kind"] == "framework_gap" for d in needs["decisions"])
+
+
+def test_gap_needs_the_owner_when_nothing_was_filed(tmp_path):
+    engine, _gh, _work = setup(tmp_path, mapped=False)
+    choose_framework(engine)
+    engine.flush_upstream()
+    _owner, needs, _gaps, _ = _gap_view(engine)
+    kinds = {d["kind"] for d in needs["decisions"]}
+    assert "framework_gap" in kinds

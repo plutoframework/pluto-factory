@@ -523,6 +523,12 @@
   }
   function renderOverview(work) {
     const sections = [];
+    if (work.waiting_on) {
+      const waiting = section("Waiting on upstream");
+      waiting.append(node("p", "secondary-line", work.waiting_on.label),
+        work.waiting_on.url ? safeLink(work.waiting_on.url, `${work.waiting_on.slug}#${work.waiting_on.number}`) : node("span", ""));
+      sections.push(waiting);
+    }
     if (work.decision) sections.push(append(section("Needs you"), decisionCard(work.decision, state.factoryId)));
     if (work.revision_reason) sections.push(append(section("Current revision"), node("p", "body-copy", work.revision_reason)));
     if (work.guidance?.length) {

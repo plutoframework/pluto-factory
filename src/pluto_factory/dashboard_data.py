@@ -300,9 +300,24 @@ def _work_decision(owner, work_id, factory_id, name):
         d
         for d in owner["decisions"]
         if d["work_id"] == work_id
+        and not d.get("waiting_on")
         and d["state"] in {"open", "answered", "auto_pending"}
     ]
     return _project_decision(rows[-1], factory_id, name) if rows else None
+
+
+def _work_waiting(owner, work_id):
+    """'Waiting on repo#N' for work parked behind a tracked upstream issue."""
+    for d in owner["decisions"]:
+        waiting = d.get("waiting_on")
+        if d["work_id"] == work_id and waiting:
+            return {
+                "slug": text(waiting["slug"], 200),
+                "number": waiting["number"],
+                "url": _url(waiting["url"]),
+                "label": f"Waiting on {text(waiting['slug'], 200)}#{waiting['number']}",
+            }
+    return None
 
 
 def _agent_activity(item, snapshot, coordinator_running):
@@ -587,6 +602,9 @@ class DashboardData:
     def _with_decision(summary, owner, factory_id, name):
         decision = _work_decision(owner, summary["id"], factory_id, name)
         summary["decision"] = decision
+        summary["waiting_on"] = _work_waiting(owner, summary["id"])
+        if summary["waiting_on"] and not decision:
+            summary["latest_failure"] = summary["waiting_on"]["label"]
         if decision:
             # The card shows the terse problem, never the raw paragraph.
             summary["latest_failure"] = decision["question"]
@@ -616,6 +634,8 @@ class DashboardData:
             )
         for decision in owner["decisions"]:
             auto = decision.get("auto") or {}
+            if decision.get("waiting_on"):
+                continue  # parked on a tracked upstream issue; not owner work
             if decision["state"] == "open":
                 needs["decisions"].append(
                     _project_decision(decision, factory_id, name)

@@ -950,7 +950,36 @@ def read_attention(connection):
         sqlite3.OperationalError
     ):  # tables absent: factory predates attention
         return {"decisions": [], "pull_requests": []}
+    for decision in decisions:
+        decision["waiting_on"] = _waiting_on(connection, decision)
     return {"decisions": decisions, "pull_requests": prs}
+
+
+def _waiting_on(connection, decision):
+    """The tracked upstream issue a framework gap is parked behind, if any.
+
+    A gap only needs the owner when no upstream issue exists or it was
+    closed as not planned; while the issue is filed and open, dependency
+    polling and propagation resolve it.
+    """
+    if decision["kind"] != "framework_gap" or decision["state"] != "open":
+        return None
+    origin = (decision.get("block_key") or "").removeprefix("gap:")
+    if not origin or origin == decision.get("block_key"):
+        return None
+    try:
+        row = connection.execute(
+            "SELECT u.slug,u.number,u.url,e.state FROM upstream_issues u "
+            "LEFT JOIN external_issues e ON e.key="
+            "'github:'||lower(u.slug)||':'||u.number "
+            "WHERE u.decision_id=? AND u.state='filed' LIMIT 1",
+            (origin,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None or row[3] not in {None, "open", "awaiting_fix"}:
+        return None
+    return {"slug": row[0], "number": row[1], "url": row[2]}
 
 
 def apply_advice(state, decision_id, advice, source, announce=True):
