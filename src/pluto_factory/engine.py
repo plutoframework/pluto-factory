@@ -56,6 +56,7 @@ from .state import State, StateConflict, identity
 from .trace import Tracer
 from .triage import Triager, TriageRunner
 from .upstream import (
+    apply_hold_answer,
     fixed_guidance,
     flush_upstream,
     poll_external,
@@ -575,6 +576,10 @@ class Engine:
                 )
             else:
                 text += ". No configuration change was made."
+        if proposal.get("upstream_hold"):
+            apply_hold_answer(self.state, decision)
+            mark_applied(self.state, decision["id"], detail)
+            return
         if proposal.get("triage"):
             self.triage.apply_answer(decision)
             mark_applied(self.state, decision["id"], detail)

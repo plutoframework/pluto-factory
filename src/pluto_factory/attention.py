@@ -163,6 +163,22 @@ def _decision(row):
     return result
 
 
+def _upstream_field(payload):
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "upstream": {
+            "title": _clip(payload.get("title"), 200),
+            "problem": _clip(payload.get("problem"), 2000),
+            "repro": _clip(payload.get("repro"), 2000),
+            "fix": _clip(payload.get("fix"), 2000),
+            "acceptance": [
+                _clip(item, 300) for item in payload.get("acceptance") or []
+            ][:8],
+        }
+    }
+
+
 def normalize_options(options):
     result = []
     for option in options or []:
@@ -178,6 +194,7 @@ def normalize_options(options):
                 "effect": _clip(option.get("effect"), 300),
                 "locus": _clip(option.get("locus") or "app", 200),
                 "fix": _clip(option.get("fix"), 300),
+                **_upstream_field(option.get("upstream")),
                 "tradeoff": _clip(option.get("tradeoff"), 300),
                 "recommended": bool(option.get("recommended")),
             }
@@ -786,6 +803,7 @@ def apply_advice(state, decision_id, advice, source):
                 "tradeoff": o.tradeoff,
                 "locus": o.locus,
                 "fix": o.fix,
+                "upstream": o.upstream.model_dump() if o.upstream else None,
                 "description": o.effect,
                 "recommended": o.recommended,
             }

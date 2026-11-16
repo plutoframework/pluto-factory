@@ -7,20 +7,45 @@ the GitHub cadence: closed-as-completed resumes the work, not-planned asks
 the owner.
 """
 
+import hashlib
+import hmac
+import json
+import os
 import re
+import secrets
 import time
 
 from . import attention
-from .advisor import terse
 from .github import GitHubFailure
 
-BODY_EVIDENCE_LIMIT = 1500
 SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ISSUE_URL = re.compile(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)")
+SECRET_KEY = "upstream_secret"
+HOLD_SKIP = "Skip upstream filing"
+HOLD_EDIT = "Edit and file"
+SLUG_REF = re.compile(r"(?<![\w/.-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+BARE_REF = re.compile(r"(?<![\w/.#&-])#(\d+)\b")
+SHA = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{7,40}(?![0-9A-Za-z])")
 
 
-def upstream_marker(factory, decision_id):
-    return f"<!-- pluto-factory:upstream:{factory}:{decision_id} -->"
+def factory_secret(state):
+    """Random per-factory secret, created once and kept in state."""
+    with state.db:
+        state.db.execute(
+            "INSERT OR IGNORE INTO settings VALUES (?,?)",
+            (SECRET_KEY, secrets.token_hex(32)),
+        )
+    return state.db.execute(
+        "SELECT value FROM settings WHERE key=?", (SECRET_KEY,)
+    ).fetchone()["value"]
+
+
+def upstream_marker(state, decision_id):
+    """Opaque, stable, idempotent: reveals neither factory nor decision."""
+    digest = hmac.new(
+        factory_secret(state).encode(), decision_id.encode(), hashlib.sha256
+    ).hexdigest()[:16]
+    return f"<!-- pluto-factory:upstream:{digest} -->"
 
 
 def request_upstream(state, config, decision, option):
@@ -44,39 +69,203 @@ def request_upstream(state, config, decision, option):
     return bool(cursor.rowcount)
 
 
-def _body(state, config, decision, option, library):
-    from .dashboard_data import text as redact
+# -- public payload and scrubber --------------------------------------------
 
-    work = state.get_work(decision["work_id"]) if decision["work_id"] else None
+
+def payload_for(state, decision, option):
+    """The generic payload, with an owner edit (if any) as the problem."""
+    payload = dict(option.get("upstream") or {})
+    edit = state.db.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (f"upstream_edit:{decision['id']}",),
+    ).fetchone()
+    if edit and payload:
+        payload["problem"] = edit["value"]
+    return payload
+
+
+def render_title(payload):
+    return " ".join(str(payload.get("title") or "").split())[:80]
+
+
+def render_body(state, decision, payload):
     lines = [
-        upstream_marker(config.name, decision["id"]),
-        f"**Problem:** {terse(decision['question'])}",
+        upstream_marker(state, decision["id"]),
+        "## Problem",
+        payload["problem"],
         "",
-        f"**Library:** {library}",
-        f"**Proposed fix:** {option.get('fix') or option['label']}",
+        "## Minimal repro",
+        payload["repro"],
+        "",
+        "## Proposed fix",
+        payload["fix"],
+        "",
+        "## Acceptance criteria",
+        *[f"- [ ] {item}" for item in payload["acceptance"]],
     ]
-    if option.get("effect"):
-        lines.append(f"**Effect:** {option['effect']}")
-    evidence = redact(decision["context"], BODY_EVIDENCE_LIMIT).strip()
-    if evidence:
-        lines += [
-            "",
-            "**Evidence (bounded, redacted):**",
-            "```",
-            evidence,
-            "```",
-        ]
-    issue = attention.source_issue(state, decision["work_id"])
-    lines.append("")
-    if issue:
-        lines.append(
-            f"**Origin:** https://github.com/{issue[0]}/issues/{issue[1]}"
-        )
-    lines.append(
-        f"**Factory:** {config.name}"
-        + (f", work item {work['id']}" if work else "")
-    )
     return "\n".join(lines)
+
+
+def _fields(payload):
+    return [
+        str(payload.get("title") or ""),
+        str(payload.get("problem") or ""),
+        str(payload.get("repro") or ""),
+        str(payload.get("fix") or ""),
+        *[str(item) for item in payload.get("acceptance") or []],
+    ]
+
+
+def denylist(state, config):
+    """Private terms and paths that must never reach a public issue."""
+    terms = {config.name}
+    paths = {os.path.expanduser("~"), os.environ.get("HOME", "")}
+    for repo in config.repositories:
+        terms.update({repo.name, repo.github or ""})
+        paths.add(repo.path)
+    for tracked in config.tracked_repositories:
+        terms.update({tracked.repo})
+        paths.add(tracked.local_path)
+    terms.update(config.framework.redact_terms)
+    for work in state.list_work():
+        terms.update({work["id"], work["title"]})
+    terms = {t.strip() for t in terms if t and len(t.strip()) >= 2}
+    paths = {
+        os.path.normpath(p) for p in paths if p and len(os.path.normpath(p)) > 1
+    }
+    return terms, paths
+
+
+def _exists(adapter, argv, key, prefix):
+    try:
+        data = adapter._json(argv)
+    except Exception:  # noqa: BLE001 - unverifiable means suspect
+        return False
+    return str(data.get(key, "")).lower().startswith(prefix.lower())
+
+
+def scrub(state, adapter, config, upstream_slug, fields):
+    """Hits found in any field; empty means clean. Fails closed."""
+    terms, paths = denylist(state, config)
+    hits = []
+    text = "\n".join(fields)
+    for term in sorted(terms):
+        pattern = rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])"
+        if re.search(pattern, text, re.IGNORECASE):
+            hits.append(f"private term: {term}")
+    for path in sorted(paths):
+        if path in text:
+            hits.append(f"private path: {path}")
+    for slug, number in SLUG_REF.findall(text):
+        if slug.lower() != upstream_slug.lower():
+            hits.append(f"issue reference: {slug}#{number}")
+    for number in sorted(set(BARE_REF.findall(text)), key=int):
+        if not _exists(
+            adapter,
+            [
+                "gh",
+                "issue",
+                "view",
+                number,
+                "--repo",
+                upstream_slug,
+                "--json",
+                "number",
+            ],
+            "number",
+            number,
+        ):
+            hits.append(f"issue reference: #{number}")
+    for sha in sorted(set(SHA.findall(text))):
+        if not any(c.isdigit() for c in sha):
+            continue
+        if not _exists(
+            adapter,
+            ["gh", "api", f"repos/{upstream_slug}/commits/{sha}"],
+            "sha",
+            sha,
+        ):
+            hits.append(f"commit SHA: {sha}")
+    return list(dict.fromkeys(hits))
+
+
+def _hold(state, decision, row, hits, payload):
+    """Park the filing and ask the owner; never file with hits present."""
+    with state.db:
+        state.db.execute(
+            "UPDATE upstream_issues SET state='held',last_error=? WHERE id=?",
+            ("upstream.redaction", row["id"]),
+        )
+    attention.add_decision(
+        state,
+        work_id=decision["work_id"],
+        kind="choice",
+        question=(
+            f"Upstream issue for {row['library']} blocked: private details "
+            f"found ({len(hits)})."
+        )[:500],
+        context=(
+            "Not filed. Private details found in the public issue text:\n"
+            + "\n".join(f"- {hit}" for hit in hits)
+            + f"\n\nTitle: {render_title(payload)}"
+        ),
+        options=[
+            {
+                "label": HOLD_EDIT,
+                "effect": (
+                    "Answer with replacement problem text (no private "
+                    "details); filing is retried."
+                ),
+                "recommended": True,
+            },
+            {
+                "label": HOLD_SKIP,
+                "effect": "Never file upstream; work stays parked.",
+            },
+        ],
+        proposal={
+            "upstream_hold": decision["id"],
+            "library": row["library"],
+        },
+        block_key="upstream-hold:"
+        + hashlib.sha256(
+            json.dumps([decision["id"], hits, payload], sort_keys=True).encode()
+        ).hexdigest()[:20],
+        notify=True,
+    )
+    state.event(
+        "upstream.held",
+        decision["work_id"] or "factory",
+        {"decision": decision["id"], "hits": len(hits)},
+    )
+
+
+def apply_hold_answer(state, decision):
+    """Owner answered a redaction hold: skip, or retry with edited text."""
+    proposal = decision["proposal"]
+    origin, library = proposal["upstream_hold"], proposal["library"]
+    if not decision["custom"] and decision["answer"] == HOLD_SKIP:
+        new_state = "skipped"
+    else:
+        edit = (
+            decision["answer"]
+            if decision["custom"]
+            else (decision.get("note") or "")
+        ).strip()
+        if edit:
+            with state.db:
+                state.db.execute(
+                    "INSERT OR REPLACE INTO settings VALUES (?,?)",
+                    (f"upstream_edit:{origin}", edit),
+                )
+        new_state = "pending"
+    with state.db:
+        state.db.execute(
+            "UPDATE upstream_issues SET state=?,wake_at=0,attempts=0,"
+            "last_error=NULL WHERE decision_id=? AND library=? "
+            "AND state='held'",
+            (new_state, origin, library),
+        )
 
 
 def _find_existing(adapter, repo, label, tag):
@@ -126,7 +315,21 @@ def flush_upstream(state, adapter, config):
         try:
             if option is None:
                 raise ValueError("framework option no longer present")
-            tag = upstream_marker(config.name, decision["id"])
+            tag = upstream_marker(state, decision["id"])
+            payload = payload_for(state, decision, option)
+            if not payload:
+                hits = ["no upstream payload recorded for this option"]
+            else:
+                hits = scrub(
+                    state,
+                    adapter,
+                    config,
+                    row["slug"],
+                    _fields(payload),
+                )
+            if hits:
+                _hold(state, decision, row, hits, payload)
+                continue
             label = config.framework.proposed_label
             found = _find_existing(adapter, row["slug"], label, tag)
             if found is None:
@@ -153,11 +356,9 @@ def flush_upstream(state, adapter, config):
                         "--repo",
                         row["slug"],
                         "--title",
-                        f"[{config.name}] {terse(decision['question'], 14)}"[
-                            :200
-                        ],
+                        render_title(payload),
                         "--body",
-                        _body(state, config, decision, option, row["library"]),
+                        render_body(state, decision, payload),
                         "--label",
                         label,
                     ],

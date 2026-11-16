@@ -83,6 +83,8 @@ class FrameworkPolicy(Contract):
     # Informational only: a foreign factory never marks upstream work ready.
     proposed_label: str = Field(default="factory:proposed", min_length=1)
     file_upstream: Literal["on_decision", "auto"] = "on_decision"
+    # Extra private terms the upstream scrubber must never let through.
+    redact_terms: list[str] = Field(default_factory=list)
 
     @field_validator("upstream")
     @classmethod

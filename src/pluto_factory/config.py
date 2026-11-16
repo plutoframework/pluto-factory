@@ -52,7 +52,15 @@ ROLE_TEXT = {
         "conventions). Every option carries locus: 'app' or "
         "'framework:<library>'; a framework option names the library and "
         "gives a one-line fix summary. Prefer a framework option when the "
-        "cause is in the framework."
+        "cause is in the framework. Every framework option also carries an "
+        "'upstream' payload (title of at most 80 characters, problem, "
+        "minimal generic repro using library APIs or a minimal manifest "
+        "snippet, proposed fix, acceptance criteria) that will be filed on "
+        "a PUBLIC issue tracker. Write it for a public audience: never name "
+        "the consuming project, its repositories, issues, work items, "
+        "customers or vendors, product features, commit SHAs from private "
+        "repositories or private file paths. Describe the need as a generic "
+        "use case (e.g. 'multi-tenant apps need per-tenant OIDC providers')."
     ),
     "triage": (
         "Triage a new issue for a factory. Read-only: you may read the "
@@ -71,7 +79,9 @@ ROLE_TEXT = {
         "options, exactly one recommended). outcome REJECT: category "
         "duplicate, invalid or out_of_scope plus a terse reason. If "
         "'human_guidance' is present it is from the owner and authoritative. "
-        "Telegraphic style, bullets over prose."
+        "Telegraphic style, bullets over prose. Restate only the generic issue: "
+        "never add names of private projects, customers or repositories that "
+        "you infer or recall."
     ),
     "qa": (
         "Validate the candidate's assigned behavior using the supplied "
