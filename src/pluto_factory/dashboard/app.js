@@ -714,8 +714,8 @@
     return `${Math.floor(s / 86400)}d`;
   }
   function renderNeeds() {
-    const needs = state.data?.needs_you || { pull_requests: [], decisions: [], count: 0 };
-    const signature = JSON.stringify([needs.pull_requests, needs.decisions].map(list => list.map(({ age, ...rest }) => rest)));
+    const needs = state.data?.needs_you || { pull_requests: [], decisions: [], auto: [], count: 0 };
+    const signature = JSON.stringify([needs.pull_requests, needs.decisions, needs.auto || []].map(list => list.map(({ age, ...rest }) => rest)));
     $("#needs-button").classList.toggle("has-needs", needs.count > 0);
     $("#needs-count").textContent = needs.count ? String(needs.count) : "";
     $("#needs-button").setAttribute("aria-label", needs.count ? `Needs you, ${needs.count} waiting` : "Needs you");
@@ -738,9 +738,8 @@
       return item;
     }) : [node("li", "muted", "No pull requests need you.")]));
     const list = $("#needs-decisions");
-    const isAuto = decision => decision.auto && decision.auto.status !== "overridden";
-    const owner = needs.decisions.filter(decision => !isAuto(decision));
-    const autos = needs.decisions.filter(isAuto);
+    const owner = needs.decisions;
+    const autos = needs.auto || [];
     list.replaceChildren(...(owner.length ? owner.map(decision => decisionCard(decision)) : [node("p", "muted", "No open decisions.")]));
     $("#auto-decisions-section").hidden = !autos.length;
     $("#auto-decisions").replaceChildren(...autos.map(decision => decisionCard(decision)));

@@ -234,7 +234,9 @@ def parser() -> argparse.ArgumentParser:
     )
     _common(decisions)
     decisions.add_argument(
-        "operation", choices=["list", "show", "answer", "add"], nargs="?"
+        "operation",
+        choices=["list", "show", "answer", "add", "withdraw"],
+        nargs="?",
     )
     decisions.add_argument("id", nargs="?")
     decisions.add_argument("--state", action="append", default=[])

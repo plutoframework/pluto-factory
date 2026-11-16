@@ -488,7 +488,7 @@ class DashboardData:
     def state(self):
         registry = self._entries()
         factories = []
-        needs = {"pull_requests": [], "decisions": []}
+        needs = {"pull_requests": [], "decisions": [], "auto": []}
         for entry in registry["factories"][:100]:
             home = Path(entry["location"])
             projected = {
@@ -561,8 +561,7 @@ class DashboardData:
             "factories": factories,
             "needs_you": {
                 **needs,
-                "count": len(needs["pull_requests"])
-                + sum(item["state"] == "open" for item in needs["decisions"]),
+                "count": len(needs["pull_requests"]) + len(needs["decisions"]),
             },
             "errors": registry["errors"],
         }
@@ -599,10 +598,21 @@ class DashboardData:
                 }
             )
         for decision in owner["decisions"]:
-            needs["decisions"].append(
-                _project_decision(decision, factory_id, name)
-            )
+            auto = decision.get("auto") or {}
+            if decision["state"] == "open":
+                needs["decisions"].append(
+                    _project_decision(decision, factory_id, name)
+                )
+            elif (
+                auto
+                and auto.get("status") != "overridden"
+                and decision["state"] in {"auto_pending", "answered", "applied"}
+            ):
+                needs["auto"].append(
+                    _project_decision(decision, factory_id, name)
+                )
         needs["decisions"].sort(key=lambda item: item["created"])
+        needs["auto"].sort(key=lambda item: item["created"])
         needs["pull_requests"].sort(key=lambda item: -item["age"])
 
     def answer(self, factory_id, decision_id, answer, note="", by="owner"):

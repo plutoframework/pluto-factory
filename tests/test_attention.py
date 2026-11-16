@@ -859,3 +859,39 @@ def test_rejected_repair_with_budget_left_revises(tmp_path):
     revised = engine.state.get_work(work["id"])
     assert revised["phase"] == "implementing"
     assert "added a noqa" in revised["data"]["revision_reason"]
+
+
+def test_decisions_cli_withdraw_marks_stale_decisions(tmp_path, capsys):
+    engine, _ = build(tmp_path)
+    home = str(engine.home)
+    main(
+        [
+            "decisions",
+            "add",
+            "--question",
+            "Stale?",
+            "--option",
+            "a",
+            "--option",
+            "b",
+            "--home",
+            home,
+        ]
+    )
+    added = json.loads(capsys.readouterr().out)
+    code = main(
+        [
+            "decisions",
+            "withdraw",
+            added["id"],
+            "--note",
+            "obsolete",
+            "--home",
+            home,
+        ]
+    )
+    assert code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "withdrawn" and result["note"] == "obsolete"
+    assert not list_decisions(engine.state, {"open"})
+    assert main(["decisions", "withdraw", added["id"], "--home", home]) == 1

@@ -59,6 +59,8 @@ def decisions(state, args):
         raise ValueError(f"decisions {operation} needs a decision id")
     if operation == "show":
         return attention.get_decision(state, args.id)
+    if operation == "withdraw":
+        return attention.withdraw_decision(state, args.id, args.note)
     if not args.answer:
         raise ValueError("decisions answer needs --answer")
     result = attention.answer_decision(
