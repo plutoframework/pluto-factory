@@ -833,6 +833,7 @@ def test_repair_goes_through_review_before_push(tmp_path):
 
 def test_rejected_repair_review_consumes_budget_and_escalates(tmp_path):
     engine, gh = build(tmp_path)
+    engine.config.pr_max_repairs = 2
     work = repair_work(engine, gh)
     target = ("plutoframework/cli", 5)
     item = engine.state.update_work(work["id"], phase="reviewing")
@@ -849,7 +850,6 @@ def test_rejected_repair_review_consumes_budget_and_escalates(tmp_path):
 
 def test_rejected_repair_with_budget_left_revises(tmp_path):
     engine, gh = build(tmp_path)
-    engine.config.pr_max_repairs = 3
     work = repair_work(engine, gh)
     target = ("plutoframework/cli", 5)
     item = engine.state.update_work(work["id"], phase="reviewing")
