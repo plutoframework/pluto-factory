@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from .check_slots import CheckSlots, SlotBusy
 from .config import atomic_json
 from .models import FactoryConfig, Repository, workable_repositories
 
@@ -89,6 +91,9 @@ class GitWorkspace:
             raise GitFailure(
                 "config.invalid", "Repository names must be unique"
             )
+        self.check_slots = CheckSlots(
+            self.home, config.concurrency.max_parallel_checks
+        )
 
     def _git(
         self,
@@ -547,6 +552,27 @@ class GitWorkspace:
             "seconds": time.time() - started,
         }
 
+    @contextmanager
+    def _run_environment(self, environment: dict[str, str]):
+        """Environment with per-run variables under a fresh run directory."""
+        templates = self.config.check_run_env
+        if not templates:
+            yield environment
+            return
+        base = self.home / "check-runs"
+        base.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=base))
+        try:
+            run_env = dict(environment)
+            for name, template in templates.items():
+                value = template.replace("{run_dir}", str(run_dir))
+                run_env[name] = value
+                if value.startswith(str(run_dir)):
+                    Path(value).mkdir(parents=True, exist_ok=True)
+            yield run_env
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
+
     def validate(self, entries: list[dict], kind: str) -> list[dict]:
         return self._validate(entries, kind)
 
@@ -571,8 +597,18 @@ class GitWorkspace:
             "Factory worker check snapshot",
         ).stdout.strip()
 
-    def check_worktree(self, entries: list[dict]) -> list[dict]:
-        """Run configured checks on a snapshot of the live worktrees."""
+    def check_worktree(
+        self,
+        entries: list[dict],
+        slot_timeout: float | None = None,
+        on_wait=None,
+        on_run=None,
+    ) -> list[dict]:
+        """Run configured checks on a snapshot of the live worktrees.
+
+        Waits for a host check slot up to ``slot_timeout`` seconds, calling
+        ``on_wait`` when it must queue and ``on_run`` once it holds a slot.
+        """
         selected = {}
         for entry in entries:
             _, _, worktree = self._entry(entry)
@@ -581,7 +617,15 @@ class GitWorkspace:
                 if entry["access"] == "write"
                 else entry["candidate"]
             )
-        rows = self._validate(entries, "checks", selected, frozen=False)
+        rows = self._validate(
+            entries,
+            "checks",
+            selected,
+            frozen=False,
+            slot_timeout=slot_timeout,
+            on_wait=on_wait,
+            on_run=on_run,
+        )
         for row in rows:
             row["kind"] = "worker_check"
         return rows
@@ -593,9 +637,30 @@ class GitWorkspace:
         candidates: dict[str, str] | None = None,
         integration_plan: dict | None = None,
         frozen: bool = True,
+        slot_timeout: float | None = None,
+        on_wait=None,
+        on_run=None,
     ) -> list[dict]:
         if kind not in {"checks", "qa"}:
             raise GitFailure("config.invalid", "Unknown validation phase")
+        try:
+            with self.check_slots.acquire(slot_timeout, on_wait):
+                if on_run:
+                    on_run()
+                return self._validate_held(
+                    entries, kind, candidates, integration_plan, frozen
+                )
+        except SlotBusy as error:
+            raise GitFailure("check.slot_busy", str(error)) from error
+
+    def _validate_held(
+        self,
+        entries: list[dict],
+        kind: str,
+        candidates: dict[str, str] | None,
+        integration_plan: dict | None,
+        frozen: bool,
+    ) -> list[dict]:
         for entry in entries:
             if frozen:
                 self._candidate(entry)
@@ -624,9 +689,10 @@ class GitWorkspace:
                 for name, root in roots.items():
                     environment[f"FACTORY_REPO_{name.upper()}"] = str(root)
                 for command in commands:
-                    result = self._command(
-                        command, roots[repo.name], environment
-                    )
+                    with self._run_environment(environment) as run_env:
+                        result = self._command(
+                            command, roots[repo.name], run_env
+                        )
                     mutations = [
                         name
                         for name, root in roots.items()

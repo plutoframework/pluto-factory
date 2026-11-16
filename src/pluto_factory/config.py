@@ -243,6 +243,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "self_improvement",
             "debug",
             "sandbox",
+            "checks",
         }
     )
     lines = [
@@ -264,6 +265,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "triage",
         "autonomy",
         "propagation",
+        "checks",
     ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():
