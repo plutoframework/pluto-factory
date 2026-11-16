@@ -382,7 +382,11 @@ h3 { font-size: 16px; font-weight: 500; letter-spacing: -.035em; }
 .needs-title { font-size: 13px; }
 .decision-context { margin: 0; max-height: 140px; overflow: auto; white-space: pre-wrap; font: 12px/1.45 var(--mono); color: var(--muted); }
 .decision-options { display: flex; flex-wrap: wrap; gap: 6px; }
-.decision-options button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.decision-recommended { color: var(--accent); background: #fffaf2; font-weight: 650; }
+.decision-option.button-primary .decision-recommended { color: var(--accent); background: #fffaf2; }
+.decision-option.is-pending { opacity: .75; cursor: progress; }
+.decision-context-line { margin: 0; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.decision-effects { margin: 0; padding-left: 18px; display: grid; gap: 3px; }
 .decision-text { width: 100%; resize: vertical; padding: 6px 8px; border: 1px solid var(--line); border-radius: 2px; background: var(--surface); color: var(--ink); font: inherit; }
 .decision-actions { display: flex; justify-content: flex-end; }
 .decision-error { color: var(--error); font-size: 12px; }

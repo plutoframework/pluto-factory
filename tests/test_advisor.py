@@ -606,11 +606,42 @@ def test_dashboard_assets_render_framework_tag_and_both_views():
     css = root.joinpath("styles.css").read_text()
     assert 'startsWith("framework:")' in js and "Framework: " in js
     assert "framework-tag" in js and ".framework-tag" in css
-    assert "Raw block text" in js and "Custom feedback" in js
+    assert "Raw block text" in js and "Send custom answer" in js
     # One card renderer serves the Needs-you list and the detail panel.
     assert "map(decisionCard)" in js and "decisionCard(work.decision" in js
     assert 'section("Needs you")' in js
     assert "Recommended" in js
+
+
+def test_decision_buttons_answer_in_one_click_with_clear_styling():
+    from importlib.resources import files
+
+    root = files("pluto_factory").joinpath("dashboard")
+    js = root.joinpath("app.js").read_text()
+    css = root.joinpath("styles.css").read_text()
+    # One click submits the option, the box text goes as the note.
+    assert 'send(option.label, field.value.trim(), button, "Sending…")' in js
+    assert (
+        "state.picked" not in js
+        and "aria-pressed"
+        not in js.split("function decisionCard")[1].split(
+            "let needsReturnFocus"
+        )[0]
+    )
+    assert 'decision.kind === "free_text"' in js and "Send custom answer" in js
+    # Recommended is primary and readable; the rest are secondary.
+    assert 'option.recommended ? "button-primary" : "button-secondary"' in js
+    assert (
+        ".decision-recommended" in css
+        and 'aria-pressed="true"'
+        not in css.split(".decision-options")[1].split("\n")[0]
+    )
+    # Operator context is the visible problem; config buttons say what applies.
+    assert "decision.context" in js and "decision-context-line" in js
+    assert (
+        "`Apply: ${decision.proposal.key} = ${decision.proposal.value}`" in js
+    )
+    assert "is-pending" in js and "Waiting for the coordinator" in js
 
 
 def test_needs_you_is_a_header_button_with_an_accessible_drawer():

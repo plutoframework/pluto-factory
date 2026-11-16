@@ -23,7 +23,7 @@
     openAssignments: new Set(), expanded: false,
     renderedPanelKey: null,
     lastPanelSignature: null, toastTimer: null,
-    needsSignature: null, picked: new Map(), drafts: new Map(), answering: new Set(), answerErrors: new Map(),
+    needsSignature: null, drafts: new Map(), answering: new Set(), answerErrors: new Map(),
   };
 
   function node(tag, className, text) {
@@ -754,6 +754,7 @@
     if (decision.details?.length) {
       card.append(append(node("ul", "decision-details"), ...decision.details.map(item => node("li", "", item))));
     }
+    if (decision.context) card.append(node("p", "decision-context-line", decision.context));
     if (decision.evidence) {
       const raw = node("details", "decision-evidence");
       raw.append(node("summary", "", "Raw block text"), node("pre", "decision-context", decision.evidence));
@@ -767,53 +768,61 @@
       card.append(node("p", "secondary-line", `Applied: ${decision.answer}.`));
       return card;
     }
-    const chosen = () => state.picked.get(decision.id) ?? decision.options.find(o => o.recommended)?.label;
-    const options = node("div", "decision-options");
-    const explain = node("p", "decision-explain secondary-line");
-    const describe = () => {
-      const option = decision.options.find(o => o.label === chosen());
-      explain.replaceChildren();
-      if (!option) return;
-      const lines = [option.effect, option.tradeoff && `Tradeoff: ${option.tradeoff}`,
-        option.fix && `Framework fix: ${option.fix}`, option.recommended && decision.why && `Why: ${decision.why}`];
-      explain.textContent = lines.filter(Boolean).join(" ");
-    };
-    for (const option of decision.options) {
-      const button = node("button", "button button-small decision-option", option.label);
-      button.type = "button";
-      if (option.recommended) button.append(node("span", "badge success", "Recommended"));
-      const tag = frameworkTag(option);
-      if (tag) button.append(tag);
-      button.setAttribute("aria-pressed", String(chosen() === option.label));
-      button.addEventListener("click", () => {
-        state.picked.set(decision.id, option.label);
-        options.querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", String(b === button)));
-        describe();
-      });
-      options.append(button);
-    }
-    describe();
+    const freeText = decision.kind === "free_text";
     const field = node("textarea", "decision-text");
     field.rows = 2; field.maxLength = 4000;
-    field.placeholder = "Custom feedback (optional)";
-    field.setAttribute("aria-label", `Custom feedback: ${decision.question}`);
+    field.placeholder = freeText ? "Or write your own answer" : "Optional note, sent with the option you click";
+    field.setAttribute("aria-label", freeText ? `Custom answer: ${decision.question}` : `Note for the chosen option: ${decision.question}`);
     field.value = state.drafts.get(decision.id) || "";
     field.addEventListener("input", () => state.drafts.set(decision.id, field.value));
-    const submit = node("button", "button", "Answer");
-    submit.type = "button";
-    submit.disabled = state.answering.has(decision.id);
     const error = node("p", "decision-error", state.answerErrors.get(decision.id) || "");
-    submit.addEventListener("click", () => answerDecision({ ...decision, factory: factoryId }, submit, error));
-    append(card, options, explain, field, append(node("div", "decision-actions"), submit), error);
+    const options = node("div", "decision-options");
+    const effects = node("ul", "decision-effects secondary-line");
+    const buttons = [];
+    const send = (answer, note, button, pendingText) =>
+      answerDecision({ ...decision, factory: factoryId }, answer, note, button, buttons, error, pendingText);
+    for (const option of decision.options) {
+      const shown = option.approves && decision.proposal
+        ? `Apply: ${decision.proposal.key} = ${decision.proposal.value}` : option.label;
+      const button = node("button", `button button-small decision-option ${option.recommended ? "button-primary" : "button-secondary"}`, shown);
+      button.type = "button";
+      button.dataset.label = shown;
+      if (option.recommended) button.append(node("span", "badge decision-recommended", "Recommended"));
+      const tag = frameworkTag(option);
+      if (tag) button.append(tag);
+      button.disabled = state.answering.has(decision.id);
+      // One click records this option; the box text rides along as the note.
+      button.addEventListener("click", () => send(option.label, field.value.trim(), button, "Sending…"));
+      buttons.push(button);
+      options.append(button);
+      const line = [option.effect, option.tradeoff && `Tradeoff: ${option.tradeoff}`, option.fix && `Framework fix: ${option.fix}`,
+        option.recommended && decision.why && `Why: ${decision.why}`].filter(Boolean).join(" ");
+      if (line) effects.append(node("li", "", `${shown}: ${line}`));
+    }
+    card.append(options);
+    if (effects.children.length) card.append(effects);
+    card.append(field);
+    if (freeText) {
+      const custom = node("button", "button button-small button-secondary decision-custom", "Send custom answer");
+      custom.type = "button";
+      custom.disabled = state.answering.has(decision.id);
+      custom.addEventListener("click", () => {
+        const text = field.value.trim();
+        if (!text) { error.textContent = "Type an answer first."; field.focus(); return; }
+        send(text, "", custom, "Sending…");
+      });
+      buttons.push(custom);
+      card.append(append(node("div", "decision-actions"), custom));
+    }
+    card.append(error);
     return card;
   }
-  async function answerDecision(decision, button, error) {
-    const picked = state.picked.get(decision.id) ?? decision.options.find(o => o.recommended)?.label;
-    const text = (state.drafts.get(decision.id) || "").trim();
-    let answer = picked, note = text;
-    if (decision.kind === "free_text" && text && !state.picked.has(decision.id)) { answer = text; note = ""; }
-    if (!answer) { error.textContent = "Choose an option or type an answer."; return; }
-    state.answering.add(decision.id); button.disabled = true; error.textContent = "";
+  async function answerDecision(decision, answer, note, button, buttons, error, pendingText) {
+    const original = button.firstChild?.textContent;
+    state.answering.add(decision.id); buttons.forEach(b => { b.disabled = true; });
+    button.setAttribute("aria-busy", "true"); button.classList.add("is-pending");
+    if (button.firstChild) button.firstChild.textContent = pendingText;
+    error.textContent = "";
     try {
       const response = await fetch(`/api/factories/${decision.factory}/decisions/${decision.id}/answer`, {
         method: "POST", cache: "no-store",
@@ -822,15 +831,18 @@
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || "The answer was not recorded.");
-      state.drafts.delete(decision.id); state.picked.delete(decision.id); state.answerErrors.delete(decision.id);
-      showToast("Answer recorded; the coordinator will pick it up");
+      state.drafts.delete(decision.id); state.answerErrors.delete(decision.id);
+      showToast("Answer recorded; waiting for the coordinator");
       state.needsSignature = null; state.lastPanelSignature = null;
       await refresh();
     } catch (failure) {
       state.answerErrors.set(decision.id, failure.message);
       error.textContent = failure.message;
+      button.removeAttribute("aria-busy"); button.classList.remove("is-pending");
+      if (button.firstChild && original !== undefined) button.firstChild.textContent = original;
     } finally {
-      state.answering.delete(decision.id); button.disabled = false;
+      state.answering.delete(decision.id);
+      if (button.isConnected) buttons.forEach(b => { b.disabled = false; });
     }
   }
   let needsReturnFocus = null;

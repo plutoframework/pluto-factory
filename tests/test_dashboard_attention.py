@@ -198,3 +198,57 @@ def test_other_methods_stay_refused_and_get_is_unchanged(world):
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         connection.request("GET", route(factory, decision))
         assert connection.getresponse().status == 404
+
+
+def test_operator_context_is_the_visible_problem_line(world):
+    state, data, _factory, _decision = world
+    add_decision(
+        state,
+        question="Raise timeout?",
+        context="Phase 2 times out on the big repo.\n\nTraceback: boom",
+        kind="free_text",
+    )
+    shown = {d["question"]: d for d in data.state()["needs_you"]["decisions"]}[
+        "Raise timeout?"
+    ]
+    assert shown["context"] == "Phase 2 times out on the big repo."
+    assert shown["evidence"] == "Traceback: boom"
+    # A decision with no extra evidence has none to collapse.
+    add_decision(
+        state, question="Plain?", context="Just this.", kind="free_text"
+    )
+    plain = {d["question"]: d for d in data.state()["needs_you"]["decisions"]}
+    assert plain["Plain?"]["context"] == "Just this."
+    assert plain["Plain?"]["evidence"] == ""
+
+
+def test_worker_block_text_stays_collapsed_evidence(world):
+    state, data, _factory, _decision = world
+    decision = add_decision(
+        state,
+        question="Blocked on tests",
+        context="RAW worker output",
+        kind="free_text",
+        advice="pending",
+    )
+    shown = {d["id"]: d for d in data.state()["needs_you"]["decisions"]}[
+        decision["id"]
+    ]
+    assert shown["context"] == ""
+    assert shown["evidence"] == "RAW worker output"
+
+
+def test_config_decision_projects_key_value_and_approving_option(world):
+    state, data, _factory, _decision = world
+    decision = add_decision(
+        state,
+        question="Raise phase timeout?",
+        kind="config",
+        proposal={"key": "phase_timeout_seconds", "value": 3600},
+    )
+    shown = {d["id"]: d for d in data.state()["needs_you"]["decisions"]}[
+        decision["id"]
+    ]
+    assert shown["proposal"] == {"key": "phase_timeout_seconds", "value": 3600}
+    approves = {o["label"]: o["approves"] for o in shown["options"]}
+    assert approves == {"Apply": True, "Decline": False}
