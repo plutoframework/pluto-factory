@@ -298,3 +298,61 @@ def fix_status(adapter, config, slug, number, view):
         )
     except (GitHubFailure, ValueError, json.JSONDecodeError) as error:
         return False, f"unverifiable ({getattr(error, 'code', 'error')})", ""
+
+
+# -- already-satisfied mechanical items ----------------------------------------
+
+
+def _file(adapter, slug, path):
+    data = _gh_api(adapter, f"repos/{slug}/contents/{path}")
+    return base64.b64decode(data.get("content") or "").decode(errors="replace")
+
+
+def already_satisfied(state, adapter, config, work):
+    """Why a propagation item's goal is verifiably met already, else ''.
+
+    Used when publishing finds no diff against the default branch: the
+    change may have landed through another merge. The requirement must be at
+    or past the target commit, proven by ancestry, never assumed.
+    """
+    payload = work["payload"]
+    if payload.get("source") != "propagation":
+        return ""
+    origin_id, _, step = (payload.get("delivery_key") or "").partition(":")
+    try:
+        origin = state.get_work(origin_id)
+        repo_name = origin["payload"]["repositories"][0]
+        repo = next(r for r in config.repositories if r.name == repo_name)
+        target = _merge_commit(origin, repo.name)
+        if not (repo.github and target):
+            return ""
+        if step.startswith("module:"):
+            module = step.removeprefix("module:")
+            text = _file(adapter, repo.github, f"{module}/go.mod")
+            pattern = (
+                rf"github\.com/{re.escape(repo.github)}(?:/v\d+)?\s+(v\S+)"
+            )
+            where = f"{module} requires {repo.github}"
+        elif step == "cli":
+            pin = config.framework.cli_pins.get(repo.name)
+            if not (pin and config.framework.cli_repo):
+                return ""
+            text = _file(adapter, config.framework.cli_repo, pin.path)
+            pattern = pin.pattern
+            where = f"the CLI pins {repo.name}"
+        else:
+            return ""
+        found = re.search(pattern, text, re.IGNORECASE)
+        if not found:
+            return ""
+        pinned = _pin_commitish(found[1])
+        compare = _gh_api(
+            adapter, f"repos/{repo.github}/compare/{target}...{pinned}"
+        )
+        if compare.get("status") in {"identical", "ahead"}:
+            return f"{where} at {pinned[:12]}, which contains {target[:12]}"
+    except (StopIteration, KeyError, IndexError, ValueError):
+        return ""
+    except GitHubFailure:
+        return ""
+    return ""

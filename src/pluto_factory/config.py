@@ -75,7 +75,10 @@ ROLE_TEXT = {
         "the consuming project, its repositories, issues, work items, "
         "customers or vendors, product features, commit SHAs from private "
         "repositories or private file paths. Describe the need as a generic "
-        "use case (e.g. 'multi-tenant apps need per-tenant OIDC providers')."
+        "use case (e.g. 'multi-tenant apps need per-tenant OIDC providers'). "
+        "When the block is 'No changes to publish', the work may already "
+        "have landed through another merge: if the evidence says so, "
+        "recommend the option with completes=true (mark already satisfied)."
     ),
     "triage": (
         "Triage a new issue for a factory. Read-only: you may read the "

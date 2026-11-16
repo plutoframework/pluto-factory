@@ -68,7 +68,7 @@ from .pr_tracker import (
     PRTracker,
     parse_repair_source,
 )
-from .propagation import propagate
+from .propagation import already_satisfied, propagate
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .scheduler import Scheduler
@@ -799,6 +799,14 @@ class Engine:
             slug, _, number = proposal["pr"].rpartition("#")
             self.tracker.grant(slug, int(number))
         option = chosen_option(decision)
+        if proposal.get("no_changes") and (option or {}).get("completes"):
+            work = self.state.get_work(decision["work_id"])
+            if not self._complete_satisfied(
+                work, f"Owner confirmed: {decision['answer']}"
+            ):
+                raise ValueError("work item could not be completed")
+            mark_applied(self.state, decision["id"], detail)
+            return
         if framework_library(option):
             # Parked until the gap decision is answered or the pin moves.
             gap = record_framework_gap(
@@ -837,7 +845,7 @@ class Engine:
             self.coordinator.config = self.config
         self.scheduler.config = self.config
 
-    def _ask_owner(self, work, reason):
+    def _ask_owner(self, work, reason, no_changes=False):
         """Every deferral a human must resolve becomes a durable decision.
 
         Filed at once with a deterministic terse headline; the advisor
@@ -845,6 +853,19 @@ class Engine:
         Raw block text stays as collapsed evidence.
         """
         advice = fallback_advice(reason)
+        satisfied = {
+            "label": "Mark as already satisfied",
+            "effect": "Complete the item: the change already landed.",
+            "tradeoff": "Skips publishing; check main has the change.",
+            "completes": True,
+            "recommended": True,
+        }
+        hint = (
+            "\nThe candidate has no diff against the default branch: the "
+            "change may already have landed through another merge."
+            if no_changes
+            else ""
+        )
         add_decision(
             self.state,
             work_id=work["id"],
@@ -853,9 +874,11 @@ class Engine:
             question=f"{work['title']}: {terse(reason, 30)}"[:500],
             context=(
                 f"Work '{work['title']}' ({work['id']}), phase "
-                f"{work['phase']}.\n{reason}"
+                f"{work['phase']}.\n{reason}{hint}"
             ),
-            options=[
+            proposal={"no_changes": True} if no_changes else None,
+            options=([satisfied] if no_changes else [])
+            + [
                 {
                     "label": o.label,
                     "effect": o.effect,
@@ -863,7 +886,7 @@ class Engine:
                     "locus": o.locus,
                     "fix": o.fix,
                     "description": o.effect,
-                    "recommended": o.recommended,
+                    "recommended": o.recommended and not no_changes,
                 }
                 for o in advice.options
             ],
@@ -2186,7 +2209,31 @@ class Engine:
             event="work.revision_requested",
         )
 
-    def _defer(self, work, reason):
+    def _complete_satisfied(self, work, reason):
+        """Close an item whose goal is already met; the chain continues."""
+        data = {**work["data"], "already_satisfied": reason}
+        try:
+            self.state.update_work(
+                work["id"],
+                phase="completed",
+                control="settled",
+                current_run=None,
+                data=data,
+                event="work.already_satisfied",
+                notice={
+                    "kind": "completed",
+                    "message": f"{work['title']}: already satisfied",
+                    "incident_key": f"completed:{work['id']}",
+                },
+            )
+        except (ValueError, StateConflict):
+            return False
+        self.state.event(
+            "work.already_satisfied", work["id"], {"reason": reason}
+        )
+        return True
+
+    def _defer(self, work, reason, no_changes=False):
         self.state.update_work(
             work["id"],
             control="deferred",
@@ -2202,7 +2249,7 @@ class Engine:
                 ),
             },
         )
-        self._ask_owner(work, reason)
+        self._ask_owner(work, reason, no_changes=no_changes)
 
     def _failure(self, work_id, failure):
         work = self.state.get_work(work_id)
@@ -2212,6 +2259,12 @@ class Engine:
             )
             return
         self.state.event("failure.observed", work_id, failure.model_dump())
+        if failure.code == "github.no_changes":
+            reason = already_satisfied(
+                self.state, self.tracker.adapter, self.config, work
+            )
+            if reason and self._complete_satisfied(work, reason):
+                return
         recovery = plan_recovery(
             failure,
             work["recoveries"],
@@ -2344,7 +2397,11 @@ class Engine:
         if recovery.action == "defer":
             if run_id != work["current_run"]:
                 work = self.state.update_work(work_id, current_run=run_id)
-            self._defer(work, failure.summary)
+            self._defer(
+                work,
+                failure.summary,
+                no_changes=failure.code == "github.no_changes",
+            )
             return
         if recovery.action == "revise":
             if run_id != work["current_run"]:

@@ -106,6 +106,9 @@ class AdviceOption(Contract):
     # app | framework:<library>; framework options carry a one-line fix.
     locus: str = "app"
     fix: str = ""
+    # Answering this option marks the work item complete (its goal is already
+    # met). Honoured only on "no changes to publish" decisions.
+    completes: bool = False
     # Required for framework options; written for a public issue tracker.
     upstream: UpstreamPayload | None = None
     recommended: bool = False
@@ -372,7 +375,13 @@ def clip_advice(advice):
                 "effect": _clip_words(option.get("effect"), EFFECT_WORDS),
                 "tradeoff": _clip_words(option.get("tradeoff"), TRADEOFF_WORDS),
             }
-            if option.get("fix"):
+            locus = str(option.get("locus") or "app").strip()
+            if not locus.startswith("framework:"):
+                # Receiving repos are frameworks: an app option with a fix
+                # note is reasonable. Sanitize rather than reject.
+                option.pop("fix", None)
+                option.pop("upstream", None)
+            elif option.get("fix"):
                 option["fix"] = _clip_words(option["fix"], FIX_WORDS)
         options.append(option)
     clipped["options"] = options

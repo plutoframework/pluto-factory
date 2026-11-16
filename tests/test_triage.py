@@ -559,3 +559,31 @@ def test_overlong_reply_triages_on_the_first_attempt(tmp_path):
     poll(engine)
     assert len(seen) == 1
     assert decided_events(engine)[0]["source"] == "model"
+
+
+def test_app_option_with_a_fix_note_is_sanitized_not_rejected():
+    """Real failure (cli#30): option 1 was app-locus yet carried a fix."""
+    block = advice_block()
+    block["options"][1] = {
+        **block["options"][1],
+        "locus": "app",
+        "fix": "Add a flag to the generator.",
+        "upstream": {"title": "t"},
+    }
+    result = TriageResult.model_validate(
+        {"outcome": "NEEDS_HUMAN", "advice": block}
+    )
+    assert [o.fix for o in result.advice.options] == ["", ""]
+    assert all(o.upstream is None for o in result.advice.options)
+
+
+def test_sanitizing_keeps_structure_strict():
+    block = advice_block()
+    for option in block["options"]:
+        option["recommended"] = True  # two recommended: still rejected
+        option["fix"] = "note"
+    with pytest.raises(ValueError, match="exactly one"):
+        TriageResult.model_validate({"outcome": "NEEDS_HUMAN", "advice": block})
+    one = {**advice_block(), "options": advice_block()["options"][:1]}
+    with pytest.raises(ValueError):
+        TriageResult.model_validate({"outcome": "NEEDS_HUMAN", "advice": one})
