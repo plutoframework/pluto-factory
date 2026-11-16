@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .attention import (
+    APPROVALS,
     OWNER_PR_STATES,
     UnknownDecision,
     answer_decision,
@@ -217,9 +218,22 @@ def _read(database, selected=None):
         connection.close()
 
 
+CONTEXT_LINE_LIMIT = 600
+
+
 def _project_decision(decision, factory_id, name):
     """Terse problem first; raw block text is separate collapsed evidence."""
     now = time.time()
+    context = decision["context"] or ""
+    shown = ""
+    if decision.get("advice", "none") == "none":
+        # Filed by an operator (CLI/API), not rewritten from a worker block:
+        # its context is the problem statement, not raw evidence. Evidence
+        # after the first paragraph (e.g. a log excerpt) stays collapsed.
+        head, _, rest = context.partition("\n\n")
+        if len(head) <= CONTEXT_LINE_LIMIT:
+            shown, context = head.strip(), rest
+    proposal = decision.get("proposal") or {}
     return {
         "factory": factory_id,
         "factory_name": text(name, 200),
@@ -229,7 +243,13 @@ def _project_decision(decision, factory_id, name):
         "question": text(decision["question"], 500),
         "details": [text(d, 300) for d in decision["details"][:8]],
         "why": text(decision.get("why"), 300),
-        "evidence": text(decision["context"], 6000),
+        "context": text(shown, CONTEXT_LINE_LIMIT),
+        "evidence": text(context.strip(), 6000),
+        "proposal": (
+            {"key": text(proposal["key"], 100), "value": proposal["value"]}
+            if decision["kind"] == "config" and "key" in proposal
+            else None
+        ),
         "options": [
             {
                 "label": text(o["label"], 200),
@@ -238,11 +258,14 @@ def _project_decision(decision, factory_id, name):
                 "locus": text(o.get("locus") or "app", 200),
                 "fix": text(o.get("fix"), 300),
                 "recommended": bool(o["recommended"]),
+                "approves": decision["kind"] == "config"
+                and o["label"].strip().lower() in APPROVALS,
             }
             for o in decision["options"][:10]
         ],
         "state": decision["state"],
         "answer": text(decision["answer"], 500),
+        "custom": bool(decision.get("custom")),
         "advice": decision.get("advice", "none"),
         "created": decision["created"],
         "age": max(0, now - decision["created"]),
