@@ -425,7 +425,18 @@ def revalidate_merged(engine, work):
     }
     evidence_ids = []
     for kind in ("checks", "qa"):
-        evidence = engine.git.validate_merged(data["entries"], merged, kind)
+        # A failure is confirmed by one automatic re-run before the owner is
+        # asked: drift on a merged, CI-green item usually is not a defect.
+        for attempt in (1, 2):
+            evidence = engine.git.validate_merged(data["entries"], merged, kind)
+            if evidence and all(r["passed"] for r in evidence):
+                break
+            if attempt == 1:
+                engine.state.event(
+                    "validation.post_merge.rerun",
+                    work["id"],
+                    {"kind": kind},
+                )
         for result in evidence:
             result["merged_candidate_set"] = result["candidate_set"]
             result["candidate_set"] = candidates

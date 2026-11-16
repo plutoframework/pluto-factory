@@ -665,11 +665,29 @@ def test_config_drift_with_failing_merged_qa_defers_with_reason(merged):
     sha, calls = drift_config(engine, lambda kind: kind != "qa")
     remote.pr["merge_commit"] = sha
     current = advance(engine, work)
-    assert [kind for kind, _ in calls] == ["checks", "qa"]
+    # qa failed, was re-run once, failed again: only then the owner is asked.
+    assert [kind for kind, _ in calls] == ["checks", "qa", "qa"]
     assert current["control"] == "deferred"
     assert not closed
     notices = engine.state.inspect()["notifications"]
     assert any("fails required qa" in row["message"] for row in notices)
+
+
+def test_flaky_merged_qa_passes_on_the_automatic_rerun(merged):
+    engine, work, remote, closed = merged
+    seen = []
+
+    def flaky(kind):
+        seen.append(kind)
+        return not (kind == "qa" and seen.count("qa") == 1)
+
+    sha, calls = drift_config(engine, flaky)
+    remote.pr["merge_commit"] = sha
+    current = advance(engine, work)
+    assert [kind for kind, _ in calls] == ["checks", "qa", "qa"]
+    assert current["phase"] == "completed" and closed == [work["id"]]
+    kinds = [e["kind"] for e in engine.state.inspect()["events"]]
+    assert "validation.post_merge.rerun" in kinds
 
 
 def test_candidate_mismatch_is_still_refused_despite_config_drift(merged):
