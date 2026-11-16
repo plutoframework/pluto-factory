@@ -426,9 +426,11 @@ def describe_factory(home: Path) -> dict:
             "implementer": config.worker.model_dump(),
             "reviewer": config.reviewer.model_dump(),
             "qa": config.qa_model.model_dump(),
+            "merge_manager": config.role_profile("merge_manager").model_dump(),
         }
         if config
         else {},
+        "max_workers": config.concurrency.max_workers if config else 1,
         "current_phase": current["phase"]
         if current
         else ("idle" if running else None),

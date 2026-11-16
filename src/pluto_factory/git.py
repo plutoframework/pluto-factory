@@ -11,13 +11,32 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .config import atomic_json
 from .models import FactoryConfig, Repository, workable_repositories
+
+_REPO_LOCKS: dict[str, threading.RLock] = {}
+_REPO_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def repo_lock(managed):
+    """Serialize mutations of one managed clone across worker threads.
+
+    Parallel work items share a managed clone per repository. Cloning,
+    adding or removing worktrees (which share ``.git/worktrees``) and
+    fast-forwarding the default checkout must not interleave.
+    """
+    key = str(Path(managed).resolve())
+    with _REPO_LOCKS_GUARD:
+        lock = _REPO_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
 
 
 class GitFailure(RuntimeError):
@@ -34,6 +53,30 @@ class GitFailure(RuntimeError):
         self.code = code
         self.summary = summary
         self.uncertain = uncertain
+
+
+def _bounded(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[{len(text) - limit} more chars omitted]"
+
+
+def _hunks(path: Path, limit: int) -> list[str]:
+    """Conflict regions of a file, markers included, each bounded."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    hunks, current = [], None
+    for line in lines:
+        if line.startswith("<<<<<<< "):
+            current = [line]
+        elif current is not None:
+            current.append(line)
+            if line.startswith(">>>>>>> "):
+                hunks.append(_bounded("\n".join(current), limit))
+                current = None
+    return hunks
 
 
 class GitWorkspace:
@@ -233,90 +276,97 @@ class GitWorkspace:
                 self.home / "repositories" / name,
                 self.home / "repositories",
             )
-            default = self._default_branch(source)
-            if not managed.exists():
-                managed.parent.mkdir(parents=True, exist_ok=True)
-                self._git(
-                    managed.parent,
-                    "clone",
-                    "--no-local",
-                    "--no-hardlinks",
-                    "--template=",
-                    "--",
-                    str(source),
-                    str(managed),
+            with repo_lock(managed):
+                entries.append(
+                    self._prepare_repository(repo, source, managed, key)
                 )
-                if self._git(
+        self._save(entries)
+        return entries
+
+    def _prepare_repository(self, repo, source, managed, key) -> dict:
+        name = repo.name
+        default = self._default_branch(source)
+        if not managed.exists():
+            managed.parent.mkdir(parents=True, exist_ok=True)
+            self._git(
+                managed.parent,
+                "clone",
+                "--no-local",
+                "--no-hardlinks",
+                "--template=",
+                "--",
+                str(source),
+                str(managed),
+            )
+            if self._git(
+                managed,
+                "show-ref",
+                "--verify",
+                f"refs/heads/{default}",
+                check=False,
+            ).returncode:
+                self._git(
+                    managed, "checkout", "-b", default, f"origin/{default}"
+                )
+            else:
+                self._git(managed, "checkout", default)
+        else:
+            origin = self._text(managed, "remote", "get-url", "origin")
+            if Path(origin).resolve() != source:
+                raise GitFailure("scope.denied", "Managed clone changed")
+        base = self._text(managed, "rev-parse", f"refs/heads/{default}")
+        worktree = self._owned(
+            self.home / "worktrees" / key / name,
+            self.home / "worktrees",
+        )
+        branch = f"factory/{key}"
+        if not worktree.exists():
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            if repo.access == "read":
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(worktree),
+                    base,
+                )
+            elif (
+                self._git(
                     managed,
                     "show-ref",
                     "--verify",
-                    f"refs/heads/{default}",
+                    f"refs/heads/{branch}",
                     check=False,
-                ).returncode:
-                    self._git(
-                        managed, "checkout", "-b", default, f"origin/{default}"
-                    )
-                else:
-                    self._git(managed, "checkout", default)
+                ).returncode
+                == 0
+            ):
+                self._git(managed, "worktree", "add", str(worktree), branch)
             else:
-                origin = self._text(managed, "remote", "get-url", "origin")
-                if Path(origin).resolve() != source:
-                    raise GitFailure("scope.denied", "Managed clone changed")
-            base = self._text(managed, "rev-parse", f"refs/heads/{default}")
-            worktree = self._owned(
-                self.home / "worktrees" / key / name,
-                self.home / "worktrees",
-            )
-            branch = f"factory/{key}"
-            if not worktree.exists():
-                worktree.parent.mkdir(parents=True, exist_ok=True)
-                if repo.access == "read":
-                    self._git(
-                        managed,
-                        "worktree",
-                        "add",
-                        "--detach",
-                        str(worktree),
-                        base,
-                    )
-                elif (
-                    self._git(
-                        managed,
-                        "show-ref",
-                        "--verify",
-                        f"refs/heads/{branch}",
-                        check=False,
-                    ).returncode
-                    == 0
-                ):
-                    self._git(managed, "worktree", "add", str(worktree), branch)
-                else:
-                    self._git(
-                        managed,
-                        "worktree",
-                        "add",
-                        "-b",
-                        branch,
-                        str(worktree),
-                        base,
-                    )
-            entry = {
-                "name": name,
-                "source": str(source),
-                "managed": str(managed),
-                "worktree": str(worktree),
-                "branch": branch,
-                "default_branch": default,
-                "base": base,
-                "candidate": base,
-                "tree": self._text(managed, "rev-parse", f"{base}^{{tree}}"),
-                "access": repo.access,
-                "work_key": key,
-            }
-            self._entry(entry)
-            entries.append(entry)
-        self._save(entries)
-        return entries
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(worktree),
+                    base,
+                )
+        entry = {
+            "name": name,
+            "source": str(source),
+            "managed": str(managed),
+            "worktree": str(worktree),
+            "branch": branch,
+            "default_branch": default,
+            "base": base,
+            "candidate": base,
+            "tree": self._text(managed, "rev-parse", f"{base}^{{tree}}"),
+            "access": repo.access,
+            "work_key": key,
+        }
+        self._entry(entry)
+        return entry
 
     def snapshot(self, entries: list[dict], work_id: str) -> list[dict]:
         result = []
@@ -447,14 +497,15 @@ class GitWorkspace:
         for entry in entries:
             _, managed, _ = self._entry(entry)
             root = batch / entry["name"]
-            self._git(
-                managed,
-                "worktree",
-                "add",
-                "--detach",
-                str(root),
-                candidates[entry["name"]],
-            )
+            with repo_lock(managed):
+                self._git(
+                    managed,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(root),
+                    candidates[entry["name"]],
+                )
             roots[entry["name"]] = root
         return roots
 
@@ -795,6 +846,88 @@ class GitWorkspace:
             result.append(entry)
         self._save(result)
         return result, changed
+
+    def conflict_context(
+        self,
+        entries: list[dict],
+        *,
+        max_files: int = 12,
+        max_hunk_chars: int = 3000,
+        max_diff_chars: int = 12000,
+        max_commits: int = 8,
+        max_commit_chars: int = 5000,
+    ) -> list[dict]:
+        """What a merge manager needs to resolve a prepared merge.
+
+        Per repository mid-merge: the conflict hunks, this item's own diff
+        and the merged changes (title, body, patch) that touched the
+        conflicting files. Everything is bounded; truncation is marked.
+        """
+        result = []
+        for entry in entries:
+            if entry["access"] != "write":
+                continue
+            _, _, worktree = self._entry(entry)
+            if not self._merging(worktree):
+                continue
+            paths = self._conflict_paths(worktree)[:max_files]
+            base = self._text(worktree, "merge-base", "HEAD", "MERGE_HEAD")
+            commits = []
+            log = self._git(
+                worktree,
+                "log",
+                f"--max-count={max_commits}",
+                "--format=%H%x1f%s%x1f%b%x1e",
+                "MERGE_HEAD",
+                "^HEAD",
+                "--",
+                *paths,
+            ).stdout
+            for record in log.split("\x1e"):
+                if not record.strip():
+                    continue
+                sha, _, rest = record.strip().partition("\x1f")
+                title, _, body = rest.partition("\x1f")
+                patch = self._git(
+                    worktree,
+                    "show",
+                    "--format=",
+                    "--patch",
+                    sha,
+                    "--",
+                    *paths,
+                ).stdout
+                commits.append(
+                    {
+                        "commit": sha,
+                        "title": title,
+                        "body": body.strip()[:2000],
+                        "patch": _bounded(patch, max_commit_chars),
+                    }
+                )
+            result.append(
+                {
+                    "repository": entry["name"],
+                    "worktree": entry["worktree"],
+                    "merge_base": base,
+                    "conflicted_paths": paths,
+                    "hunks": {
+                        path: _hunks(worktree / path, max_hunk_chars)
+                        for path in paths
+                    },
+                    "this_item_diff": _bounded(
+                        self._git(
+                            worktree, "diff", base, "HEAD", "--", *paths
+                        ).stdout,
+                        max_diff_chars,
+                    ),
+                    "this_item_stat": self._text(
+                        worktree, "diff", "--stat", base, "HEAD"
+                    )[:2000],
+                    "merged_changes": commits,
+                }
+            )
+        return result
 
     def _contains(self, managed: Path, ancestor: str, descendant: str) -> bool:
         return (

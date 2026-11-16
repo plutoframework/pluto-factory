@@ -14,6 +14,7 @@ from pathlib import Path
 from .attention import fill_number, record_intent
 from .config import atomic_json
 from .dependencies import DependencyError, source_key
+from .git import repo_lock
 from .github_checks import merge_check_status
 from .github_process import classify_failure, git_command, operation_name
 from .models import FactoryConfig, Submission, workable_repositories
@@ -360,67 +361,71 @@ class GitHubAdapter:
             if entry["name"] not in self.github:
                 continue
             _, managed, slug = self._entry(entry)
-            response = self._json(
-                [
-                    "gh",
-                    "repo",
-                    "view",
-                    slug,
-                    "--json",
-                    "defaultBranchRef",
-                ]
+            with repo_lock(managed):
+                self._refresh_default(entry, managed, slug)
+
+    def _refresh_default(self, entry, managed, slug) -> None:
+        response = self._json(
+            [
+                "gh",
+                "repo",
+                "view",
+                slug,
+                "--json",
+                "defaultBranchRef",
+            ]
+        )
+        default = (response.get("defaultBranchRef") or {}).get("name")
+        if not default or default != entry.get("default_branch"):
+            raise GitHubFailure(
+                "github.default_changed",
+                "Remote default branch needs reconciliation",
             )
-            default = (response.get("defaultBranchRef") or {}).get("name")
-            if not default or default != entry.get("default_branch"):
-                raise GitHubFailure(
-                    "github.default_changed",
-                    "Remote default branch needs reconciliation",
-                )
-            self._git(managed, "check-ref-format", "--branch", default)
-            if self._text(managed, "branch", "--show-current") != default:
-                raise GitHubFailure(
-                    "github.dirty_default", "Managed default checkout changed"
-                )
-            if self._text(managed, "status", "--porcelain"):
-                raise GitHubFailure(
-                    "github.dirty_default", "Managed default is not clean"
-                )
-            remote_ref = f"refs/remotes/factory/{default}"
-            remote = f"https://github.com/{slug}.git"
-            self._git(
-                managed,
-                "fetch",
-                "--no-tags",
-                "--",
-                remote,
-                f"+refs/heads/{default}:{remote_ref}",
-                mutating=True,
+        self._git(managed, "check-ref-format", "--branch", default)
+        if self._text(managed, "branch", "--show-current") != default:
+            raise GitHubFailure(
+                "github.dirty_default", "Managed default checkout changed"
             )
-            latest = self._text(managed, "rev-parse", remote_ref)
-            current = self._text(managed, "rev-parse", f"refs/heads/{default}")
-            if latest == current:
-                continue
-            ancestor = self._git(
-                managed,
-                "merge-base",
-                "--is-ancestor",
-                current,
-                latest,
-                acceptable=(0, 1),
+        if self._text(managed, "status", "--porcelain"):
+            raise GitHubFailure(
+                "github.dirty_default", "Managed default is not clean"
             )
-            if ancestor.returncode:
-                raise GitHubFailure(
-                    "github.default_diverged",
-                    "Managed default cannot fast-forward safely",
-                )
-            self._git(
-                managed,
-                "merge",
-                "--ff-only",
-                "--no-edit",
-                latest,
-                mutating=True,
+        remote_ref = f"refs/remotes/factory/{default}"
+        remote = f"https://github.com/{slug}.git"
+        self._git(
+            managed,
+            "fetch",
+            "--no-tags",
+            "--",
+            remote,
+            f"+refs/heads/{default}:{remote_ref}",
+            mutating=True,
+        )
+        latest = self._text(managed, "rev-parse", remote_ref)
+        current = self._text(managed, "rev-parse", f"refs/heads/{default}")
+        if latest == current:
+            return
+        ancestor = self._git(
+            managed,
+            "merge-base",
+            "--is-ancestor",
+            current,
+            latest,
+            acceptable=(0, 1),
+        )
+        if ancestor.returncode:
+            raise GitHubFailure(
+                "github.default_diverged",
+                "Managed default cannot fast-forward safely",
             )
+        self._git(
+            managed,
+            "merge",
+            "--ff-only",
+            "--no-edit",
+            latest,
+            mutating=True,
+        )
 
     def _record_path(self, work_id):
         key = hashlib.sha256(work_id.encode()).hexdigest()

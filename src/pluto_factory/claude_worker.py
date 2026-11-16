@@ -21,7 +21,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .config import atomic_json
-from .models import WorkerReport
+from .models import WRITER_ROLES, WorkerReport
 from .trace import worker_event
 
 SERVER = "factory"
@@ -222,14 +222,14 @@ def handle_message(assignment: dict, message: dict) -> dict | None:
         result = {}
     elif method == "tools/list":
         tools = [_tool_definition(assignment)]
-        if assignment.get("role") == "implementer":
+        if assignment.get("role") in WRITER_ROLES:
             tools.append(_check_definition())
         result = {"tools": tools}
     elif method == "tools/call":
         params = message.get("params") or {}
         if (
             params.get("name") == CHECK_TOOL
-            and assignment.get("role") == "implementer"
+            and assignment.get("role") in WRITER_ROLES
         ):
             outcome = request_check(assignment)
             return {

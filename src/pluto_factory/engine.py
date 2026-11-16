@@ -1,7 +1,10 @@
 """Durable phase transitions around interchangeable interactive workers."""
 
 import json
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
 
@@ -37,14 +40,25 @@ from .attention import (
     set_pr,
     withdraw_decision,
 )
-from .config import atomic_json, digest, load_config, resolved_bundle
+from .config import (
+    atomic_json,
+    digest,
+    load_config,
+    resolved_bundle,
+    role_prompt,
+)
 from .coordinator import Coordinator, CoordinatorError
 from .framework_sources import pins
 from .git import GitFailure, GitWorkspace
 from .github import GitHubFailure
 from .harness import HarnessError, make_harness
 from .improvements import propose
-from .models import Failure, WorkerReport, workable_repositories
+from .models import (
+    WRITER_ROLES,
+    Failure,
+    WorkerReport,
+    workable_repositories,
+)
 from .notifications import flush
 from .post_merge import confirm_merged, reassess_merged, revalidate_merged
 from .pr_tracker import (
@@ -56,6 +70,7 @@ from .pr_tracker import (
 from .propagation import propagate
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
+from .scheduler import Scheduler
 from .state import State, StateConflict, identity
 from .trace import Tracer
 from .triage import Triager, TriageRunner
@@ -77,6 +92,41 @@ GUIDANCE_AUTHORITY = (
     "reports and deferrals. Follow it, or report precisely why it cannot "
     "be followed; do not defer again for the question it answers."
 )
+
+
+MERGE_MANAGER_RULES = (
+    "Preserve BOTH intents: this item's change and every merged change in "
+    "the packet. Never drop the other side's behavior. Never weaken, "
+    "delete, skip or loosen tests to resolve a conflict. Regenerate "
+    "generated files with the repository's generator instead of "
+    "hand-merging them, where applicable. Change nothing unrelated to the "
+    "conflict. Remove every conflict marker, then run the repository "
+    "checks with factory_check and cite the result."
+)
+CONFLICT_REVIEW_CHECKLIST = (
+    "This candidate contains a conflict resolution against the moving "
+    "default branch. Beyond the normal review: (1) confirm no conflict "
+    "marker remains; (2) confirm the incoming (merged) side's behavior is "
+    "fully preserved, not silently dropped; (3) confirm this item's own "
+    "behavior is still present; (4) confirm no test was weakened, deleted "
+    "or skipped to resolve the conflict; (5) confirm generated files were "
+    "regenerated, not hand-edited; (6) report any lost or duplicated "
+    "logic, and any change unrelated to the conflict, as required findings."
+)
+
+
+def merge_attempt_key(data):
+    """Merge attempts are budgeted per published PR head."""
+    heads = sorted(
+        str(pr.get("head") or "")
+        for pr in data.get("pull_requests", [])
+        if pr.get("state") != "merged"
+    )
+    return ",".join(heads) or "unpublished"
+
+
+def merge_attempt_number(data):
+    return (data.get("merge_attempts") or {}).get(merge_attempt_key(data), 0)
 
 
 def orphaned_terminals(terminals, work_items, factory):
@@ -161,6 +211,14 @@ class Engine:
         if self.tracer.enabled:
             self.state.tracer = self.tracer
         self._reaped_at = None
+        self.scheduler = Scheduler(self.config)
+        # Parallel steps: work id -> (future, phase of the step in flight).
+        self._executor = None
+        self._running = {}
+        self._skips = {}
+        # Coordinator model calls are serialized unless the config allows
+        # parallel decisions; each decision reads only its own item.
+        self._decision_lock = threading.Lock()
         self.github = None
         if self.config.integration == "github":
             from .github_flow import GitHubFlow
@@ -199,6 +257,11 @@ class Engine:
     def tick(self):
         if self.state.is_paused():
             return False
+        if not self.config.concurrency.parallel:
+            return self._tick_serial()
+        return self._tick_parallel()
+
+    def _tick_serial(self):
         work_items = self.state.list_work()
         active = [
             work
@@ -211,7 +274,10 @@ class Engine:
             ready = active or [work for work in work_items if self._ready(work)]
         if not ready:
             return False
-        work = ready[0]
+        self._guarded_step(ready[0])
+        return True
+
+    def _guarded_step(self, work):
         try:
             self._step(work)
         except StateConflict:
@@ -222,7 +288,7 @@ class Engine:
             self._failure(work["id"], Failure.model_validate(error.failure))
         except (GitFailure, GitHubFailure) as error:
             if self._conflict_revision(work, error):
-                return True
+                return
             self._failure(
                 work["id"],
                 Failure(
@@ -241,7 +307,98 @@ class Engine:
                     source="coordinator",
                 ),
             )
-        return True
+
+    # -- parallel workers ------------------------------------------------
+
+    def _tick_parallel(self):
+        """Step every live run, then admit new work up to the limits.
+
+        Steps run on pool threads so a long check or a slow launch for one
+        item never delays observing the others. At most one step per work
+        item is in flight; ``scheduler.admit`` gates everything that would
+        occupy a new slot, repository, phase or host resource.
+        """
+        finished = self._reap_steps()
+        work_items = self.state.list_work()
+        running = {wid: phase for wid, (_, phase) in self._running.items()}
+        ready = [
+            work
+            for work in work_items
+            if work["id"] not in running and self._ready(work)
+        ]
+        submitted = 0
+        for work in ready:
+            if work["current_run"]:
+                self._submit(work)
+                submitted += 1
+        if not self._limited():
+            for work in ready:
+                if work["current_run"]:
+                    continue
+                verdict = self.scheduler.admit(work, work_items, running)
+                if not verdict.admitted:
+                    self._note_skip(work, verdict.reason)
+                    continue
+                self._skips.pop(work["id"], None)
+                if work["phase"] == "queued":
+                    self.scheduler.note_start()
+                running[work["id"]] = work["phase"]
+                self._submit(work)
+                submitted += 1
+        return bool(submitted or finished)
+
+    def _note_skip(self, work, reason):
+        """Record why a ready item waits, once per distinct reason."""
+        if self._skips.get(work["id"]) == reason:
+            return
+        self._skips[work["id"]] = reason
+        self.state.event(
+            "dispatch.deferred",
+            work["id"],
+            {"phase": work["phase"], "reason": reason},
+        )
+
+    def _submit(self, work):
+        if self._executor is None:
+            size = self.config.concurrency.max_workers * 2 + 2
+            self._executor = ThreadPoolExecutor(
+                max_workers=size, thread_name_prefix="factory-step"
+            )
+        future = self._executor.submit(self._guarded_step, work)
+        self._running[work["id"]] = (future, work["phase"])
+
+    def _reap_steps(self):
+        """Collect finished steps; an unexpected error stops the factory."""
+        done = [
+            wid for wid, (future, _) in self._running.items() if future.done()
+        ]
+        futures = [self._running.pop(wid)[0] for wid in done]
+        for future in futures:
+            future.result()
+        return len(done)
+
+    def shutdown(self):
+        """Let in-flight steps finish, then release the step pool."""
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        self._running.clear()
+
+    def drain(self):
+        """Wait for every in-flight step to finish."""
+        while self._running:
+            wait(
+                [future for future, _ in self._running.values()],
+                return_when=FIRST_COMPLETED,
+            )
+            self._reap_steps()
+
+    def active_runs(self):
+        """Work items currently holding a worker slot."""
+        return self.scheduler.active(
+            self.state.list_work(),
+            {wid: phase for wid, (_, phase) in self._running.items()},
+        )
 
     def run(self, once=False, max_seconds=None, watch=None):
         started = time.monotonic()
@@ -272,6 +429,7 @@ class Engine:
                     self.github.poll(force=once)
                 progressed = self.tick()
                 if once:
+                    self.drain()
                     break
                 work = self.state.list_work()
                 pending = [
@@ -287,6 +445,13 @@ class Engine:
                 ]
                 if not pending and not watching:
                     break
+                if not progressed and self._running:
+                    wait(
+                        [f for f, _ in self._running.values()],
+                        timeout=1,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    continue
                 if not progressed:
                     future = [
                         item["wake_at"]
@@ -302,6 +467,7 @@ class Engine:
                         max(min(future) - time.time(), 0.01) if future else 1
                     )
                     Event().wait(min(delay, 1))
+            self.drain()
             self.flush_notifications()
         return self.state.inspect()
 
@@ -361,8 +527,15 @@ class Engine:
                 "reviewing": "reviewer",
                 "qa": "qa",
             }[phase]
+            pending = work["data"].get("conflict_revision") or {}
+            if (
+                role == "implementer"
+                and not repair
+                and pending.get("resolver") == "merge_manager"
+            ):
+                role = "merge_manager"
             notes = None
-            if role == "implementer" and not repair:
+            if role in WRITER_ROLES and not repair:
                 notes = self._synchronize_for_dispatch(work)
                 work = self.state.get_work(work["id"])
                 pending = work["data"].get("conflict_revision")
@@ -634,6 +807,7 @@ class Engine:
         self.triage.triager.config = self.config
         if hasattr(self.coordinator, "config"):
             self.coordinator.config = self.config
+        self.scheduler.config = self.config
 
     def _ask_owner(self, work, reason):
         """Every deferral a human must resolve becomes a durable decision.
@@ -904,6 +1078,17 @@ class Engine:
         try:
             fresh = self.state.get_work(work["id"])
             data = fresh["data"]
+            resolver = "implementer"
+            if self.config.merge_manager_enabled:
+                key = merge_attempt_key(data)
+                attempts = data.setdefault("merge_attempts", {})
+                if attempts.get(key, 0) >= (
+                    self.config.merge_manager.max_merge_attempts
+                ):
+                    self._merge_exhausted(fresh, error, attempts[key])
+                    return True
+                attempts[key] = attempts.get(key, 0) + 1
+                resolver = "merge_manager"
             data["revision_reason"] = (
                 "Resolve merge conflicts with the new default branch: "
                 + ", ".join(error.paths)
@@ -912,6 +1097,7 @@ class Engine:
                 "paths": error.paths,
                 "summary": error.summary,
                 "from_phase": work["phase"],
+                "resolver": resolver,
             }
             data.pop("checks_candidate", None)
             data.pop("qa_candidate", None)
@@ -939,6 +1125,24 @@ class Engine:
         except StateConflict:
             self.state.event("operation.superseded", work["id"], {})
         return True
+
+    def _merge_exhausted(self, work, error, attempts):
+        """Merge-manager budget spent for this PR head: owner decides."""
+        reason = (
+            f"Merge manager made {attempts} attempt(s) at this PR head and "
+            "the branch still conflicts with the default branch in: "
+            + ", ".join(error.paths or [])
+        )
+        for pr in work["data"].get("pull_requests", []):
+            row = get_pr(self.state, pr.get("slug", ""), pr.get("number", 0))
+            if row is not None:
+                set_pr(self.state, row, state="needs_owner", reason=reason)
+        self.state.event(
+            "merge_manager.exhausted",
+            work["id"],
+            {"attempts": attempts, "paths": error.paths},
+        )
+        self._defer(work, reason)
 
     def _synchronize_for_dispatch(self, work):
         """Merge the latest default branch before an implementer starts.
@@ -1036,7 +1240,9 @@ class Engine:
             "trace": self.tracer.assignment_settings(directory),
         }
         Path(assignment["session_dir"]).mkdir(parents=True, exist_ok=True)
-        Path(assignment["role_path"]).write_text(bundle["prompts"][role])
+        Path(assignment["role_path"]).write_text(
+            role_prompt(self.home, bundle, role)
+        )
         atomic_json(
             Path(assignment["schema_path"]), WorkerReport.model_json_schema()
         )
@@ -1078,6 +1284,7 @@ class Engine:
             "revision_reason": work["data"].get("revision_reason"),
             "pr_repair": self._repair_packet(work, role),
             "conflict_revision": work["data"].get("conflict_revision"),
+            **self._conflict_packet(work, role),
             "evidence": bound_evidence(
                 [json.loads(row["data"]) for row in evidence]
             ),
@@ -1091,6 +1298,31 @@ class Engine:
         atomic_json(Path(assignment["assignment_path"]), run["assignment"])
         self.tracer.provenance(work, run)
         self._launch(run)
+
+    def _conflict_packet(self, work, role):
+        """Merge-manager context, or the reviewer's resolution checklist."""
+        conflict = work["data"].get("conflict_revision")
+        if not conflict:
+            return {}
+        if role == "reviewer":
+            if conflict.get("resolver") != "merge_manager":
+                return {}
+            return {"conflict_resolution_checklist": CONFLICT_REVIEW_CHECKLIST}
+        if role != "merge_manager":
+            return {}
+        return {
+            "merge_context": {
+                "rules": MERGE_MANAGER_RULES,
+                "this_item": {
+                    "title": work["payload"]["title"],
+                    "instruction": work["payload"]["instruction"],
+                    "acceptance": work["payload"]["acceptance"],
+                },
+                "conflicts": self.git.conflict_context(work["data"]["entries"]),
+                "attempt": merge_attempt_number(work["data"]),
+                "max_attempts": self.config.merge_manager.max_merge_attempts,
+            }
+        }
 
     def _repair_packet(self, work, role="implementer"):
         target = self._repair_target(work)
@@ -1305,7 +1537,7 @@ class Engine:
 
     def _phase_timeout(self, work):
         run = self.state.get_run(work["current_run"])
-        if run["role"] == "implementer":
+        if run["role"] in WRITER_ROLES:
             return (
                 self.config.implementer_phase_timeout_seconds
                 or self.config.phase_timeout_seconds
@@ -1444,9 +1676,15 @@ class Engine:
                 .get("remaining_work", []),
                 "boundary": "Publication, merging, issue closure and coordinator handoffs are factory duties, not unfinished product scope. Worker remaining-work text is advisory; assess every criterion.",
             }
-        decision = self.coordinator.decide(
-            snapshot, allowed, bundle["prompts"]["orchestrator"]
+        guard = (
+            nullcontext()
+            if self.config.concurrency.coordinator_parallel_decisions
+            else self._decision_lock
         )
+        with guard:
+            decision = self.coordinator.decide(
+                snapshot, allowed, bundle["prompts"]["orchestrator"]
+            )
         current = self.state.get_work(work["id"])
         if (
             current["updated"] != work["updated"]
@@ -1519,7 +1757,7 @@ class Engine:
         else:
             allowed, preferred = {"advance", "revise", "defer"}, "advance"
         if (
-            run["role"] == "implementer"
+            run["role"] in WRITER_ROLES
             and report.outcome == "ready"
             and not required_findings
         ):
@@ -1548,7 +1786,7 @@ class Engine:
                 },
             )
         else:
-            if run["role"] == "implementer":
+            if run["role"] in WRITER_ROLES:
                 # The coordinator must judge what the implementer actually
                 # committed, not the candidate frozen at prepare time.
                 self._refresh_candidate(work)
@@ -1605,6 +1843,7 @@ class Engine:
         else:
             phase = {
                 "implementer": "checking",
+                "merge_manager": "checking",
                 "reviewer": "pushing" if repair else "preparing",
                 "qa": "integrating",
             }[run["role"]]

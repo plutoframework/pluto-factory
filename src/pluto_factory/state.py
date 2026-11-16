@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -38,6 +39,16 @@ OBSERVATION_HEARTBEAT = 60.0
 DELIVERY_PHASES = {"awaiting_merge", "completed"}
 
 
+class WorkData(dict):
+    """A work item's ``data`` as read, remembering the values it was read as.
+
+    ``update_work`` merges a write of this object against that base, so only
+    keys the writer actually changed are applied.
+    """
+
+    base: dict | None = None
+
+
 class StateConflict(RuntimeError):
     """An owner changed control state while an operation was in progress."""
 
@@ -48,11 +59,12 @@ class State:
         self.home.mkdir(parents=True, exist_ok=True)
         # Optional debug Tracer; durable events are mirrored into its trace.
         self.tracer = None
-        self.db = sqlite3.connect(self.home / "state.sqlite3", timeout=10)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys = ON")
+        # One SQLite connection per thread: parallel workers step on pool
+        # threads, and a connection may only be used by its creator.
+        self._local = threading.local()
+        self._connections = []
+        self._connections_lock = threading.Lock()
         self.db.execute("PRAGMA journal_mode = WAL")
-        self.db.execute("PRAGMA busy_timeout = 10000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, 1):
             raise ValueError(f"unsupported database schema version {version}")
@@ -128,8 +140,32 @@ class State:
         ):
             (self.home / folder).mkdir(exist_ok=True)
 
+    @property
+    def db(self):
+        connection = getattr(self._local, "db", None)
+        if connection is None:
+            connection = sqlite3.connect(
+                self.home / "state.sqlite3",
+                timeout=10,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            self._local.db = connection
+            with self._connections_lock:
+                self._connections.append(connection)
+        return connection
+
     def close(self):
-        self.db.close()
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for connection in connections:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        self._local = threading.local()
 
     @contextmanager
     def writer(self):
@@ -373,13 +409,53 @@ class State:
         if row is None:
             raise ValueError(f"unknown work item: {work_id}")
         result = dict(row)
+        self._snapshots()[work_id] = result["data"]
         result["payload"] = json.loads(result["payload"])
-        result["data"] = json.loads(result["data"])
+        data = WorkData(json.loads(result["data"]))
+        data.base = json.loads(result["data"])
+        result["data"] = data
         return result
 
+    def _snapshots(self):
+        """Raw ``data`` this thread last read per work item (merge base)."""
+        snapshots = getattr(self._local, "snapshots", None)
+        if snapshots is None:
+            snapshots = self._local.snapshots = {}
+        return snapshots
+
+    @staticmethod
+    def _merge_data(base, mine, current):
+        """Three-way merge on top-level keys.
+
+        Keys this caller changed, added or removed (against what it read)
+        are applied to the row's current data; keys it left alone keep the
+        current value, so a concurrent writer's keys are never undone.
+        """
+        merged = dict(current)
+        for key in set(base) | set(mine):
+            if key not in mine:
+                merged.pop(key, None)
+            elif key not in base or mine[key] != base[key]:
+                merged[key] = mine[key]
+        return merged
+
     def update_work(
-        self, work_id, *, event="work.updated", notice=None, **values
+        self,
+        work_id,
+        *,
+        event="work.updated",
+        notice=None,
+        mutate=None,
+        **values,
     ):
+        """Update a work row atomically.
+
+        ``mutate(data)`` runs inside the write transaction on the row's
+        current data (edit in place or return a new dict): the preferred
+        form for ``data``. A plain ``data=`` write is merged key-wise
+        against the snapshot this thread last read, so it can never
+        overwrite keys another writer changed in between.
+        """
         allowed = {
             "phase",
             "control",
@@ -390,19 +466,34 @@ class State:
             "wake_at",
             "data",
         }
-        if not values or not set(values).issubset(allowed):
+        if mutate is not None and "data" in values:
+            raise ValueError("use either data= or mutate=")
+        if (not values and mutate is None) or not set(values).issubset(allowed):
             raise ValueError("invalid work update")
-        stored = {
-            key: encode(value) if key == "data" else value
-            for key, value in values.items()
-        }
-        stored["updated"] = time.time()
-        query = ",".join(f"{key}=?" for key in stored)
+        base_raw = self._snapshots().get(work_id)
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             current = self.get_work(work_id)
             if current["control"] == "paused" or self.is_paused():
                 raise StateConflict("factory or work item is paused")
+            if mutate is not None:
+                data = current["data"]
+                returned = mutate(data)
+                values["data"] = data if returned is None else returned
+            elif "data" in values:
+                base = getattr(values["data"], "base", None)
+                if base is None and base_raw is not None:
+                    base = json.loads(base_raw)
+                if base is not None:
+                    values["data"] = self._merge_data(
+                        base, values["data"], dict(current["data"])
+                    )
+            stored = {
+                key: encode(value) if key == "data" else value
+                for key, value in values.items()
+            }
+            stored["updated"] = time.time()
+            query = ",".join(f"{key}=?" for key in stored)
             if values.get("phase") in DELIVERY_PHASES:
                 self._require_tracking(current, values)
             self.db.execute(
