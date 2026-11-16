@@ -76,6 +76,17 @@ class AdvisorPolicy(Contract):
         return paths
 
 
+class CliPin(Contract):
+    """Where the CLI pins a library: a file and a regex with one group.
+
+    The group yields a commit-ish: a SHA, a tag, or a Go pseudo-version
+    (whose trailing 12 hex digits name the commit).
+    """
+
+    path: str = Field(min_length=1)
+    pattern: str = Field(min_length=1)
+
+
 class FrameworkPolicy(Contract):
     """Where framework gaps go: library name -> upstream GitHub repository."""
 
@@ -85,6 +96,11 @@ class FrameworkPolicy(Contract):
     file_upstream: Literal["on_decision", "auto"] = "on_decision"
     # Extra private terms the upstream scrubber must never let through.
     redact_terms: list[str] = Field(default_factory=list)
+    # Dependent side: a fix is consumable once the library revision the
+    # newest CLI revision pins contains it. Empty cli_repo disables the check.
+    cli_repo: str = ""
+    cli_ref: str = "main"
+    cli_pins: dict[str, CliPin] = Field(default_factory=dict)
 
     @field_validator("upstream")
     @classmethod
@@ -106,6 +122,27 @@ class FrameworkPolicy(Contract):
             if norm(name) == norm(library):
                 return repo
         return ""
+
+
+class PropagationRule(Contract):
+    library: str = Field(min_length=1)
+    # Sibling modules in the same repo that must land the fix pinned to the
+    # merge commit before the CLI can consume it (e.g. a Go store module).
+    sibling_modules: list[str] = Field(default_factory=list)
+    cli_bump: bool = False
+
+
+class PropagationPolicy(Contract):
+    """Receiving side: follow-up work that makes a library fix consumable."""
+
+    cli_repo: str = ""
+    rules: list[PropagationRule] = Field(default_factory=list)
+
+    def rule(self, library: str):
+        return next(
+            (r for r in self.rules if r.library.lower() == library.lower()),
+            None,
+        )
 
 
 class AutonomyPolicy(Contract):
@@ -289,6 +326,7 @@ class FactoryConfig(Contract):
     framework: FrameworkPolicy = Field(default_factory=FrameworkPolicy)
     triage: TriagePolicy = Field(default_factory=TriagePolicy)
     autonomy: AutonomyPolicy = Field(default_factory=AutonomyPolicy)
+    propagation: PropagationPolicy = Field(default_factory=PropagationPolicy)
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"

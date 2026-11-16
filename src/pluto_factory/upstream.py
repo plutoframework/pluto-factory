@@ -17,6 +17,7 @@ import time
 
 from . import attention
 from .github import GitHubFailure
+from .propagation import fix_status
 
 SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 ISSUE_URL = re.compile(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)")
@@ -473,7 +474,7 @@ def poll_external(state, adapter, config, resume, *, force=False):
         known = state.db.execute(
             "SELECT state FROM external_issues WHERE key=?", (key,)
         ).fetchone()
-        if known and known["state"] != "open":
+        if known and known["state"] in {"completed", "not_planned", "waived"}:
             continue
         try:
             view = adapter._json(
@@ -507,6 +508,27 @@ def poll_external(state, adapter, config, resume, *, force=False):
         reason = str(view.get("stateReason") or "COMPLETED").upper()
         outcome = "not_planned" if reason == "NOT_PLANNED" else "completed"
         closing = closing_reference(view)
+        cli_revision = ""
+        if outcome == "completed":
+            ready, pending, cli_revision = fix_status(
+                adapter, config, slug, number, view
+            )
+            if not ready:
+                with state.db:
+                    state.db.execute(
+                        "INSERT INTO external_issues (key,slug,number,state,"
+                        "closing,checked) VALUES (?,?,?,'awaiting_fix',?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET state='awaiting_fix',"
+                        "closing=excluded.closing,checked=excluded.checked",
+                        (key, slug, number, f"waiting: {pending}", time.time()),
+                    )
+                state.event(
+                    "external.pending",
+                    "factory",
+                    {"issue": key, "waiting_on": pending},
+                    f"external-pending:{key}:{pending}",
+                )
+                continue
         with state.db:
             state.db.execute(
                 "INSERT INTO external_issues (key,slug,number,state,closing,"
@@ -523,13 +545,29 @@ def poll_external(state, adapter, config, resume, *, force=False):
         changed.append(key)
         for work_id in work_ids:
             if outcome == "completed":
-                resume(work_id, slug, number, closing)
+                if cli_revision:
+                    resume(
+                        work_id,
+                        slug,
+                        number,
+                        closing,
+                        cli_revision=cli_revision,
+                    )
+                else:
+                    resume(work_id, slug, number, closing)
             else:
                 _ask_not_planned(state, work_id, key, slug, number)
     return changed
 
 
-def fixed_guidance(slug, number, closing):
+def fixed_guidance(slug, number, closing, cli_revision=""):
+    if cli_revision:
+        return (
+            f"Upstream {slug}#{number} fixed ({closing}) and consumable "
+            f"through CLI revision {cli_revision}. Pin that CLI revision in "
+            "CI, run `pluto generate`, adopt the change if needed, then "
+            "continue."
+        )
     return (
         f"Upstream {slug}#{number} fixed ({closing}); bump the pinned "
         "dependency to include it, then continue."

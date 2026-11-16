@@ -97,6 +97,7 @@ BUNDLE_EXCLUDED = {
     "triage",
     "framework",
     "autonomy",
+    "propagation",
     "advisor_model",
     "tracked_repositories",
     "pr_poll_seconds",
@@ -115,6 +116,8 @@ def _toml(value):
             )
             + " }"
         )
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml(item) for item in value) + "]"
     return json.dumps(value)
 
 
@@ -208,6 +211,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "framework",
             "triage",
             "autonomy",
+            "propagation",
             "worker",
             "reviewer",
             "qa_model",
@@ -232,6 +236,7 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "framework",
         "triage",
         "autonomy",
+        "propagation",
     ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():
