@@ -126,3 +126,38 @@ def test_step_pool_runs_and_reports_results_and_errors():
     with pytest.raises(ValueError):
         pool.submit(boom).result(timeout=5)
     pool.shutdown(wait=True)
+
+
+def test_step_pool_spawns_when_queued_work_exceeds_idle_threads():
+    # Deterministic: hold the first thread in the window where it already
+    # counts itself idle but has not taken its item yet, then submit again.
+    import queue
+    import threading
+
+    from pluto_factory.steppool import StepPool
+
+    pool = StepPool(2)
+    waiting, release = threading.Event(), threading.Event()
+    real = queue.SimpleQueue()
+
+    class Gated:
+        def put(self, item):
+            real.put(item)
+
+        def qsize(self):
+            return real.qsize()
+
+        def get(self):
+            waiting.set()
+            release.wait(5)
+            return real.get()
+
+    pool._queue = Gated()
+    barrier = threading.Barrier(2, timeout=5)
+    first = pool.submit(barrier.wait)
+    assert waiting.wait(5)
+    second = pool.submit(barrier.wait)
+    release.set()
+    first.result(timeout=10)
+    second.result(timeout=10)
+    pool.shutdown(wait=False)

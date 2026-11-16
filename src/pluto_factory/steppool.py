@@ -28,7 +28,12 @@ class StepPool:
             if self._closed:
                 raise RuntimeError("step pool is shut down")
             self._queue.put((future, fn, args, kwargs))
-            if self._idle == 0 and len(self._threads) < self.max_workers:
+            # A thread counts itself idle before it takes its first item,
+            # so compare queued work with idle threads, not idle with zero.
+            if (
+                self._queue.qsize() > self._idle
+                and len(self._threads) < self.max_workers
+            ):
                 thread = threading.Thread(
                     target=self._work,
                     name=f"{self._prefix}_{len(self._threads)}",
