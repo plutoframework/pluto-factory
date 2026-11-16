@@ -716,8 +716,9 @@
   function renderNeeds() {
     const needs = state.data?.needs_you || { pull_requests: [], decisions: [], count: 0 };
     const signature = JSON.stringify([needs.pull_requests, needs.decisions].map(list => list.map(({ age, ...rest }) => rest)));
-    $("#needs-you").hidden = !needs.pull_requests.length && !needs.decisions.length;
+    $("#needs-button").classList.toggle("has-needs", needs.count > 0);
     $("#needs-count").textContent = needs.count ? String(needs.count) : "";
+    $("#needs-button").setAttribute("aria-label", needs.count ? `Needs you, ${needs.count} waiting` : "Needs you");
     if (signature === state.needsSignature) return;
     // Keep text the owner is typing: only rebuild when the data changed.
     if (state.needsSignature !== null && document.activeElement?.closest?.("#needs-decisions")) {
@@ -832,6 +833,36 @@
       state.answering.delete(decision.id); button.disabled = false;
     }
   }
+  let needsReturnFocus = null;
+  const needsFocusable = () => [...$("#needs-drawer").querySelectorAll(
+    "a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex='-1'])")].filter(el => !el.closest("[hidden]"));
+  function setNeedsOpen(open) {
+    const drawer = $("#needs-drawer");
+    if (open === !drawer.hidden) return;
+    drawer.hidden = !open; $("#needs-backdrop").hidden = !open;
+    $("#needs-button").setAttribute("aria-expanded", String(open));
+    document.body.classList.toggle("needs-open", open);
+    // The page behind a modal drawer is inert: no tabbing or reading into it.
+    for (const el of document.querySelectorAll("#main, .skip-link")) el.inert = open;
+    if (open) {
+      needsReturnFocus = document.activeElement;
+      (needsFocusable().find(el => el.id === "needs-close") || drawer).focus();
+    } else {
+      (needsReturnFocus?.isConnected ? needsReturnFocus : $("#needs-button")).focus();
+      needsReturnFocus = null;
+    }
+  }
+  $("#needs-button").addEventListener("click", () => setNeedsOpen($("#needs-drawer").hidden));
+  $("#needs-close").addEventListener("click", () => setNeedsOpen(false));
+  $("#needs-backdrop").addEventListener("click", () => setNeedsOpen(false));
+  $("#needs-drawer").addEventListener("keydown", event => {
+    if (event.key !== "Tab") return;
+    const items = needsFocusable();
+    if (!items.length) { event.preventDefault(); return; }
+    const first = items[0], last = items[items.length - 1];
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === $("#needs-drawer"))) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  });
   function renderAll() {
     renderNeeds(); renderFactories(); renderHeader(); renderPipeline(); renderQueue(); renderDetail();
   }
@@ -980,7 +1011,10 @@
   $("#expand-task").addEventListener("click", () => setTaskExpanded(!state.expanded));
   $("#back-to-queue").addEventListener("click", returnToQueue);
   document.addEventListener("keydown", event => {
-    if (event.key === "Escape" && state.expanded) {
+    if (event.key === "Escape" && !$("#needs-drawer").hidden) {
+      event.preventDefault();
+      setNeedsOpen(false);
+    } else if (event.key === "Escape" && state.expanded) {
       event.preventDefault();
       setTaskExpanded(false, true);
     }

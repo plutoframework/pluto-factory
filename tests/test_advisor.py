@@ -613,6 +613,34 @@ def test_dashboard_assets_render_framework_tag_and_both_views():
     assert "Recommended" in js
 
 
+def test_needs_you_is_a_header_button_with_an_accessible_drawer():
+    from importlib.resources import files
+
+    root = files("pluto_factory").joinpath("dashboard")
+    html = root.joinpath("index.html").read_text()
+    js = root.joinpath("app.js").read_text()
+    css = root.joinpath("styles.css").read_text()
+    # The inline section is gone; the button sits in the header actions,
+    # which render on every factory view, before Refresh.
+    assert 'id="needs-you"' not in html and "needs-surface" not in css
+    header = html[html.index('class="header-actions"') :]
+    assert header.index('id="needs-button"') < header.index("refresh-button")
+    assert 'id="needs-count"' in header.split("</header>")[0]
+    assert ".needs-button.has-needs" in css and "has-needs" in js
+    # Drawer: modal dialog with both lists, a close button and a backdrop.
+    drawer = html[html.index('id="needs-drawer"') :]
+    assert 'role="dialog"' in drawer and 'aria-modal="true"' in drawer
+    for ident in ("needs-prs", "needs-decisions", "needs-close"):
+        assert f'id="{ident}"' in drawer
+    assert 'id="needs-backdrop"' in html
+    # Esc, backdrop and X close it; focus is moved in, trapped and restored.
+    assert '"#needs-close").addEventListener("click"' in js
+    assert '"#needs-backdrop").addEventListener("click"' in js
+    assert 'event.key === "Escape" && !$("#needs-drawer").hidden' in js
+    assert "inert" in js and "needsReturnFocus" in js and '"Tab"' in js
+    assert ".needs-drawer" in css and "aria-expanded" in html
+
+
 def test_fallback_advice_is_schema_valid():
     for pr in (False, True):
         Advice.model_validate(
