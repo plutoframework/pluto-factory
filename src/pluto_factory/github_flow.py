@@ -152,7 +152,7 @@ class GitHubFlow:
         data = work["data"]
         data["pull_requests"] = pull_requests
         data["remaining_after_merge"] = remaining
-        if self.config.github_auto_merge:
+        if self.config.github_auto_merge and not self.queue_active:
             self.adapter.request_merge(pull_requests)
         self.state.update_work(
             work["id"],
@@ -168,6 +168,61 @@ class GitHubFlow:
                 "incident_key": f"prs:{work['id']}:{work['generation']}",
             },
         )
+
+    @property
+    def queue_active(self):
+        """The merge queue serializes same-repository merges when parallel."""
+        return self.config.concurrency.parallel
+
+    def queue_heads(self, work):
+        """slug -> True when this work's PR is first in that repo's queue.
+
+        The queue is every work item awaiting merge with an open PR in the
+        repository, oldest item first. Only the head merges (or is offered
+        to the owner) and resyncs on the newest base; the rest wait.
+        """
+        if not self.queue_active:
+            return {}
+        slugs = {
+            pr.get("slug")
+            for pr in work["data"].get("pull_requests", [])
+            if pr.get("state", "open") == "open"
+        }
+        heads = {}
+        for slug in slugs:
+            for other in self.state.list_work():
+                if other["phase"] != "awaiting_merge" or other["control"] in {
+                    "paused",
+                    "deferred",
+                    "quarantined",
+                }:
+                    continue
+                if any(
+                    pr.get("slug") == slug and pr.get("state", "open") == "open"
+                    for pr in other["data"].get("pull_requests", [])
+                ):
+                    heads[slug] = other["id"] == work["id"]
+                    break
+            else:
+                heads[slug] = True
+        return heads
+
+    def _ready_for_owner(self, work, pull_requests):
+        """Auto-merge is off: announce the queue head once per PR head."""
+        ready = [
+            pr
+            for pr in pull_requests
+            if pr.get("state") == "open" and pr.get("merge_state") == "CLEAN"
+        ]
+        for pr in ready:
+            self.state.notify(
+                work["id"],
+                "progress",
+                f"Next in the merge queue for {pr.get('slug')}: "
+                f"{pr.get('url', '')}",
+                f"merge-queue-ready:{pr.get('slug')}#{pr.get('number')}:"
+                f"{pr.get('head')}",
+            )
 
     def advance(
         self,
@@ -212,6 +267,7 @@ class GitHubFlow:
             defer(work, "A required pull request was closed without merging")
             return
         if status != "merged":
+            heads = self.queue_heads(work)
             stale = [
                 pr
                 for pr in result["pull_requests"]
@@ -219,8 +275,13 @@ class GitHubFlow:
                 and (
                     pr.get("merge_state") == "DIRTY"
                     or (
-                        self.config.github_require_up_to_date
-                        and pr.get("merge_state") == "BEHIND"
+                        pr.get("merge_state") == "BEHIND"
+                        and (
+                            self.config.github_require_up_to_date
+                            # Queue head only: followers resync when they
+                            # reach the front, on whatever base is newest.
+                            or heads.get(pr.get("slug"))
+                        )
                     )
                 )
             ]
@@ -228,8 +289,24 @@ class GitHubFlow:
                 work = self.state.update_work(work["id"], data=data)
                 resync(work, stale)
                 return
-            if self.config.github_auto_merge:
+            if self.queue_active and not all(
+                heads.get(pr.get("slug"), True)
+                for pr in result["pull_requests"]
+                if pr.get("state") == "open"
+            ):
+                waiting = sorted(
+                    slug for slug, head in heads.items() if not head
+                )
+                self.state.event(
+                    "merge_queue.waiting",
+                    work["id"],
+                    {"repositories": waiting},
+                    f"merge-queue-wait:{work['id']}:{','.join(waiting)}",
+                )
+            elif self.config.github_auto_merge:
                 self.adapter.request_merge(result["pull_requests"])
+            elif self.queue_active:
+                self._ready_for_owner(work, result["pull_requests"])
             self.state.update_work(
                 work["id"],
                 data=data,

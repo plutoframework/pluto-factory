@@ -55,6 +55,30 @@ class GitFailure(RuntimeError):
         self.uncertain = uncertain
 
 
+def _bounded(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[{len(text) - limit} more chars omitted]"
+
+
+def _hunks(path: Path, limit: int) -> list[str]:
+    """Conflict regions of a file, markers included, each bounded."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    hunks, current = [], None
+    for line in lines:
+        if line.startswith("<<<<<<< "):
+            current = [line]
+        elif current is not None:
+            current.append(line)
+            if line.startswith(">>>>>>> "):
+                hunks.append(_bounded("\n".join(current), limit))
+                current = None
+    return hunks
+
+
 class GitWorkspace:
     def __init__(self, home: Path, config: FactoryConfig) -> None:
         self.home = home.resolve()
@@ -822,6 +846,88 @@ class GitWorkspace:
             result.append(entry)
         self._save(result)
         return result, changed
+
+    def conflict_context(
+        self,
+        entries: list[dict],
+        *,
+        max_files: int = 12,
+        max_hunk_chars: int = 3000,
+        max_diff_chars: int = 12000,
+        max_commits: int = 8,
+        max_commit_chars: int = 5000,
+    ) -> list[dict]:
+        """What a merge manager needs to resolve a prepared merge.
+
+        Per repository mid-merge: the conflict hunks, this item's own diff
+        and the merged changes (title, body, patch) that touched the
+        conflicting files. Everything is bounded; truncation is marked.
+        """
+        result = []
+        for entry in entries:
+            if entry["access"] != "write":
+                continue
+            _, _, worktree = self._entry(entry)
+            if not self._merging(worktree):
+                continue
+            paths = self._conflict_paths(worktree)[:max_files]
+            base = self._text(worktree, "merge-base", "HEAD", "MERGE_HEAD")
+            commits = []
+            log = self._git(
+                worktree,
+                "log",
+                f"--max-count={max_commits}",
+                "--format=%H%x1f%s%x1f%b%x1e",
+                "MERGE_HEAD",
+                "^HEAD",
+                "--",
+                *paths,
+            ).stdout
+            for record in log.split("\x1e"):
+                if not record.strip():
+                    continue
+                sha, _, rest = record.strip().partition("\x1f")
+                title, _, body = rest.partition("\x1f")
+                patch = self._git(
+                    worktree,
+                    "show",
+                    "--format=",
+                    "--patch",
+                    sha,
+                    "--",
+                    *paths,
+                ).stdout
+                commits.append(
+                    {
+                        "commit": sha,
+                        "title": title,
+                        "body": body.strip()[:2000],
+                        "patch": _bounded(patch, max_commit_chars),
+                    }
+                )
+            result.append(
+                {
+                    "repository": entry["name"],
+                    "worktree": entry["worktree"],
+                    "merge_base": base,
+                    "conflicted_paths": paths,
+                    "hunks": {
+                        path: _hunks(worktree / path, max_hunk_chars)
+                        for path in paths
+                    },
+                    "this_item_diff": _bounded(
+                        self._git(
+                            worktree, "diff", base, "HEAD", "--", *paths
+                        ).stdout,
+                        max_diff_chars,
+                    ),
+                    "this_item_stat": self._text(
+                        worktree, "diff", "--stat", base, "HEAD"
+                    )[:2000],
+                    "merged_changes": commits,
+                }
+            )
+        return result
 
     def _contains(self, managed: Path, ancestor: str, descendant: str) -> bool:
         return (
