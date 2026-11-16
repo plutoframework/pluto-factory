@@ -738,7 +738,7 @@
       return item;
     }) : [node("li", "muted", "No pull requests need you.")]));
     const list = $("#needs-decisions");
-    list.replaceChildren(...(needs.decisions.length ? needs.decisions.map(decisionCard) : [node("p", "muted", "No open decisions.")]));
+    list.replaceChildren(...(needs.decisions.length ? needs.decisions.map(decision => decisionCard(decision)) : [node("p", "muted", "No open decisions.")]));
   }
   function frameworkTag(option) {
     if (!option.locus || !option.locus.startsWith("framework:")) return null;
