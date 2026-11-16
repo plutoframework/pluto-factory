@@ -18,7 +18,9 @@ class StepPool:
         self._prefix = thread_name_prefix
         self._queue = queue.SimpleQueue()
         self._threads = []
-        self._idle = 0
+        # Submitted items not yet finished. Each gets a thread (up to
+        # max_workers); idle counting races with queue.get, this cannot.
+        self._outstanding = 0
         self._lock = threading.Lock()
         self._closed = False
 
@@ -28,10 +30,9 @@ class StepPool:
             if self._closed:
                 raise RuntimeError("step pool is shut down")
             self._queue.put((future, fn, args, kwargs))
-            # A thread counts itself idle before it takes its first item,
-            # so compare queued work with idle threads, not idle with zero.
+            self._outstanding += 1
             if (
-                self._queue.qsize() > self._idle
+                self._outstanding > len(self._threads)
                 and len(self._threads) < self.max_workers
             ):
                 thread = threading.Thread(
@@ -45,20 +46,20 @@ class StepPool:
 
     def _work(self):
         while True:
-            with self._lock:
-                self._idle += 1
             item = self._queue.get()
-            with self._lock:
-                self._idle -= 1
             if item is None:
                 return
             future, fn, args, kwargs = item
-            if not future.set_running_or_notify_cancel():
-                continue
             try:
-                future.set_result(fn(*args, **kwargs))
-            except BaseException as error:  # noqa: BLE001 - delivered
-                future.set_exception(error)
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as error:  # noqa: BLE001 - delivered
+                    future.set_exception(error)
+            finally:
+                with self._lock:
+                    self._outstanding -= 1
 
     def shutdown(self, wait=True, cancel_futures=False):
         with self._lock:
@@ -72,6 +73,8 @@ class StepPool:
                     break
                 if item is not None:
                     item[0].cancel()
+                    with self._lock:
+                        self._outstanding -= 1
         for _ in threads:
             self._queue.put(None)
         if wait:

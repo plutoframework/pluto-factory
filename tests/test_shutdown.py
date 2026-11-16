@@ -128,7 +128,7 @@ def test_step_pool_runs_and_reports_results_and_errors():
     pool.shutdown(wait=True)
 
 
-def test_step_pool_spawns_when_queued_work_exceeds_idle_threads():
+def test_step_pool_gives_each_outstanding_item_a_thread():
     # Deterministic: hold the first thread in the window where it already
     # counts itself idle but has not taken its item yet, then submit again.
     import queue
