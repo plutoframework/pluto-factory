@@ -499,6 +499,7 @@ class DashboardData:
                     "status",
                     "coordinator_running",
                     "models",
+                    "max_workers",
                     "repositories",
                     "last_activity",
                     "errors",
@@ -507,6 +508,7 @@ class DashboardData:
             projected["id"] = self.factory_id(home)
             projected["paused"] = entry["status"] == "paused"
             projected["work"] = []
+            projected["max_workers"] = entry.get("max_workers") or 1
             try:
                 snapshot = _snapshot(home, _read)
                 if snapshot:
@@ -530,6 +532,9 @@ class DashboardData:
                     projected["work_truncated"] = (
                         len(snapshot["work"]) == MAX_WORK
                     )
+                    projected["active_workers"] = sum(
+                        1 for item in projected["work"] if item["active_role"]
+                    )
             except (
                 sqlite3.Error,
                 OSError,
@@ -543,6 +548,7 @@ class DashboardData:
                     "Work state is temporarily unavailable.",
                 ]
             enabled = entry.get("integration") == "github"
+            projected.setdefault("active_workers", 0)
             projected["watcher"] = {
                 "enabled": enabled,
                 "state": "paused"

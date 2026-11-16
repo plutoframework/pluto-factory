@@ -397,3 +397,11 @@ h3 { font-size: 16px; font-weight: 500; letter-spacing: -.035em; }
 .decision-option { display: inline-flex; align-items: center; gap: 6px; }
 .framework-tag { color: #fff; background: var(--accent); }
 .decision-explain:empty { display: none; }
+
+.workers-count { font-variant-numeric: tabular-nums; color: var(--muted); }
+.orbit-lanes { display: grid; gap: 6px; list-style: none; margin: 0 0 16px; padding: 0; }
+.orbit-lane { display: block; }
+.orbit-lane-button { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 14px; align-items: center; width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.orbit-lane-button.selected { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.orbit-lane-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.orbit-lane-stage, .orbit-lane-role { color: var(--muted); font-size: 12px; }

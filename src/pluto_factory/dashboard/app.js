@@ -41,7 +41,7 @@
     return text === "qa" ? "QA" : text.replace(/^./, c => c.toUpperCase());
   }
   function roleName(value) {
-    return { implementer: "Implementation agent", reviewer: "Review agent", qa: "QA agent" }[value] || human(value);
+    return { implementer: "Implementation agent", reviewer: "Review agent", qa: "QA agent", merge_manager: "Merge manager" }[value] || human(value);
   }
   function timestamp(value) {
     if (typeof value === "number") return value * 1000;
@@ -297,6 +297,9 @@
       let label = factory.coordinator_running ? "Coordinator running" : "Coordinator stopped";
       if (factory.paused) label += "; factory paused";
       status.replaceChildren(node("span", `status-dot`), node("strong", "", label));
+      if ((factory.max_workers || 1) > 1) {
+        status.append(node("span", "workers-count", `Workers ${factory.active_workers || 0} / ${factory.max_workers}`));
+      }
       if (watcher?.enabled) status.append(node("span", "", `Issue intake ${human(watcher.state || "enabled").toLowerCase()}`));
       if (factory.last_activity) status.append(timeNode(factory.last_activity));
     }
@@ -335,7 +338,28 @@
         node("span", "", "Available factories remain visible."), details);
     }
   }
+  function renderLanes() {
+    const factory = selectedFactory();
+    const lanes = $("#orbit-lanes");
+    const parallel = (factory?.max_workers || 1) > 1;
+    const active = parallel ? (factory.work || []).filter(item => item.active_role && item.phase !== "completed") : [];
+    lanes.hidden = !parallel;
+    $("#pipeline-heading").textContent = parallel
+      ? `Work in orbit · ${factory.active_workers || active.length} / ${factory.max_workers} workers` : "Work in orbit";
+    lanes.replaceChildren(...(active.length ? active : [null]).map(item => {
+      const row = node("li", "orbit-lane");
+      if (!item) return append(row, node("span", "muted", "No worker is running"));
+      const button = node("button", "orbit-lane-button" + (item.id === state.workId ? " selected" : ""));
+      button.type = "button";
+      button.addEventListener("click", () => selectWork(item.id));
+      return append(row, append(button,
+        node("span", "orbit-lane-title", item.title || "Untitled work"),
+        node("span", "orbit-lane-stage", phaseNames[item.phase] || human(item.phase)),
+        node("span", "orbit-lane-role", roleName(item.active_role))));
+    }));
+  }
   function renderPipeline() {
+    renderLanes();
     const work = selectedWork();
     const index = work ? (phaseStages[work.phase] ?? 0) : -1;
     $("#pipeline-caption").textContent = work?.title || "Select a work item to trace its progress";
