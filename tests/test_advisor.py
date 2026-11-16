@@ -608,7 +608,7 @@ def test_dashboard_assets_render_framework_tag_and_both_views():
     assert "framework-tag" in js and ".framework-tag" in css
     assert "Raw block text" in js and "Send custom answer" in js
     # One card renderer serves the Needs-you list and the detail panel.
-    assert "map(decisionCard)" in js and "decisionCard(work.decision" in js
+    assert "decisionCard(decision)" in js and "decisionCard(work.decision" in js
     assert 'section("Needs you")' in js
     assert "Recommended" in js
 
@@ -803,3 +803,14 @@ def test_custom_grant_text_does_not_reset_a_pr_budget(tmp_path):
     answer_decision(engine.state, decision["id"], "Grant nothing, I am on it")
     engine.process_decisions()
     assert not called
+
+
+def test_drawer_cards_use_each_decisions_own_factory_id():
+    from importlib.resources import files
+
+    # Array.map passes the index as a second argument; decisionCard's second
+    # parameter is the factory id, so passing it point-free sent "0".
+    root = files("pluto_factory").joinpath("dashboard")
+    js = root.joinpath("app.js").read_text()
+    assert ".map(decisionCard)" not in js
+    assert "needs.decisions.map(decision => decisionCard(decision))" in js
