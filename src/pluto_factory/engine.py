@@ -20,7 +20,9 @@ from .attention import (
     answer_decision,
     apply_advice,
     apply_config_change,
+    apply_due_autos,
     approved,
+    auto_verdict,
     chosen_option,
     enqueue_issue_comment,
     flush_issue_comments,
@@ -31,6 +33,7 @@ from .attention import (
     list_decisions,
     mark_applied,
     record_framework_gap,
+    set_auto_pending,
     set_pr,
     withdraw_decision,
 )
@@ -50,12 +53,14 @@ from .pr_tracker import (
     PRTracker,
     parse_repair_source,
 )
+from .propagation import propagate
 from .ratelimit import transcript_failure
 from .recovery import plan_recovery
 from .state import State, StateConflict, identity
 from .trace import Tracer
 from .triage import Triager, TriageRunner
 from .upstream import (
+    apply_hold_answer,
     fixed_guidance,
     flush_upstream,
     poll_external,
@@ -519,9 +524,11 @@ class Engine:
     def attention(self, force=False):
         """Apply answered decisions, then poll tracked pull requests."""
         self.check_framework_gaps()
+        apply_due_autos(self.state)
         self.process_decisions()
         self.advise_pending()
         self.flush_upstream()
+        self.propagate()
         self.flush_issue_comments()
         if self.state.is_paused():
             return
@@ -575,6 +582,10 @@ class Engine:
                 )
             else:
                 text += ". No configuration change was made."
+        if proposal.get("upstream_hold"):
+            apply_hold_answer(self.state, decision)
+            mark_applied(self.state, decision["id"], detail)
+            return
         if proposal.get("triage"):
             self.triage.apply_answer(decision)
             mark_applied(self.state, decision["id"], detail)
@@ -698,8 +709,23 @@ class Engine:
             advice, source = self.advisor.advise(
                 packet, pull_request=decision["work_id"] is None
             )
-            if apply_advice(self.state, decision["id"], advice, source):
+            ok, _why = (
+                auto_verdict(self.config.autonomy, advice, packet=packet)
+                if source == "model"
+                else (False, "fallback advice")
+            )
+            if apply_advice(
+                self.state, decision["id"], advice, source, announce=not ok
+            ):
                 done += 1
+                if ok:
+                    set_auto_pending(
+                        self.state,
+                        decision["id"],
+                        advice,
+                        self.config.autonomy.grace_seconds,
+                    )
+                    continue
                 self._auto_upstream(get_decision(self.state, decision["id"]))
         return done
 
@@ -713,6 +739,15 @@ class Engine:
         if framework_library(option):
             request_upstream(self.state, self.config, decision, option)
 
+    def propagate(self):
+        try:
+            return propagate(self.state, self.tracker.adapter, self.config)
+        except GitHubFailure as error:
+            self.state.event(
+                "propagation.failed", "factory", {"code": error.code}
+            )
+            return 0
+
     def flush_upstream(self):
         try:
             return flush_upstream(self.state, self.tracker.adapter, self.config)
@@ -720,14 +755,16 @@ class Engine:
             self.state.event("upstream.failed", "factory", {"code": error.code})
             return 0
 
-    def _upstream_fixed(self, work_id, slug, number, closing):
+    def _upstream_fixed(self, work_id, slug, number, closing, cli_revision=""):
         """An upstream issue closed as completed: resume the parked work."""
         for gap in list_decisions(self.state, {"open"}):
             if gap["kind"] == "framework_gap" and gap["work_id"] == work_id:
                 withdraw_decision(self.state, gap["id"])
         work = self.state.get_work(work_id)
         self.state.add_guidance(
-            work_id, fixed_guidance(slug, number, closing), "coordinator"
+            work_id,
+            fixed_guidance(slug, number, closing, cli_revision),
+            "coordinator",
         )
         if work["control"] in {"deferred", "quarantined", "backoff"}:
             self.state.resume(work_id)

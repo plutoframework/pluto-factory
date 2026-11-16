@@ -99,12 +99,14 @@ def test_owner_choice_files_one_upstream_issue_with_links(tmp_path):
     assert engine.config.github_issue_label not in issue["label"]
     body = issue["body"]
     assert attention.get_decision(engine.state, decision["id"])
-    assert f"pluto-factory:upstream:test:{decision['id']}" in body
-    assert "pluto-rbac denies scoped job grants" in body  # terse problem
-    assert "Support scoped job grants in rbac.Check." in body  # proposed fix
-    assert "https://github.com/owner/core/issues/12" in body  # back-link
-    assert work["id"] in body
-    # Raw evidence is bounded.
+    assert issue["title"] == "RBAC check cannot scope job grants"
+    assert "pluto-factory:upstream:test" not in body
+    assert decision["id"] not in body and "Evidence" not in body
+    assert "owner/core" not in body and work["id"] not in body
+    # Private back-link lives only on the private side.
+    assert "Origin" not in body and "Factory" not in body
+    assert "## Acceptance criteria" in body
+    # Raw evidence is never copied.
     assert len(body) < 4000
     # Source issue comment + dependency on the upstream issue.
     engine.flush_issue_comments()
@@ -327,3 +329,131 @@ def test_proposed_label_can_never_equal_the_ready_label():
             repositories=[Repository(name="a", path="/tmp")],
             framework={"proposed_label": "factory:ready"},
         )
+
+
+# --- redaction ------------------------------------------------------------
+
+
+def _filed(engine, gh):
+    choose_framework(engine)
+    engine.flush_upstream()
+    return gh.created
+
+
+def test_filed_issue_contains_no_private_tokens(tmp_path):
+    engine, gh, work = setup(tmp_path)
+    (issue,) = _filed(engine, gh)
+    text = issue["title"] + "\n" + issue["body"]
+    config = engine.config
+    for token in (
+        config.name,
+        "owner/core",
+        work["id"],
+        "Issue work",
+        "#12",
+        str(tmp_path),
+        "checkout",
+    ):
+        assert token.lower() not in text.lower(), token
+
+
+def test_marker_is_opaque_and_stable(tmp_path):
+    from pluto_factory.upstream import upstream_marker
+
+    engine, gh, _ = setup(tmp_path)
+    (issue,) = _filed(engine, gh)
+    marker = upstream_marker(
+        engine.state, attention.list_decisions(engine.state)[0]["id"]
+    )
+    assert marker in issue["body"]
+    assert upstream_marker(engine.state, "decision-x") == upstream_marker(
+        engine.state, "decision-x"
+    )
+    assert upstream_marker(engine.state, "decision-x") != upstream_marker(
+        engine.state, "decision-y"
+    )
+    import re
+
+    assert re.fullmatch(r"<!-- pluto-factory:upstream:[0-9a-f]{16} -->", marker)
+
+
+def _leak(engine, **fields):
+    """Rewrite the stored framework option's upstream payload."""
+    import json as j
+
+    (decision,) = list_decisions(engine.state, {"open"})
+    options = decision["options"]
+    options[0]["upstream"] = {**options[0]["upstream"], **fields}
+    engine.state.db.execute(
+        "UPDATE decisions SET options=? WHERE id=?",
+        (j.dumps(options), decision["id"]),
+    )
+    engine.state.db.commit()
+
+
+def test_scrubber_blocks_filing_and_creates_a_hold_decision(tmp_path):
+    engine, gh, work = setup(tmp_path)
+    _leak(
+        engine,
+        problem=f"Okta in test breaks, see owner/core#12 and #12, "
+        f"{work['id']}, commit abcdef1 at {tmp_path}/checkout/x.",
+    )
+    assert not _filed(engine, gh)
+    row = engine.state.db.execute("SELECT * FROM upstream_issues").fetchone()
+    assert row["state"] == "held"
+    (hold,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_hold")
+    ]
+    for hit in ("private term: test", "owner/core#12", "#12", "abcdef1"):
+        assert hit in hold["context"]
+    assert [o["label"] for o in hold["options"]] == [
+        "Edit and file",
+        "Skip upstream filing",
+    ]
+    # Edit with a clean replacement: filed.
+    answer_decision(
+        engine.state,
+        hold["id"],
+        "Edit and file",
+        "Per-tenant providers cannot be scoped by the grant check.",
+    )
+    engine.process_decisions()
+    engine.flush_upstream()
+    (issue,) = gh.created
+    assert "Per-tenant providers" in issue["body"]
+
+
+def test_hold_skip_never_files(tmp_path):
+    engine, gh, _ = setup(tmp_path)
+    _leak(engine, repro="see #99")
+    assert not _filed(engine, gh)
+    (hold,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_hold")
+    ]
+    answer_decision(engine.state, hold["id"], "Skip upstream filing")
+    engine.process_decisions()
+    engine.flush_upstream()
+    assert not gh.created
+    row = engine.state.db.execute("SELECT * FROM upstream_issues").fetchone()
+    assert row["state"] == "skipped"
+
+
+def test_redact_terms_are_enforced(tmp_path):
+    engine, _ = build(
+        tmp_path,
+        framework=FrameworkPolicy(
+            upstream={"pluto-rbac": UPSTREAM}, redact_terms=["Okta"]
+        ),
+    )
+    gh = UpstreamGh()
+    engine.tracker.adapter.runner = gh
+    work = make_work_with_issue(engine)
+    engine.advisor.runner = lambda p, q: FRAMEWORK
+    engine._defer(engine.state.get_work(work["id"]), "x")
+    engine.advise_pending()
+    _leak(engine, problem="Okta needs per-tenant providers.")
+    assert not _filed(engine, gh)

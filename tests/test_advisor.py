@@ -97,12 +97,47 @@ def test_framework_locus_option_is_valid_with_fix():
                     True,
                     locus="framework:pluto-rbac",
                     fix="Allow scoped wildcard grants in rbac.Check.",
+                    upstream=UPSTREAM_PAYLOAD,
                 ),
                 option("Work around in app"),
             ]
         )
     )
     assert parsed.options[0].library == "pluto-rbac"
+
+
+def test_framework_option_requires_the_upstream_payload():
+    framework = option(
+        "Fix pluto-rbac",
+        True,
+        locus="framework:pluto-rbac",
+        fix="Allow scoped wildcard grants.",
+    )
+    with pytest.raises(ValidationError, match="upstream payload"):
+        Advice.model_validate(advice(options=[framework, option("Other")]))
+    incomplete = {**framework, "upstream": {"title": "t"}}
+    with pytest.raises(ValidationError):
+        Advice.model_validate(advice(options=[incomplete, option("Other")]))
+    long_title = {**UPSTREAM_PAYLOAD, "title": "x" * 81}
+    with pytest.raises(ValidationError):
+        Advice.model_validate(
+            advice(
+                options=[
+                    {**framework, "upstream": long_title},
+                    option("Other"),
+                ]
+            )
+        )
+    # App options never carry an upstream payload.
+    with pytest.raises(ValidationError):
+        Advice.model_validate(
+            advice(
+                options=[
+                    option("A", True, upstream=UPSTREAM_PAYLOAD),
+                    option("B"),
+                ]
+            )
+        )
 
 
 def test_advisor_retries_with_the_violation_then_accepts(tmp_path):
@@ -135,7 +170,13 @@ def test_unknown_framework_library_is_rejected(tmp_path):
     engine, _ = build(tmp_path)
     bad = advice(
         options=[
-            option("Fix it", True, locus="framework:nope", fix="Patch nope."),
+            option(
+                "Fix it",
+                True,
+                locus="framework:nope",
+                fix="Patch nope.",
+                upstream=UPSTREAM_PAYLOAD,
+            ),
             option("Stop"),
         ]
     )
@@ -331,6 +372,15 @@ def test_packet_lists_framework_sources(tmp_path):
     del work
 
 
+UPSTREAM_PAYLOAD = {
+    "title": "RBAC check cannot scope job grants",
+    "problem": "rbac.Check has no way to restrict a grant to one job queue.",
+    "repro": "Define a role with a job grant, then call rbac.Check for a "
+    "second queue; it is allowed.",
+    "fix": "Accept a queue scope in rbac.Check and the manifest grant.",
+    "acceptance": ["Grants may name a queue", "Other queues are denied"],
+}
+
 FRAMEWORK = advice(
     problem="pluto-rbac denies scoped job grants; library gap.",
     options=[
@@ -339,6 +389,7 @@ FRAMEWORK = advice(
             True,
             locus="framework:pluto-rbac",
             fix="Support scoped job grants in rbac.Check.",
+            upstream=UPSTREAM_PAYLOAD,
         ),
         option("Loosen the app role"),
     ],
@@ -813,4 +864,5 @@ def test_drawer_cards_use_each_decisions_own_factory_id():
     root = files("pluto_factory").joinpath("dashboard")
     js = root.joinpath("app.js").read_text()
     assert ".map(decisionCard)" not in js
-    assert "needs.decisions.map(decision => decisionCard(decision))" in js
+    assert "owner.map(decision => decisionCard(decision))" in js
+    assert "autos.map(decision => decisionCard(decision))" in js

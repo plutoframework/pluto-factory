@@ -738,7 +738,12 @@
       return item;
     }) : [node("li", "muted", "No pull requests need you.")]));
     const list = $("#needs-decisions");
-    list.replaceChildren(...(needs.decisions.length ? needs.decisions.map(decision => decisionCard(decision)) : [node("p", "muted", "No open decisions.")]));
+    const isAuto = decision => decision.auto && decision.auto.status !== "overridden";
+    const owner = needs.decisions.filter(decision => !isAuto(decision));
+    const autos = needs.decisions.filter(isAuto);
+    list.replaceChildren(...(owner.length ? owner.map(decision => decisionCard(decision)) : [node("p", "muted", "No open decisions.")]));
+    $("#auto-decisions-section").hidden = !autos.length;
+    $("#auto-decisions").replaceChildren(...autos.map(decision => decisionCard(decision)));
   }
   function frameworkTag(option) {
     if (!option.locus || !option.locus.startsWith("framework:")) return null;
@@ -759,6 +764,24 @@
       const raw = node("details", "decision-evidence");
       raw.append(node("summary", "", "Raw block text"), node("pre", "decision-context", decision.evidence));
       card.append(raw);
+    }
+    if (decision.auto && decision.auto.status !== "overridden" && ["auto_pending", "answered", "applied"].includes(decision.state)) {
+      const when = decision.state === "auto_pending" && decision.auto.apply_at
+        ? `Applies ${new Date(decision.auto.apply_at * 1000).toLocaleTimeString()} unless overridden.` : "Applied automatically.";
+      card.append(node("p", "secondary-line", `Decided automatically: ${decision.auto.answer}. ${decision.auto.reason} ${when}`));
+      const field = node("textarea", "decision-text");
+      field.rows = 2; field.maxLength = 4000; field.placeholder = "Override with your own answer";
+      field.setAttribute("aria-label", `Override: ${decision.question}`);
+      const error = node("p", "decision-error", state.answerErrors.get(decision.id) || "");
+      const override = node("button", "button button-small button-secondary decision-override", "Override");
+      override.type = "button";
+      override.addEventListener("click", () => {
+        const value = field.value.trim();
+        if (!value) { error.textContent = "Write the answer to use instead."; return; }
+        answerDecision({ ...decision, factory: factoryId }, value, "", override, [override], error, "Overriding…");
+      });
+      card.append(field, append(node("div", "decision-actions"), override), error);
+      return card;
     }
     if (decision.state === "answered") {
       card.append(node("p", "secondary-line", `Answered${decision.custom ? " (custom)" : ""}: ${decision.answer}. Waiting for the coordinator.`));

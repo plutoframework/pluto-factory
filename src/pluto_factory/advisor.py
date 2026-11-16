@@ -10,6 +10,7 @@ is used, so a blocked item is never left without a decision.
 import json
 import re
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -54,6 +55,48 @@ LOCUS = re.compile(r"^(app|framework:[A-Za-z0-9@/_.-]+)$")
 FIX_WORDS = 25
 
 
+UPSTREAM_TITLE_CHARS = 80
+UPSTREAM_FIELD_CHARS = 2000
+
+
+class UpstreamPayload(Contract):
+    """Public-audience issue text: library terms only, no private context."""
+
+    title: str
+    problem: str
+    repro: str
+    fix: str
+    acceptance: list[str] = Field(min_length=1, max_length=8)
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, value):
+        value = " ".join(value.split())
+        if not value or len(value) > UPSTREAM_TITLE_CHARS:
+            raise ValueError(
+                f"upstream title must be 1-{UPSTREAM_TITLE_CHARS} characters"
+            )
+        return value
+
+    @field_validator("problem", "repro", "fix")
+    @classmethod
+    def _text(cls, value):
+        value = value.strip()
+        if not value or len(value) > UPSTREAM_FIELD_CHARS:
+            raise ValueError(
+                f"upstream text must be 1-{UPSTREAM_FIELD_CHARS} characters"
+            )
+        return value
+
+    @field_validator("acceptance")
+    @classmethod
+    def _acceptance(cls, values):
+        values = [v.strip() for v in values]
+        if not all(values) or any(len(v) > 300 for v in values):
+            raise ValueError("acceptance items are 1-300 characters")
+        return values
+
+
 class AdviceOption(Contract):
     label: str
     effect: str
@@ -61,6 +104,8 @@ class AdviceOption(Contract):
     # app | framework:<library>; framework options carry a one-line fix.
     locus: str = "app"
     fix: str = ""
+    # Required for framework options; written for a public issue tracker.
+    upstream: UpstreamPayload | None = None
     recommended: bool = False
 
     @field_validator("locus")
@@ -78,8 +123,15 @@ class AdviceOption(Contract):
             if "\n" in self.fix:
                 raise ValueError("fix must be one line")
             self.fix = _capped(self.fix, FIX_WORDS, "framework fix summary")
-        elif self.fix.strip():
-            raise ValueError("only framework options carry a fix summary")
+            if self.upstream is None:
+                raise ValueError(
+                    "framework options require an upstream payload "
+                    "(title, problem, repro, fix, acceptance)"
+                )
+        elif self.fix.strip() or self.upstream is not None:
+            raise ValueError(
+                "only framework options carry a fix summary or upstream"
+            )
         return self
 
     @property
@@ -102,7 +154,37 @@ class AdviceOption(Contract):
         return _capped(value, TRADEOFF_WORDS, "option tradeoff")
 
 
+AUTO_CATEGORIES = (
+    "upstream_issue",
+    "resume_after_fix",
+    "app_fix",
+    "config_change",
+)
+OWNER_CATEGORIES = (
+    "security",
+    "credentials_spend",
+    "acceptance_scope",
+    "public_release",
+    "product_ux",
+    "other",
+)
+Category = Literal[AUTO_CATEGORIES + OWNER_CATEGORIES]  # type: ignore[valid-type]
+
+
+class ConfigChange(Contract):
+    key: str
+    value: float
+
+
 class Advice(Contract):
+    # Autonomy: the model proposes, deterministic policy decides. Owner-only
+    # categories can never auto-apply whatever the model claims.
+    category: Category = "other"
+    autonomy: Literal["auto", "owner"] = "owner"
+    autonomy_reason: str = ""
+    confidence: Literal["high", "medium", "low"] = "low"
+    reversible: bool = False
+    config_change: ConfigChange | None = None
     problem: str
     details: list[str] = Field(default_factory=list, max_length=6)
     options: list[AdviceOption] = Field(min_length=2, max_length=4)
@@ -117,6 +199,27 @@ class Advice(Contract):
     @classmethod
     def _details(cls, values):
         return [_capped(v, DETAIL_WORDS, "detail bullet") for v in values]
+
+    @field_validator("autonomy_reason")
+    @classmethod
+    def _autonomy_reason(cls, value):
+        value = " ".join(value.split())
+        if words(value) > WHY_WORDS:
+            raise ValueError(f"autonomy_reason cap is {WHY_WORDS} words")
+        return value
+
+    @model_validator(mode="after")
+    def _autonomy_consistent(self):
+        if self.autonomy == "auto" and not self.autonomy_reason:
+            raise ValueError("autonomy 'auto' needs an autonomy_reason")
+        if (self.category == "config_change") != (
+            self.config_change is not None
+        ):
+            raise ValueError(
+                "config_change is required for (and only for) the "
+                "config_change category"
+            )
+        return self
 
     @field_validator("why")
     @classmethod
