@@ -296,9 +296,6 @@ class Tracer:
 
         assignment = run["assignment"]
         role = run["role"]
-        profile_name = {"implementer": "worker", "reviewer": "reviewer"}.get(
-            role, "qa_model"
-        )
         role_text = Path(assignment["role_path"]).read_bytes()
         self.write(
             work["id"],
@@ -306,7 +303,7 @@ class Tracer:
             run_id=run["id"],
             role=role,
             harness=self.config.harness,
-            model=getattr(self.config, profile_name).model_dump(),
+            model=self.config.role_profile(role).model_dump(),
             coordinator={
                 "strategy": self.config.coordinator,
                 "runtime": self.config.coordinator_runtime,

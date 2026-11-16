@@ -305,6 +305,94 @@ class SandboxPolicy(Contract):
         return names
 
 
+# Roles that edit the worktree and may call the factory_check tool.
+WRITER_ROLES = frozenset({"implementer", "merge_manager"})
+
+PHASES = (
+    "queued",
+    "implementing",
+    "checking",
+    "reviewing",
+    "preparing",
+    "qa_checks",
+    "qa",
+    "pushing",
+    "integrating",
+)
+
+
+class ConcurrencyPolicy(Contract):
+    """Parallel workers. The defaults reproduce the serial factory exactly.
+
+    ``max_per_repository`` defaults to ``max_workers``; ``repositories``
+    overrides it per repository name. ``max_per_phase`` caps items running
+    in a phase (e.g. ``checking``), counting long check commands.
+    ``avoid_overlap`` stops items that may touch the same files from running
+    together: ``repository`` (default when parallel) serializes items per
+    repository; ``paths`` estimates touched paths and falls back to
+    repository-level when it cannot. ``min_free_memory_mb`` and
+    ``max_load_average`` hold new starts while the host is under pressure.
+    """
+
+    max_workers: int = Field(default=1, ge=1, le=8)
+    max_per_repository: int | None = Field(default=None, ge=1, le=8)
+    repositories: dict[str, int] = Field(default_factory=dict)
+    max_per_phase: dict[str, int] = Field(default_factory=dict)
+    avoid_overlap: Literal["none", "repository", "paths"] | None = None
+    start_stagger_seconds: float = Field(default=30, ge=0)
+    min_free_memory_mb: int | None = Field(default=None, ge=0)
+    max_load_average: float | None = Field(default=None, gt=0)
+    # Serialize coordinator model calls unless explicitly allowed.
+    coordinator_parallel_decisions: bool = False
+
+    @field_validator("repositories")
+    @classmethod
+    def _repository_limits(cls, value):
+        if any(not 1 <= limit <= 8 for limit in value.values()):
+            raise ValueError("repository limits must be 1..8")
+        return value
+
+    @field_validator("max_per_phase")
+    @classmethod
+    def _phase_limits(cls, value):
+        for phase, limit in value.items():
+            if phase not in PHASES:
+                raise ValueError(f"unknown phase {phase!r}")
+            if not 1 <= limit <= 8:
+                raise ValueError("phase limits must be 1..8")
+        return value
+
+    @property
+    def parallel(self) -> bool:
+        return self.max_workers > 1
+
+    @property
+    def overlap(self) -> str:
+        if self.avoid_overlap is not None:
+            return self.avoid_overlap
+        return "repository" if self.parallel else "none"
+
+    def repository_limit(self, name: str) -> int:
+        if name in self.repositories:
+            return self.repositories[name]
+        return self.max_per_repository or self.max_workers
+
+
+class MergeManagerPolicy(Contract):
+    """Role that resolves merge conflicts with the moving default branch.
+
+    Empty provider/model/reasoning inherit the reviewer's profile. ``enabled``
+    unset follows parallelism: on when ``concurrency.max_workers > 1``, so
+    serial factories keep routing conflicts to the implementer.
+    """
+
+    provider: str = ""
+    model: str = ""
+    reasoning: str = ""
+    enabled: bool | None = None
+    max_merge_attempts: int = Field(default=2, ge=1, le=10)
+
+
 class FactoryConfig(Contract):
     schema_version: Literal[1] = 1
     name: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
@@ -327,6 +415,10 @@ class FactoryConfig(Contract):
     triage: TriagePolicy = Field(default_factory=TriagePolicy)
     autonomy: AutonomyPolicy = Field(default_factory=AutonomyPolicy)
     propagation: PropagationPolicy = Field(default_factory=PropagationPolicy)
+    concurrency: ConcurrencyPolicy = Field(default_factory=ConcurrencyPolicy)
+    merge_manager: MergeManagerPolicy = Field(
+        default_factory=MergeManagerPolicy
+    )
     qa_model: ModelProfile = Field(
         default_factory=lambda: ModelProfile(
             model="gpt-6.1-terra", reasoning="medium"
@@ -390,6 +482,26 @@ class FactoryConfig(Contract):
                     "advisor_model must be a claude-* model on Anthropic"
                 )
         return self
+
+    @property
+    def merge_manager_enabled(self) -> bool:
+        enabled = self.merge_manager.enabled
+        return self.concurrency.parallel if enabled is None else enabled
+
+    def role_profile(self, role: str) -> ModelProfile:
+        """Model profile for a worker role; the merge manager inherits."""
+        if role == "merge_manager":
+            policy = self.merge_manager
+            base = self.reviewer
+            return ModelProfile(
+                provider=policy.provider or base.provider,
+                model=policy.model or base.model,
+                reasoning=policy.reasoning or base.reasoning,
+            )
+        return {
+            "implementer": self.worker,
+            "reviewer": self.reviewer,
+        }.get(role, self.qa_model)
 
     @property
     def advisor_provider(self) -> str:

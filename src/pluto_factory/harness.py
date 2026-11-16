@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import sandbox
 from .config import atomic_json
-from .models import FactoryConfig, WorkerReport
+from .models import WRITER_ROLES, FactoryConfig, WorkerReport
 from .trace import worker_event
 
 
@@ -94,6 +94,14 @@ class PiHarness:
         self.runner = runner
 
     def _profile(self, role: str) -> dict:
+        if role == "merge_manager":
+            # Empty fields inherit the reviewer's profile.
+            policy = self.config.get("merge_manager") or {}
+            base = self.config["reviewer"]
+            return {
+                key: policy.get(key) or base[key]
+                for key in ("provider", "model", "reasoning")
+            }
         key = {
             "implementer": "worker",
             "reviewer": "reviewer",
@@ -399,7 +407,7 @@ class PiHarness:
     ) -> list[str]:
         profile = self._profile(assignment["role"])
         tools = "read,grep,find,ls,factory_report"
-        if assignment["role"] == "implementer":
+        if assignment["role"] in WRITER_ROLES:
             tools = "read,bash,edit,write,grep,find,ls,factory_report"
         return [
             "env",
@@ -884,7 +892,7 @@ class ClaudeHarness(PiHarness):
         )
         atomic_json(mcp_path, mcp_config(sys.executable, assignment_path))
         tools = list(self.READ_TOOLS)
-        if assignment["role"] == "implementer":
+        if assignment["role"] in WRITER_ROLES:
             tools.extend(self.WRITE_TOOLS)
         # Always pre-accept the folder-trust dialog so new worktrees never
         # prompt; project settings still load only for trusted repositories.
@@ -934,7 +942,7 @@ class ClaudeHarness(PiHarness):
                     QUALIFIED_TOOL,
                     *(
                         [QUALIFIED_CHECK_TOOL]
-                        if assignment["role"] == "implementer"
+                        if assignment["role"] in WRITER_ROLES
                         else []
                     ),
                 ]
@@ -1040,6 +1048,8 @@ class FixtureHarness:
                 )
             elif assignment["role"] == "implementer":
                 self._apply_recipes(assignment)
+            elif assignment["role"] == "merge_manager":
+                self._resolve_conflicts(assignment)
             atomic_json(
                 Path(assignment["report_path"]),
                 {
@@ -1058,6 +1068,31 @@ class FixtureHarness:
             },
         )
         return session
+
+    def _resolve_conflicts(self, assignment: dict) -> None:
+        """Fixture resolution: keep both sides of every conflict hunk."""
+        for root in _root_records(assignment):
+            if root.get("access", "write") != "write":
+                continue
+            directory = Path(root["path"]).resolve(strict=True)
+            for path in directory.rglob("*"):
+                if ".git" in path.relative_to(directory).parts:
+                    continue
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text()
+                except UnicodeDecodeError:
+                    continue
+                if "<<<<<<< " not in text:
+                    continue
+                kept = [
+                    line
+                    for line in text.splitlines(keepends=True)
+                    if not line.startswith(("<<<<<<< ", ">>>>>>> "))
+                    and line.rstrip("\n") != "======="
+                ]
+                path.write_text("".join(kept))
 
     def _apply_recipes(self, assignment: dict) -> None:
         for root in _root_records(assignment):

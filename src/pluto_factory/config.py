@@ -27,6 +27,20 @@ ROLE_TEXT = {
         "instructions. Do not push, merge, change factory policy, or start "
         "other agents. Return the final result with factory_report."
     ),
+    "merge_manager": (
+        "Resolve merge conflicts between this work item and the moving "
+        "default branch. The merge is prepared in the worktree with "
+        "conflict markers. Read both sides' intent in the packet (this "
+        "item's spec and diff, and the merged changes that touched the "
+        "conflicting files) and produce the combined result. Preserve both "
+        "intents: never drop the other side's behavior, never weaken, "
+        "delete or skip tests to resolve a conflict, and change nothing "
+        "unrelated to the conflict. Regenerate generated files with the "
+        "repository's generator instead of hand-merging them, where "
+        "applicable. Remove every conflict marker, run the repository "
+        "checks with factory_check, and return the final result with "
+        "factory_report. Do not commit, push, merge or start agents."
+    ),
     "reviewer": (
         "Independently review the assigned candidate and acceptance criteria. "
         "Do not change source, push, merge, or start agents. Inspect every "
@@ -93,6 +107,8 @@ ROLE_TEXT = {
 
 # Tracking policy never affects validation; keep it out of the config digest.
 BUNDLE_EXCLUDED = {
+    "concurrency",
+    "merge_manager",
     "advisor",
     "triage",
     "framework",
@@ -147,8 +163,10 @@ def load_config(home: Path) -> FactoryConfig:
 def resolved_bundle(home: Path, config: FactoryConfig) -> dict:
     prompts = {}
     for role in ROLE_TEXT:
-        if role in {"advisor", "triage"}:
-            continue  # read-only roles; never part of validated config
+        if role in {"advisor", "triage", "merge_manager"}:
+            # Read-only roles and the merge manager (its output is reviewed
+            # and checked like any change) never enter the validated digest.
+            continue
         path = home / "prompts" / f"{role}.md"
         prompts[role] = path.read_text()
     guidance = home / "qa" / "guidance.md"
@@ -215,6 +233,8 @@ def write_config(home: Path, config: FactoryConfig) -> None:
             "worker",
             "reviewer",
             "qa_model",
+            "concurrency",
+            "merge_manager",
             "self_improvement",
             "debug",
             "sandbox",
@@ -229,6 +249,8 @@ def write_config(home: Path, config: FactoryConfig) -> None:
         "worker",
         "reviewer",
         "qa_model",
+        "concurrency",
+        "merge_manager",
         "self_improvement",
         "debug",
         "sandbox",
@@ -240,7 +262,8 @@ def write_config(home: Path, config: FactoryConfig) -> None:
     ):
         lines.extend(["", f"[{table}]"])
         for key, value in getattr(config, table).model_dump().items():
-            lines.append(f"{key} = {_toml(value)}")
+            if value is not None:  # TOML has no null; unset falls back
+                lines.append(f"{key} = {_toml(value)}")
     for repo in config.repositories:
         lines.extend(["", "[[repositories]]"])
         for key, value in repo.model_dump(
@@ -277,6 +300,14 @@ def advisor_prompt(home: Path) -> str:
     """The advisor role text; factories predating the role use the default."""
     path = home / "prompts" / "advisor.md"
     return path.read_text() if path.exists() else ROLE_TEXT["advisor"]
+
+
+def role_prompt(home: Path, bundle: dict, role: str) -> str:
+    """Prompt text for a run; factories predating a role use the default."""
+    if role in bundle["prompts"]:
+        return bundle["prompts"][role]
+    path = home / "prompts" / f"{role}.md"
+    return path.read_text() if path.exists() else ROLE_TEXT[role]
 
 
 def triage_prompt(home: Path) -> str:
