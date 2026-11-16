@@ -15,10 +15,12 @@ from .attention import (
     add_decision,
     fill_number,
     get_pr,
+    list_decisions,
     list_prs,
     pending_intents,
     set_pr,
     track_pr,
+    withdraw_decision,
 )
 from .github import GitHubAdapter, GitHubFailure
 from .github_checks import merge_check_status
@@ -59,6 +61,11 @@ REVIEW_CHECKLIST = (
     "that fixes the production cause of the recorded failure."
 )
 FAILURE_RANK = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"}
+
+
+# A green PR waiting on the owner's approval/merge is a pull-request item
+# with a link, never a decision: there is nothing to choose.
+READY_APPROVAL = "Ready: needs your approval + merge"
 
 
 def repair_source(slug, number):
@@ -136,7 +143,7 @@ def classify(view, row, config, now=None):
     if review == "REVIEW_REQUIRED":
         return {
             "state": "needs_owner",
-            "reason": "Checks passed; a required review is outstanding",
+            "reason": READY_APPROVAL,
             "failing": [],
         }
     if view.get("isDraft"):
@@ -160,8 +167,7 @@ def classify(view, row, config, now=None):
     if merge_state == "BLOCKED":
         return {
             "state": "needs_owner",
-            "reason": "Checks passed; blocked by branch protection "
-            "(a human step is required)",
+            "reason": READY_APPROVAL,
             "failing": [],
         }
     if merge_state in {"BEHIND", "UNKNOWN"}:
@@ -380,8 +386,18 @@ class PRTracker:
         self._escalate(row)
         return row
 
+    def _withdraw_pr_decisions(self, row):
+        """Earlier fallback decisions for this PR are obsolete: no choice."""
+        prefix = f"pr:{row['slug']}#{row['number']}:"
+        for decision in list_decisions(self.state, {"open"}):
+            if (decision.get("block_key") or "").startswith(prefix):
+                withdraw_decision(self.state, decision["id"])
+
     def _escalate(self, row):
         """A PR that needs the owner always gets a decision (advised later)."""
+        if row and row["reason"] == READY_APPROVAL:
+            self._withdraw_pr_decisions(row)
+            return
         if (
             not row
             or row["state"] != "needs_owner"

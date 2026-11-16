@@ -7,8 +7,10 @@ with the violation named; if every attempt fails the deterministic fallback
 is used, so a blocked item is never left without a decision.
 """
 
+import contextlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -238,6 +240,145 @@ class Advice(Contract):
         return self
 
 
+TRANSIENT = {"timeout", "rate_limit", "crash"}
+TRANSIENT_RETRIES = 2
+BACKOFF_SECONDS = (5, 20)
+STDERR_TAIL = 500
+MESSAGE_LIMIT = 400
+
+
+def _tail(value, limit):
+    value = str(value or "")
+    return value if len(value) <= limit else "…" + value[-limit:]
+
+
+def classify(error):
+    """schema | timeout | rate_limit | crash | unavailable | error."""
+    name = type(error).__name__
+    message = str(error).lower()
+    if isinstance(error, (TimeoutError,)) or "timeout" in name.lower():
+        return "timeout"
+    if (
+        "ratelimit" in name.lower()
+        or "rate limit" in message
+        or "429" in message
+    ):
+        return "rate_limit"
+    if (
+        getattr(error, "exit_code", None) is not None
+        or getattr(error, "returncode", None) is not None
+        or "ProcessError" in name
+    ):
+        return "crash"
+    if name in {"UnexpectedModelBehavior", "ValidationError"} or isinstance(
+        error, (ValueError, TypeError)
+    ):
+        return "schema"
+    if "unavailable" in message:
+        return "unavailable"
+    return "error"
+
+
+def failure_record(error, attempts):
+    """Bounded, redacted account of why a model triage failed."""
+    from .dashboard_data import text
+
+    exit_code = getattr(error, "exit_code", None)
+    if exit_code is None:
+        exit_code = getattr(error, "returncode", None)
+    cause = error.__cause__ or error.__context__
+    record = {
+        "kind": classify(error),
+        "exception": type(error).__name__,
+        "message": text(_tail(str(error), MESSAGE_LIMIT), MESSAGE_LIMIT + 20),
+        "attempts": attempts,
+    }
+    if cause is not None:
+        record["cause"] = text(
+            f"{type(cause).__name__}: {_tail(str(cause), 300)}", 340
+        )
+    if hasattr(error, "errors") and callable(error.errors):
+        with contextlib.suppress(Exception):
+            record["validation_errors"] = text(
+                json.dumps(error.errors(include_url=False), default=str)[:1200],
+                1200,
+            )
+    if exit_code is not None:
+        record["exit_code"] = exit_code
+    stderr = getattr(error, "stderr", None)
+    if stderr:
+        record["stderr_tail"] = text(
+            _tail(stderr, STDERR_TAIL), STDERR_TAIL + 20
+        )
+    return record
+
+
+def failure_reason(record):
+    """One terse line for owners: 'Triage failed: <reason>'."""
+    parts = [record["kind"], record["exception"]]
+    if record.get("message"):
+        parts.append(record["message"])
+    if record.get("exit_code") is not None:
+        parts.append(f"exit {record['exit_code']}")
+    return "Triage failed: " + terse(" ".join(parts), 30)
+
+
+def _clip_words(value, limit):
+    if not isinstance(value, str):
+        return value
+    pieces = value.split()
+    return value if len(pieces) <= limit else " ".join(pieces[:limit])
+
+
+def app_only(advice):
+    """Pull-request items have no framework fix to file: force app locus."""
+    if not isinstance(advice, dict):
+        return advice
+    options = []
+    for option in advice.get("options") or []:
+        if isinstance(option, dict):
+            option = {
+                **option,
+                "locus": "app",
+                "fix": "",
+                "upstream": None,
+            }
+        options.append(option)
+    return {**advice, "options": options}
+
+
+def clip_advice(advice):
+    """Shorten over-long prose to the advisor caps instead of rejecting it.
+
+    Long issues make the model write long rationales; the caps exist for
+    terse display, so clipping keeps a useful decision where strict
+    validation used to drop the whole triage into the fallback.
+    """
+    if not isinstance(advice, dict):
+        return advice
+    clipped = dict(advice)
+    clipped["problem"] = _clip_words(clipped.get("problem"), PROBLEM_WORDS)
+    clipped["why"] = _clip_words(clipped.get("why"), WHY_WORDS)
+    if isinstance(clipped.get("details"), list):
+        clipped["details"] = [
+            _clip_words(d, DETAIL_WORDS) for d in clipped["details"][:6]
+        ]
+    options = []
+    for option in clipped.get("options") or []:
+        if isinstance(option, dict):
+            option = {
+                **option,
+                "label": _clip_words(option.get("label"), LABEL_WORDS),
+                "effect": _clip_words(option.get("effect"), EFFECT_WORDS),
+                "tradeoff": _clip_words(option.get("tradeoff"), TRADEOFF_WORDS),
+            }
+            if option.get("fix"):
+                option["fix"] = _clip_words(option["fix"], FIX_WORDS)
+        options.append(option)
+    clipped["options"] = options
+    return clipped
+
+
 def terse(text: str, limit: int = PROBLEM_WORDS) -> str:
     """Deterministic shortening: first words of the first line, cap kept."""
     flat = " ".join(str(text or "").split())
@@ -337,14 +478,23 @@ def evidence_packet(state, decision, reason, extra=None, sources=None):
 
 
 class Advisor:
-    def __init__(self, home: Path, config, runner=None):
+    def __init__(self, home: Path, config, runner=None, sleep=time.sleep):
         self.home = Path(home)
         self.config = config
         self.runner = runner
+        self.sleep = sleep
+        self.last_failure = None
 
     def advise(self, packet: dict, *, pull_request=False):
-        """(Advice, source): source is 'model' or 'fallback'."""
+        """(Advice, source): source is 'model' or 'fallback'.
+
+        On fallback, ``last_failure`` holds a bounded account of why. Over-long
+        prose is clipped to the caps, transient failures (timeout, rate limit,
+        harness crash) are retried with backoff, schema errors are retried
+        with the violation named.
+        """
         reason = packet.get("block_reason", "")
+        self.last_failure = None
         if self.runner is None and self.config.coordinator == "rules":
             return fallback_advice(
                 reason, pull_request=pull_request
@@ -352,8 +502,15 @@ class Advisor:
         runner = self.runner or self._model
         prompt = advisor_prompt(self.home)
         problem = None
-        for _ in range(ADVISOR_RETRIES + 1):
+        contract = transient = attempts = 0
+        while True:
+            attempts += 1
             payload = dict(packet)
+            if pull_request:
+                payload["item_kind"] = (
+                    "pull_request: every option has locus 'app'; the owner "
+                    "reviews, merges or re-checks; no framework fixes"
+                )
             if problem:
                 payload["contract_error"] = {
                     "message": "Previous reply violated the schema. Fix it.",
@@ -363,16 +520,29 @@ class Advisor:
                 reply = runner(prompt, json.dumps(payload))
                 if isinstance(reply, str):
                     reply = json.loads(reply)
+                if isinstance(reply, dict):
+                    reply = clip_advice(reply)
+                    if pull_request:
+                        reply = app_only(reply)
                 if not isinstance(reply, Advice):
                     reply = Advice.model_validate(reply)
                 self._known_libraries(reply, packet)
+                self.last_failure = None
                 return reply, "model"
-            except (ValueError, TypeError) as error:
-                problem = str(error)[:1500]
-            except Exception as error:  # noqa: BLE001 - provider failure
-                problem = None
-                self.last_error = type(error).__name__
-                break
+            except Exception as error:  # noqa: BLE001 - recorded, not lost
+                self.last_failure = failure_record(error, attempts)
+                kind = self.last_failure["kind"]
+                if kind == "schema":
+                    problem = str(error)[:1500]
+                    contract += 1
+                    if contract > ADVISOR_RETRIES:
+                        break
+                elif kind in TRANSIENT and transient < TRANSIENT_RETRIES:
+                    self.sleep(BACKOFF_SECONDS[transient])
+                    transient += 1
+                else:
+                    break
+        self.last_error = self.last_failure["exception"]
         return fallback_advice(reason, pull_request=pull_request), "fallback"
 
     @staticmethod
