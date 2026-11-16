@@ -1,5 +1,6 @@
 """Durable phase transitions around interchangeable interactive workers."""
 
+import copy
 import json
 import threading
 import time
@@ -206,6 +207,8 @@ class Engine:
         self.config = load_config(self.home)
         self.state = State(self.home)
         self.git = GitWorkspace(self.home, self.config)
+        self._check_guard = threading.Lock()
+        self._check_threads = {}
         self.harness = harness or make_harness(self.config)
         self.coordinator = coordinator or Coordinator(self.home, self.config)
         self.tracer = Tracer(self.home, self.config)
@@ -1462,24 +1465,85 @@ class Engine:
                 "dispatch.paused_after_launch", work["id"], observation
             )
 
+    CHECK_SLOT_MARGIN = 60.0
+
     def _service_checks(self, work, run):
-        """Run worker-requested checks here, outside the worker's sandbox."""
-        from .claude_worker import answer_check, pending_checks, summarize_check
+        """Start worker-requested checks, outside the worker's sandbox.
+
+        Each request runs on its own thread so a queued or long check never
+        stalls observation, the phase deadline or report collection.
+        """
+        from .claude_worker import pending_checks
 
         assignment = run["assignment"]
-        for request_id in pending_checks(assignment):
-            try:
-                rows = self.git.check_worktree(work["data"]["entries"])
-                digest_now = digest(resolved_bundle(self.home, self.config))
-                for row in rows:
-                    row["config_digest"] = digest_now
-                    self.state.evidence(work["id"], row, run["id"])
-                result = summarize_check(rows)
-                if not rows:
-                    result["error"] = "No check commands are configured"
-            except (GitFailure, OSError, ValueError) as error:
-                result = {"passed": False, "error": str(error)[:2000]}
+        pending = pending_checks(assignment)
+        if not pending:
+            return
+        deadline = run["created"] + self._phase_timeout(work)
+        entries = copy.deepcopy(work["data"]["entries"])
+        for request_id in pending:
+            with self._check_guard:
+                running = self._check_threads.get(request_id)
+                if running and running.is_alive():
+                    continue
+                thread = threading.Thread(
+                    target=self._run_worker_check,
+                    args=(work["id"], run["id"], assignment, request_id)
+                    + (entries, deadline),
+                    name=f"check-{request_id[:8]}",
+                    daemon=True,
+                )
+                self._check_threads[request_id] = thread
+                thread.start()
+
+    def _run_worker_check(
+        self, work_id, run_id, assignment, request_id, entries, deadline
+    ):
+        from .claude_worker import (
+            answer_check,
+            check_status,
+            summarize_check,
+        )
+
+        def status(state):
+            check_status(assignment, request_id, state)
+            self.state.event(
+                f"check.{state}",
+                work_id,
+                {"run_id": run_id, "request": request_id},
+            )
+
+        try:
+            remaining = deadline - time.time() - self.CHECK_SLOT_MARGIN
+            rows = self.git.check_worktree(
+                entries,
+                slot_timeout=max(0.0, remaining),
+                on_wait=lambda: status("waiting"),
+                on_run=lambda: status("running"),
+            )
+            digest_now = digest(resolved_bundle(self.home, self.config))
+            for row in rows:
+                row["config_digest"] = digest_now
+                self.state.evidence(work_id, row, run_id)
+            result = summarize_check(rows)
+            if not rows:
+                result["error"] = "No check commands are configured"
+        except GitFailure as error:
+            result = {"passed": False, "error": str(error)[:2000]}
+            if error.code == "check.slot_busy":
+                result["error"] = (
+                    "check slot busy: every host check slot stayed taken "
+                    "until this phase was near its deadline; report what "
+                    "you have and note the checks were not run"
+                )
+                result["busy"] = True
+        except (OSError, ValueError) as error:
+            result = {"passed": False, "error": str(error)[:2000]}
+        try:
             answer_check(assignment, request_id, result)
+        finally:
+            with self._check_guard:
+                self._check_threads.pop(request_id, None)
 
     def _collect(self, work):
         run = self.state.get_run(work["current_run"])

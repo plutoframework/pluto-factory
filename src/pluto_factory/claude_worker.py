@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -155,25 +156,85 @@ def summarize_check(rows: list[dict]) -> dict:
     }
 
 
-def request_check(assignment: dict) -> dict:
-    """File a check request and wait for the factory's answer."""
+def check_status(assignment: dict, request_id: str, state: str) -> None:
+    """Factory side: record that a request is ``waiting`` or ``running``."""
+    atomic_json(
+        _check_dir(assignment) / f"{request_id}.status.json",
+        {"state": state, "at": time.time()},
+    )
+
+
+def _check_state(folder: Path, request_id: str) -> str | None:
+    try:
+        return json.loads((folder / f"{request_id}.status.json").read_text())[
+            "state"
+        ]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def check_queue_seconds(assignment: dict) -> float:
+    """Longest a request may wait for a host check slot.
+
+    The factory answers "check slot busy" before the phase deadline, so
+    this only backstops a factory that stopped answering.
+    """
+    config = assignment.get("config") or {}
+    phase = (
+        config.get("implementer_phase_timeout_seconds")
+        or config.get("phase_timeout_seconds")
+        or 900
+    )
+    return phase + 120
+
+
+_CHECK_GUARD = threading.Lock()
+
+
+def request_check(assignment: dict, notify=None) -> dict:
+    """File a check request and wait for the factory's answer.
+
+    One check per worker at a time: a call made while another is in flight
+    waits for and returns that run's result. Time spent queued for a host
+    check slot does not count against the command timeout.
+    """
     folder = _check_dir(assignment)
     folder.mkdir(parents=True, exist_ok=True)
-    request_id = uuid.uuid4().hex
-    atomic_json(
-        folder / f"{request_id}.request.json",
-        {**_identity(assignment), "requested": time.time()},
-    )
+    with _CHECK_GUARD:
+        pending = pending_checks(assignment)
+        if pending:
+            request_id = pending[0]
+        else:
+            request_id = uuid.uuid4().hex
+            atomic_json(
+                folder / f"{request_id}.request.json",
+                {**_identity(assignment), "requested": time.time()},
+            )
     result_path = folder / f"{request_id}.result.json"
-    deadline = time.monotonic() + check_wait_seconds(assignment)
-    while time.monotonic() < deadline:
+    queue_until = time.monotonic() + check_queue_seconds(assignment)
+    run_until = None
+    announced = False
+    while True:
         if result_path.exists():
             try:
                 return json.loads(result_path.read_text())
             except json.JSONDecodeError:
                 pass
+        state = _check_state(folder, request_id)
+        if state == "waiting" and not announced and notify:
+            announced = True
+            notify("waiting for check slot")
+        if state == "running" and run_until is None:
+            run_until = time.monotonic() + check_wait_seconds(assignment)
+            if notify:
+                notify("running checks")
+        limit = run_until if run_until is not None else queue_until
+        if time.monotonic() >= limit:
+            return {
+                "passed": False,
+                "error": "Timed out waiting for the factory",
+            }
         time.sleep(0.5)
-    return {"passed": False, "error": "Timed out waiting for the factory"}
 
 
 def _check_definition() -> dict:
@@ -205,7 +266,7 @@ def _tool_definition(assignment: dict) -> dict:
     }
 
 
-def handle_message(assignment: dict, message: dict) -> dict | None:
+def handle_message(assignment: dict, message: dict, notify=None) -> dict | None:
     """Answer one JSON-RPC message; notifications return ``None``."""
     method = message.get("method")
     identifier = message.get("id")
@@ -231,7 +292,7 @@ def handle_message(assignment: dict, message: dict) -> dict | None:
             params.get("name") == CHECK_TOOL
             and assignment.get("role") in WRITER_ROLES
         ):
-            outcome = request_check(assignment)
+            outcome = request_check(assignment, notify)
             return {
                 "jsonrpc": "2.0",
                 "id": identifier,
@@ -266,7 +327,44 @@ def handle_message(assignment: dict, message: dict) -> dict | None:
 
 
 def serve(stdin=sys.stdin, stdout=sys.stdout) -> None:
+    """Serve JSON-RPC on stdio.
+
+    ``factory_check`` calls run on their own threads: a long ``factory_check`` must not
+    block ``factory_report`` behind it, or the session ends unreported.
+    """
     assignment = _assignment()
+    write_lock = threading.Lock()
+
+    def send(payload: dict) -> None:
+        with write_lock:
+            stdout.write(json.dumps(payload) + "\n")
+            stdout.flush()
+
+    def call(message: dict) -> None:
+        token = ((message.get("params") or {}).get("_meta") or {}).get(
+            "progressToken"
+        )
+        ticks = iter(range(1, 1000))
+
+        def notify(text: str) -> None:
+            if token is not None:
+                send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": {
+                            "progressToken": token,
+                            "progress": next(ticks),
+                            "message": text,
+                        },
+                    }
+                )
+
+        response = handle_message(assignment, message, notify)
+        if response is not None:
+            send(response)
+
+    calls: list[threading.Thread] = []
     for line in stdin:
         if not line.strip():
             continue
@@ -279,10 +377,21 @@ def serve(stdin=sys.stdin, stdout=sys.stdout) -> None:
                 "error": {"code": -32700, "message": "Parse error"},
             }
         else:
+            if (
+                message.get("method") == "tools/call"
+                and (message.get("params") or {}).get("name") == CHECK_TOOL
+            ):
+                thread = threading.Thread(
+                    target=call, args=(message,), daemon=True
+                )
+                thread.start()
+                calls.append(thread)
+                continue
             response = handle_message(assignment, message)
         if response is not None:
-            stdout.write(json.dumps(response) + "\n")
-            stdout.flush()
+            send(response)
+    for thread in calls:
+        thread.join(timeout=10)
 
 
 def handle_hook(assignment: dict, event: str, payload: dict) -> dict | None:

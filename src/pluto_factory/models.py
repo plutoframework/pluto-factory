@@ -339,6 +339,10 @@ class ConcurrencyPolicy(Contract):
     max_per_repository: int | None = Field(default=None, ge=1, le=8)
     repositories: dict[str, int] = Field(default_factory=dict)
     max_per_phase: dict[str, int] = Field(default_factory=dict)
+    # Host-wide cap on simultaneously running check executions (factory
+    # phases, factory_check, PR repair, merge manager). Shared by every
+    # factory process on the host through file locks under the home.
+    max_parallel_checks: int = Field(default=1, ge=1, le=8)
     avoid_overlap: Literal["none", "repository", "paths"] | None = None
     start_stagger_seconds: float = Field(default=30, ge=0)
     min_free_memory_mb: int | None = Field(default=None, ge=0)
@@ -377,6 +381,32 @@ class ConcurrencyPolicy(Contract):
         if name in self.repositories:
             return self.repositories[name]
         return self.max_per_repository or self.max_workers
+
+
+class ChecksPolicy(Contract):
+    """Environment for each check execution.
+
+    ``per_run_env`` values may use ``{run_dir}``, a fresh directory per check
+    run, so tools with global locks or caches (golangci-lint) cannot collide.
+    Unset: parallel factories (``max_workers > 1``) isolate
+    ``GOLANGCI_LINT_CACHE`` and ``TMPDIR``; serial factories add nothing.
+    """
+
+    per_run_env: dict[str, str] | None = None
+
+    @field_validator("per_run_env")
+    @classmethod
+    def _names(cls, value):
+        for name in value or {}:
+            if not ENV_NAME.fullmatch(name):
+                raise ValueError(f"invalid environment variable: {name!r}")
+        return value
+
+
+PARALLEL_RUN_ENV = {
+    "GOLANGCI_LINT_CACHE": "{run_dir}/golangci",
+    "TMPDIR": "{run_dir}/tmp",
+}
 
 
 class MergeManagerPolicy(Contract):
@@ -458,6 +488,7 @@ class FactoryConfig(Contract):
     )
     debug: DebugPolicy = Field(default_factory=DebugPolicy)
     sandbox: SandboxPolicy = Field(default_factory=SandboxPolicy)
+    checks: ChecksPolicy = Field(default_factory=ChecksPolicy)
 
     @model_validator(mode="after")
     def _labels_never_ready(self):
@@ -484,6 +515,13 @@ class FactoryConfig(Contract):
                     "advisor_model must be a claude-* model on Anthropic"
                 )
         return self
+
+    @property
+    def check_run_env(self) -> dict[str, str]:
+        configured = self.checks.per_run_env
+        if configured is not None:
+            return configured
+        return dict(PARALLEL_RUN_ENV) if self.concurrency.parallel else {}
 
     @property
     def merge_manager_enabled(self) -> bool:

@@ -992,6 +992,8 @@ def test_worker_check_runs_on_worktree_snapshot_and_records_evidence(tmp_path):
         engine._service_checks(
             engine.state.get_work(work_id), engine.state.get_run(run["id"])
         )
+        for thread in list(engine._check_threads.values()):
+            thread.join(30)
         answer = json.loads(
             (folder / "checks" / f"{request}.result.json").read_text()
         )
