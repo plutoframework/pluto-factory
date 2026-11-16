@@ -607,6 +607,22 @@ class Engine:
         row = get_pr(self.state, slug, number)
         if row is None or not row["head"]:
             raise GitFailure("scope.denied", "Repair target is not tracked")
+        # The tracker refreshes heads on a slow cadence: compare against the
+        # live head, and restart from a new one instead of retrying stale.
+        refreshed = self.tracker.refresh_head(row)
+        if refreshed["head"] != row["head"]:
+            self.state.event(
+                "pr.repair_superseded",
+                work_id,
+                {"from": row["head"], "to": refreshed["head"]},
+            )
+            self.state.update_work(
+                work_id,
+                phase="completed",
+                control="settled",
+                event="work.repair_abandoned",
+            )
+            return
         name = work["payload"]["repositories"][0]
         repo = self.git.repositories.get(name)
         if repo is None or repo.github != slug or not repo.checks:

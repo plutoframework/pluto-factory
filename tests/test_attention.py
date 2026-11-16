@@ -921,3 +921,38 @@ def test_decisions_cli_withdraw_marks_stale_decisions(tmp_path, capsys):
     assert result["state"] == "withdrawn" and result["note"] == "obsolete"
     assert not list_decisions(engine.state, {"open"})
     assert main(["decisions", "withdraw", added["id"], "--home", home]) == 1
+
+
+def test_repair_waits_while_someone_is_pushing(tmp_path):
+    engine, gh = build(tmp_path)
+    tracked(engine, gh)
+    gh.views[("plutoframework/cli", 5)] = view(head=SHA2, checks=FAIL)
+    row = observe(engine)
+    assert row["head"] == SHA2 and row["head_changed"] > 0
+    assert not repairs(engine)  # head just moved: wait and re-check
+    assert "settle" in row["reason"]
+    # Ten quiet minutes later the repair starts.
+    engine.state.db.execute(
+        "UPDATE pull_requests SET head_changed=?", (time.time() - 700,)
+    )
+    engine.state.db.commit()
+    observe(engine)
+    assert len(repairs(engine)) == 1
+
+
+def test_repair_prepare_refreshes_a_stale_head_and_restarts(tmp_path):
+    engine, gh = build(tmp_path)
+    work = repair_work(engine, gh)
+    # GitHub moved on; the tracker has not polled for 300s.
+    gh.views[("plutoframework/cli", 5)] = view(head=SHA2, checks=FAIL)
+    stale = engine.state.get_work(work["id"])
+    engine._prepare_repair(stale, ("plutoframework/cli", 5))
+    row = get_pr(engine.state, "plutoframework/cli", 5)
+    assert row["head"] == SHA2 and row["state"] == "pending"
+    assert row["repairs"].get(SHA2, 0) == 0  # fresh budget for the new head
+    done = engine.state.get_work(work["id"])
+    assert done["phase"] == "completed" and done["control"] == "settled"
+    kinds = [e["kind"] for e in engine.state.inspect()["events"]]
+    assert "pr.repair_superseded" in kinds and "pr.head_moved" in kinds
+    # No deferral and no retry loop against the stale head.
+    assert not list_decisions(engine.state, {"open"})
