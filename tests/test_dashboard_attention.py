@@ -266,3 +266,99 @@ def test_http_free_text_is_custom_except_for_config(world):
     assert get_decision(state, config["id"])["state"] == "open"
     answered = get_decision(state, decision["id"])
     assert answered["answer"] == "Z" and answered["custom"] == 1
+
+
+def test_needs_you_lists_only_open_decisions(world):
+    from pluto_factory.attention import (
+        answer_decision,
+        mark_applied,
+        withdraw_decision,
+    )
+
+    state, data, _factory, decision = world
+    others = [
+        add_decision(
+            state,
+            question=f"Other {n}?",
+            kind="choice",
+            options=[{"label": "A", "recommended": True}, {"label": "B"}],
+        )
+        for n in range(3)
+    ]
+    answer_decision(state, others[0]["id"], "A")
+    answer_decision(state, others[1]["id"], "A")
+    mark_applied(state, others[1]["id"])
+    withdraw_decision(state, others[2]["id"], "stale")
+    needs = data.state()["needs_you"]
+    assert [d["id"] for d in needs["decisions"]] == [decision["id"]]
+    assert needs["count"] == 2  # one decision + the ready PR
+    assert needs["auto"] == []
+    assert get_decision(state, others[2]["id"])["note"] == "stale"
+
+
+def test_auto_decisions_are_listed_apart_from_needs_you(world):
+    import time
+
+    from pluto_factory.attention import AUTO_BY, apply_due_autos
+
+    state, data, _factory, decision = world
+    auto = add_decision(
+        state,
+        question="Obvious?",
+        kind="choice",
+        options=[{"label": "Go", "recommended": True}, {"label": "No"}],
+    )
+    meta = {
+        "category": "app_fix",
+        "reason": "r",
+        "answer": "Go",
+        "apply_at": time.time() + 600,
+        "status": "pending",
+    }
+    state.db.execute(
+        "UPDATE decisions SET state='auto_pending',auto=? WHERE id=?",
+        (json.dumps(meta), auto["id"]),
+    )
+    state.db.commit()
+    needs = data.state()["needs_you"]
+    assert [d["id"] for d in needs["decisions"]] == [decision["id"]]
+    assert [d["id"] for d in needs["auto"]] == [auto["id"]]
+    apply_due_autos(state, time.time() + 601)
+    assert get_decision(state, auto["id"])["answered_by"] == AUTO_BY
+    needs = data.state()["needs_you"]
+    assert [d["id"] for d in needs["auto"]] == [auto["id"]]
+    assert [d["id"] for d in needs["decisions"]] == [decision["id"]]
+
+
+def test_advice_state_is_exposed_for_the_drawer(world):
+    from pluto_factory.dashboard_data import _advice_state
+
+    state, data, _factory, decision = world
+    base = {"state": "open"}
+    assert _advice_state({**base, "advice": "pending"}) == "analysing"
+    assert _advice_state({**base, "advice": "fallback"}) == "unavailable"
+    assert _advice_state({**base, "advice": "model"}) == "ready"
+    assert _advice_state({**base, "advice": "none"}) == "none"
+    state.db.execute(
+        "UPDATE decisions SET advice='pending' WHERE id=?", (decision["id"],)
+    )
+    state.db.commit()
+    (shown,) = data.state()["needs_you"]["decisions"]
+    assert shown["advice_state"] == "analysing"
+    state.db.execute(
+        "UPDATE decisions SET advice='fallback' WHERE id=?", (decision["id"],)
+    )
+    state.db.commit()
+    (shown,) = data.state()["needs_you"]["decisions"]
+    assert shown["advice_state"] == "unavailable"
+
+
+def test_drawer_disables_options_while_the_advisor_runs():
+    from importlib.resources import files
+
+    js = files("pluto_factory").joinpath("dashboard/app.js").read_text()
+    assert "Advisor analysing…" in js and "Advisor unavailable" in js
+    assert 'decision.advice_state === "analysing"' in js
+    assert "button.disabled = analysing ||" in js
+    # Custom answers stay available while analysing.
+    assert "Send custom answer" in js

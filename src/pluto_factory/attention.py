@@ -535,20 +535,21 @@ def apply_due_autos(state, now=None):
     return done
 
 
-def withdraw_decision(state, decision_id):
+def withdraw_decision(state, decision_id, note=""):
     with state.db:
         decision = get_decision(state, decision_id)
-        if decision["state"] != "open":
+        if decision["state"] not in {"open", "auto_pending", "answered"}:
             raise DecisionConflict(f"decision is already {decision['state']}")
         state.db.execute(
-            "UPDATE decisions SET state='withdrawn' WHERE id=?",
-            (decision_id,),
+            "UPDATE decisions SET state='withdrawn',note=? WHERE id=?",
+            (_clip(note, ANSWER_LIMIT).strip(), decision_id),
         )
         state._event(
             "decision.withdrawn",
             decision["work_id"] or "factory",
-            {"id": decision_id},
+            {"id": decision_id, "note": _clip(note, 300)},
         )
+    return get_decision(state, decision_id)
 
 
 def mark_applied(state, decision_id, detail=None):

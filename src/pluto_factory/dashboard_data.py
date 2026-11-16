@@ -221,6 +221,16 @@ def _read(database, selected=None):
 CONTEXT_LINE_LIMIT = 600
 
 
+def _advice_state(decision):
+    """analysing | unavailable | ready | none: what the options mean."""
+    advice = decision.get("advice", "none")
+    if advice == "pending" and decision["state"] == "open":
+        return "analysing"
+    if advice == "fallback":
+        return "unavailable"
+    return "none" if advice in {"none", "skipped"} else "ready"
+
+
 def _project_decision(decision, factory_id, name):
     """Terse problem first; raw block text is separate collapsed evidence."""
     now = time.time()
@@ -267,6 +277,7 @@ def _project_decision(decision, factory_id, name):
         "answer": text(decision["answer"], 500),
         "custom": bool(decision.get("custom")),
         "advice": decision.get("advice", "none"),
+        "advice_state": _advice_state(decision),
         "auto": (
             {
                 "category": text(decision["auto"].get("category"), 100),
@@ -488,7 +499,7 @@ class DashboardData:
     def state(self):
         registry = self._entries()
         factories = []
-        needs = {"pull_requests": [], "decisions": []}
+        needs = {"pull_requests": [], "decisions": [], "auto": []}
         for entry in registry["factories"][:100]:
             home = Path(entry["location"])
             projected = {
@@ -561,8 +572,7 @@ class DashboardData:
             "factories": factories,
             "needs_you": {
                 **needs,
-                "count": len(needs["pull_requests"])
-                + sum(item["state"] == "open" for item in needs["decisions"]),
+                "count": len(needs["pull_requests"]) + len(needs["decisions"]),
             },
             "errors": registry["errors"],
         }
@@ -599,10 +609,21 @@ class DashboardData:
                 }
             )
         for decision in owner["decisions"]:
-            needs["decisions"].append(
-                _project_decision(decision, factory_id, name)
-            )
+            auto = decision.get("auto") or {}
+            if decision["state"] == "open":
+                needs["decisions"].append(
+                    _project_decision(decision, factory_id, name)
+                )
+            elif (
+                auto
+                and auto.get("status") != "overridden"
+                and decision["state"] in {"auto_pending", "answered", "applied"}
+            ):
+                needs["auto"].append(
+                    _project_decision(decision, factory_id, name)
+                )
         needs["decisions"].sort(key=lambda item: item["created"])
+        needs["auto"].sort(key=lambda item: item["created"])
         needs["pull_requests"].sort(key=lambda item: -item["age"])
 
     def answer(self, factory_id, decision_id, answer, note="", by="owner"):
