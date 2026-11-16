@@ -179,12 +179,52 @@ def test_auto_mode_ignores_app_locus_recommendations(tmp_path):
     assert engine.flush_upstream() == 0 and not gh.created
 
 
-def test_unmapped_library_files_nothing_and_says_so(tmp_path):
-    engine, gh, _ = setup(tmp_path, mapped=False)
+def test_unmapped_library_files_nothing_but_asks_the_owner(tmp_path):
+    engine, gh, work = setup(tmp_path, mapped=False)
     choose_framework(engine)
     assert engine.flush_upstream() == 0 and not gh.created
     kinds = [e["kind"] for e in engine.state.inspect()["events"]]
     assert "upstream.unmapped" in kinds
+    (ask,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_repo_for")
+    ]
+    assert ask["question"] == "Upstream repo unknown for pluto-rbac."
+    assert ask["options"][-1]["label"] == "Withdraw; handle in the app"
+    # Withdrawing drops the gap and resumes the work with guidance.
+    answer_decision(engine.state, ask["id"], "Withdraw; handle in the app")
+    engine.process_decisions()
+    assert engine.state.get_work(work["id"])["control"] == "ready"
+    assert not [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if d["kind"] == "framework_gap"
+    ]
+
+
+def test_owner_can_pick_a_mapped_repo_for_an_unmapped_library(tmp_path):
+    engine, gh, work = setup(tmp_path, mapped=False)
+    engine.config.framework.upstream = {"pluto-core": UPSTREAM}
+    choose_framework(engine)
+    (ask,) = [
+        d
+        for d in list_decisions(engine.state, {"open"})
+        if (d["proposal"] or {}).get("upstream_repo_for")
+    ]
+    assert f"File in {UPSTREAM}" in [o["label"] for o in ask["options"]]
+    answer_decision(engine.state, ask["id"], f"File in {UPSTREAM}")
+    engine.process_decisions()
+    assert engine.flush_upstream() == 1
+    assert gh.created[0]["slug"] == UPSTREAM
+    assert engine.state.get_work(work["id"])["control"] == "deferred"
+
+
+def test_library_names_normalize_the_pluto_prefix():
+    policy = FrameworkPolicy(upstream={"pluto-cli": "plutoframework/cli"})
+    for name in ("cli", "pluto-cli", "CLI", "@plutoframework/cli"):
+        assert policy.repository(name) == "plutoframework/cli"
+    assert policy.repository("auth") == ""
 
 
 def test_framework_config_validates_repositories():
@@ -457,3 +497,47 @@ def test_redact_terms_are_enforced(tmp_path):
     engine.advise_pending()
     _leak(engine, problem="Okta needs per-tenant providers.")
     assert not _filed(engine, gh)
+
+
+# --- framework gaps parked behind a tracked upstream issue -----------------
+
+
+def _gap_view(engine):
+    from pluto_factory.attention import read_attention
+    from pluto_factory.dashboard_data import DashboardData, _work_waiting
+
+    owner = read_attention(engine.state.db)
+    needs = {"pull_requests": [], "decisions": [], "auto": []}
+    DashboardData._owner_items(needs, "f", "test", owner)
+    gaps = [d for d in owner["decisions"] if d["kind"] == "framework_gap"]
+    return owner, needs, gaps, _work_waiting
+
+
+def test_gap_is_not_owner_work_while_the_upstream_issue_is_tracked(tmp_path):
+    engine, _gh, work = setup(tmp_path)
+    choose_framework(engine)
+    _owner, needs, gaps, _ = _gap_view(engine)
+    assert gaps and not gaps[0]["waiting_on"]  # nothing filed yet: owner
+    engine.flush_upstream()
+    owner, needs, (gap,), waiting = _gap_view(engine)
+    assert gap["waiting_on"]["number"] == 7
+    assert all(d["kind"] != "framework_gap" for d in needs["decisions"])
+    shown = waiting(owner, work["id"])
+    assert shown["label"] == f"Waiting on {UPSTREAM}#7"
+    # Closed as not planned: the owner is needed again.
+    engine.state.db.execute(
+        "UPDATE external_issues SET state='not_planned' WHERE key=?", (KEY,)
+    )
+    engine.state.db.commit()
+    owner, needs, (gap,), waiting = _gap_view(engine)
+    assert gap["waiting_on"] is None and waiting(owner, work["id"]) is None
+    assert any(d["kind"] == "framework_gap" for d in needs["decisions"])
+
+
+def test_gap_needs_the_owner_when_nothing_was_filed(tmp_path):
+    engine, _gh, _work = setup(tmp_path, mapped=False)
+    choose_framework(engine)
+    engine.flush_upstream()
+    _owner, needs, _gaps, _ = _gap_view(engine)
+    kinds = {d["kind"] for d in needs["decisions"]}
+    assert "framework_gap" in kinds

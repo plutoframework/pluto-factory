@@ -116,7 +116,8 @@ class FrameworkPolicy(Contract):
 
     def repository(self, library: str) -> str:
         def norm(name):
-            return name.lower().removeprefix("@plutoframework/")
+            name = name.strip().lower().removeprefix("@plutoframework/")
+            return name.removeprefix("pluto-")
 
         for name, repo in self.upstream.items():
             if norm(name) == norm(library):

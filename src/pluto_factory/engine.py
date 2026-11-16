@@ -76,6 +76,7 @@ from .trace import Tracer
 from .triage import Triager, TriageRunner
 from .upstream import (
     apply_hold_answer,
+    apply_repo_answer,
     fixed_guidance,
     flush_upstream,
     poll_external,
@@ -757,6 +758,30 @@ class Engine:
                 text += ". No configuration change was made."
         if proposal.get("upstream_hold"):
             apply_hold_answer(self.state, decision)
+            mark_applied(self.state, decision["id"], detail)
+            return
+        if proposal.get("upstream_repo_for"):
+            if apply_repo_answer(self.state, self.config, decision):
+                for gap in list_decisions(self.state, {"open"}):
+                    if (
+                        gap["kind"] == "framework_gap"
+                        and gap["work_id"] == decision["work_id"]
+                    ):
+                        withdraw_decision(self.state, gap["id"])
+                if decision["work_id"]:
+                    work = self.state.get_work(decision["work_id"])
+                    self.state.add_guidance(
+                        decision["work_id"],
+                        "Upstream filing withdrawn; handle in the app "
+                        "within Pluto rules.",
+                        "owner",
+                    )
+                    if work["control"] in {
+                        "deferred",
+                        "quarantined",
+                        "backoff",
+                    }:
+                        self.state.resume(decision["work_id"])
             mark_applied(self.state, decision["id"], detail)
             return
         if proposal.get("triage"):

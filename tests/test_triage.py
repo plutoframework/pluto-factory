@@ -378,3 +378,184 @@ def test_triage_decision_appears_in_needs_you(tmp_path):
     assert shown["options"][0]["label"] == APPROVE
     assert shown["evidence"].startswith(f"{SLUG}#1")
     assert attention.read_attention(engine.state.db)["decisions"]
+
+
+# --- failure reasons, retries and the fallback decision -------------------
+
+
+class HarnessCrash(Exception):
+    def __init__(self):
+        super().__init__("claude exited unexpectedly")
+        self.exit_code = 137
+        self.stderr = "x" * 2000 + "Killed: out of memory"
+
+
+def failing(error):
+    def reply():
+        raise error
+
+    return reply
+
+
+def decided_events(engine):
+    return [
+        json.loads(e["data"]) if isinstance(e["data"], str) else e["data"]
+        for e in engine.state.inspect()["events"]
+        if e["kind"] == "triage.decided"
+    ]
+
+
+def test_failure_reason_is_recorded_in_event_and_decision(tmp_path):
+    from pluto_factory.triage import RETRY
+
+    engine, gh, _ = setup(tmp_path, failing(HarnessCrash()))
+    naps = []
+    engine.triage.triager.sleep = naps.append
+    gh.add(author="stranger")
+    poll(engine)
+    assert naps == [5, 20]  # two backoff retries, then fallback
+    (event,) = decided_events(engine)
+    failure = event["failure"]
+    assert event["source"] == "fallback"
+    assert failure["kind"] == "crash" and failure["exit_code"] == 137
+    assert failure["exception"] == "HarnessCrash" and failure["attempts"] == 3
+    assert failure["stderr_tail"].endswith("Killed: out of memory")
+    assert len(failure["stderr_tail"]) < 600  # bounded tail
+    (decision,) = list_decisions(engine.state, {"open"})
+    assert decision["question"].startswith("Triage failed: crash HarnessCrash")
+    assert "Triage failed:" in decision["context"]
+    assert [o["label"] for o in decision["options"]] == [RETRY]
+    assert decision["options"][0]["recommended"]
+
+
+def test_timeout_is_retried_then_succeeds(tmp_path):
+    calls = []
+
+    def reply():
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("model call timed out")
+        return SPEC
+
+    engine, gh, _ = setup(tmp_path, reply)
+    engine.triage.triager.sleep = lambda s: None
+    gh.add(author="owner-acct")
+    poll(engine)
+    assert len(calls) == 2
+    assert decided_events(engine)[0]["source"] == "model"
+    assert "failure" not in decided_events(engine)[0]
+    assert gh.labels[1] == ["factory:ready"]
+
+
+def test_schema_failure_is_recorded_without_transient_retries(tmp_path):
+    engine, gh, seen = setup(tmp_path, {"outcome": "ACCEPT"})
+    naps = []
+    engine.triage.triager.sleep = naps.append
+    gh.add(author="stranger")
+    poll(engine)
+    assert not naps and len(seen) == 3
+    failure = decided_events(engine)[0]["failure"]
+    assert failure["kind"] == "schema" and "ACCEPT" in failure["message"]
+    assert seen[1][1]["contract_error"]["problems"]
+
+
+def test_non_transient_error_is_not_retried(tmp_path):
+    engine, gh, seen = setup(tmp_path, failing(RuntimeError("boom")))
+    gh.add(author="stranger")
+    poll(engine)
+    assert len(seen) == 1
+    assert decided_events(engine)[0]["failure"]["kind"] == "error"
+
+
+def test_trusted_fallback_offers_accept_as_written(tmp_path):
+    from pluto_factory.triage import ACCEPT_AS_WRITTEN, RETRY
+
+    engine, gh, _ = setup(tmp_path, failing(RuntimeError("boom")))
+    gh.add(author="owner-acct", body="Please add retries to the runner")
+    poll(engine)
+    (decision,) = list_decisions(engine.state, {"open"})
+    assert [o["label"] for o in decision["options"]] == [
+        RETRY,
+        ACCEPT_AS_WRITTEN,
+    ]
+    assert not gh.labels
+    answer_decision(engine.state, decision["id"], ACCEPT_AS_WRITTEN)
+    engine.process_decisions()
+    assert gh.labels[1] == ["factory:ready"]
+    assert "Please add retries" in gh.comments[1][0]
+
+
+def test_retry_triage_actually_reruns_triage(tmp_path):
+    from pluto_factory.triage import RETRY
+
+    outcomes = [RuntimeError("boom"), SPEC]
+
+    def reply():
+        item = outcomes.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    engine, gh, seen = setup(tmp_path, reply)
+    gh.add(author="stranger")
+    gh.permissions["stranger"] = "read"
+    poll(engine)
+    (decision,) = list_decisions(engine.state, {"open"})
+    answer_decision(engine.state, decision["id"], RETRY)
+    engine.process_decisions()
+    assert poll(engine) == 1 and len(seen) == 2
+    # Untrusted author: the retried accept is still capped for the owner.
+    assert not gh.labels
+    (again,) = list_decisions(engine.state, {"open"})
+    assert [o["label"] for o in again["options"]] == [APPROVE, REJECT, MORE]
+
+
+def test_over_long_advice_is_clipped_not_rejected():
+    """Reproduced on a real long issue: caps rejected every attempt."""
+    long = " ".join(["word"] * 60)
+    result = TriageResult.model_validate(
+        {
+            "outcome": "NEEDS_HUMAN",
+            "advice": {
+                "problem": long,
+                "details": [long],
+                "options": [
+                    {
+                        "label": "Narrow scope",
+                        "effect": long,
+                        "tradeoff": long,
+                        "recommended": True,
+                    },
+                    {"label": "Broad", "effect": "e", "tradeoff": "t"},
+                ],
+                "why": long,
+            },
+        }
+    )
+    advice = result.advice
+    assert len(advice.problem.split()) == 40
+    assert len(advice.details[0].split()) == 15
+    assert len(advice.why.split()) == 25
+    assert len(advice.options[0].effect.split()) == 25
+
+
+def test_clipping_keeps_the_structure_strict():
+    bad = {
+        "outcome": "NEEDS_HUMAN",
+        "advice": {**advice_block(), "options": advice_block()["options"][:1]},
+    }
+    with pytest.raises(ValueError):
+        TriageResult.model_validate(bad)
+
+
+def test_overlong_reply_triages_on_the_first_attempt(tmp_path):
+    long = " ".join(["word"] * 60)
+    reply = {
+        "outcome": "NEEDS_HUMAN",
+        "advice": {**advice_block(), "problem": long, "why": long},
+    }
+    engine, gh, seen = setup(tmp_path, reply)
+    gh.add(author="stranger")
+    poll(engine)
+    assert len(seen) == 1
+    assert decided_events(engine)[0]["source"] == "model"

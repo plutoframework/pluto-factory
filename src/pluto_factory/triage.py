@@ -13,14 +13,29 @@ comments and labels (which bump ``updated_at``) never retrigger triage;
 ``updated_at`` is recorded for audit.
 """
 
+import contextlib
 import json
 import time
+from types import SimpleNamespace
 from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from . import attention, structured
-from .advisor import LOCUS, Advice, fallback_advice, terse, words
+from .advisor import (
+    DETAIL_WORDS,
+    EFFECT_WORDS,
+    FIX_WORDS,
+    LABEL_WORDS,
+    LOCUS,
+    PROBLEM_WORDS,
+    TRADEOFF_WORDS,
+    WHY_WORDS,
+    Advice,
+    fallback_advice,
+    terse,
+    words,
+)
 from .config import digest, triage_prompt
 from .dependencies import REFERENCE
 from .github import GitHubFailure
@@ -95,11 +110,57 @@ class Rejection(Contract):
         return value
 
 
+def _clip_words(value, limit):
+    if not isinstance(value, str):
+        return value
+    pieces = value.split()
+    return value if len(pieces) <= limit else " ".join(pieces[:limit])
+
+
+def clip_advice(advice):
+    """Shorten over-long prose to the advisor caps instead of rejecting it.
+
+    Long issues make the model write long rationales; the caps exist for
+    terse display, so clipping keeps a useful decision where strict
+    validation used to drop the whole triage into the fallback.
+    """
+    if not isinstance(advice, dict):
+        return advice
+    clipped = dict(advice)
+    clipped["problem"] = _clip_words(clipped.get("problem"), PROBLEM_WORDS)
+    clipped["why"] = _clip_words(clipped.get("why"), WHY_WORDS)
+    if isinstance(clipped.get("details"), list):
+        clipped["details"] = [
+            _clip_words(d, DETAIL_WORDS) for d in clipped["details"][:6]
+        ]
+    options = []
+    for option in clipped.get("options") or []:
+        if isinstance(option, dict):
+            option = {
+                **option,
+                "label": _clip_words(option.get("label"), LABEL_WORDS),
+                "effect": _clip_words(option.get("effect"), EFFECT_WORDS),
+                "tradeoff": _clip_words(option.get("tradeoff"), TRADEOFF_WORDS),
+            }
+            if option.get("fix"):
+                option["fix"] = _clip_words(option["fix"], FIX_WORDS)
+        options.append(option)
+    clipped["options"] = options
+    return clipped
+
+
 class TriageResult(Contract):
     outcome: Literal["ACCEPT", "NEEDS_HUMAN", "REJECT"]
     spec: Spec | None = None
     advice: Advice | None = None
     rejection: Rejection | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lenient_advice(cls, data):
+        if isinstance(data, dict) and data.get("outcome") == "NEEDS_HUMAN":
+            return {**data, "advice": clip_advice(data.get("advice"))}
+        return data
 
     @model_validator(mode="after")
     def _matches_outcome(self):
@@ -145,11 +206,98 @@ def render_spec(spec, url):
     return "\n".join(lines)
 
 
+TRANSIENT = {"timeout", "rate_limit", "crash"}
+TRANSIENT_RETRIES = 2
+BACKOFF_SECONDS = (5, 20)
+RETRY = "Retry triage"
+ACCEPT_AS_WRITTEN = "Accept as written"
+STDERR_TAIL = 500
+MESSAGE_LIMIT = 400
+
+
+def _tail(value, limit):
+    value = str(value or "")
+    return value if len(value) <= limit else "…" + value[-limit:]
+
+
+def classify(error):
+    """schema | timeout | rate_limit | crash | unavailable | error."""
+    name = type(error).__name__
+    message = str(error).lower()
+    if isinstance(error, (TimeoutError,)) or "timeout" in name.lower():
+        return "timeout"
+    if (
+        "ratelimit" in name.lower()
+        or "rate limit" in message
+        or "429" in message
+    ):
+        return "rate_limit"
+    if (
+        getattr(error, "exit_code", None) is not None
+        or getattr(error, "returncode", None) is not None
+        or "ProcessError" in name
+    ):
+        return "crash"
+    if name in {"UnexpectedModelBehavior", "ValidationError"} or isinstance(
+        error, (ValueError, TypeError)
+    ):
+        return "schema"
+    if "unavailable" in message:
+        return "unavailable"
+    return "error"
+
+
+def failure_record(error, attempts):
+    """Bounded, redacted account of why a model triage failed."""
+    from .dashboard_data import text
+
+    exit_code = getattr(error, "exit_code", None)
+    if exit_code is None:
+        exit_code = getattr(error, "returncode", None)
+    cause = error.__cause__ or error.__context__
+    record = {
+        "kind": classify(error),
+        "exception": type(error).__name__,
+        "message": text(_tail(str(error), MESSAGE_LIMIT), MESSAGE_LIMIT + 20),
+        "attempts": attempts,
+    }
+    if cause is not None:
+        record["cause"] = text(
+            f"{type(cause).__name__}: {_tail(str(cause), 300)}", 340
+        )
+    if hasattr(error, "errors") and callable(error.errors):
+        with contextlib.suppress(Exception):
+            record["validation_errors"] = text(
+                json.dumps(error.errors(include_url=False), default=str)[:1200],
+                1200,
+            )
+    if exit_code is not None:
+        record["exit_code"] = exit_code
+    stderr = getattr(error, "stderr", None)
+    if stderr:
+        record["stderr_tail"] = text(
+            _tail(stderr, STDERR_TAIL), STDERR_TAIL + 20
+        )
+    return record
+
+
+def failure_reason(record):
+    """One terse line for owners: 'Triage failed: <reason>'."""
+    parts = [record["kind"], record["exception"]]
+    if record.get("message"):
+        parts.append(record["message"])
+    if record.get("exit_code") is not None:
+        parts.append(f"exit {record['exit_code']}")
+    return "Triage failed: " + terse(" ".join(parts), 30)
+
+
 class Triager:
-    def __init__(self, home, config, runner=None):
+    def __init__(self, home, config, runner=None, sleep=time.sleep):
         self.home = home
         self.config = config
         self.runner = runner
+        self.sleep = sleep
+        self.last_failure = None
 
     def sources(self):
         return [
@@ -162,7 +310,10 @@ class Triager:
         runner = self.runner or self._model
         prompt = triage_prompt(self.home)
         problem = None
-        for _ in range(3):
+        contract = transient = attempts = 0
+        self.last_failure = None
+        while True:
+            attempts += 1
             payload = dict(packet)
             if problem:
                 payload["contract_error"] = {
@@ -175,13 +326,28 @@ class Triager:
                     reply = json.loads(reply)
                 if not isinstance(reply, TriageResult):
                     reply = TriageResult.model_validate(reply)
+                self.last_failure = None  # a retry succeeded: nothing to report
                 return reply, "model"
-            except (ValueError, TypeError) as error:
-                problem = str(error)[:1500]
-            except Exception:  # noqa: BLE001 - provider failure
-                break
+            except Exception as error:  # noqa: BLE001 - recorded, not lost
+                self.last_failure = failure_record(error, attempts)
+                kind = self.last_failure["kind"]
+                if kind == "schema":
+                    problem = str(error)[:1500]
+                    contract += 1
+                    if contract >= 3:
+                        break
+                elif kind in TRANSIENT and transient < TRANSIENT_RETRIES:
+                    self.sleep(BACKOFF_SECONDS[transient])
+                    transient += 1
+                else:
+                    break
         title = packet["untrusted_issue"]["title"]
-        advice = fallback_advice(f"Triage unavailable: {terse(title, 20)}")
+        reason = (
+            failure_reason(self.last_failure)
+            if self.last_failure
+            else f"Triage failed: {terse(title, 20)}"
+        )
+        advice = fallback_advice(reason)
         return (
             TriageResult(outcome="NEEDS_HUMAN", advice=advice),
             "fallback",
@@ -337,6 +503,12 @@ class TriageRunner:
                     "outcome": result.outcome,
                     "source": source,
                     "trusted": trusted,
+                    **(
+                        {"failure": self.triager.last_failure}
+                        if source == "fallback"
+                        and getattr(self.triager, "last_failure", None)
+                        else {}
+                    ),
                 },
             )
         owner_engaged = bool(guidance)
@@ -347,6 +519,8 @@ class TriageRunner:
                 self._cap(slug, number, version, issue, author, result.spec)
         elif result.outcome == "REJECT":
             self._reject(slug, number, version, result.rejection.reason)
+        elif source == "fallback":
+            self._failed(slug, number, version, issue, trusted)
         else:
             self._needs_human(slug, number, version, issue, result.advice)
         return 1
@@ -375,7 +549,16 @@ class TriageRunner:
 
     # -- outcomes ---------------------------------------------------------
 
-    def _decision(self, slug, number, version, issue, advice):
+    def _decision(
+        self,
+        slug,
+        number,
+        version,
+        issue,
+        advice,
+        lead="",
+        advice_kind="triage",
+    ):
         evidence = bounded(issue)
         decision = attention.add_decision(
             self.state,
@@ -384,7 +567,8 @@ class TriageRunner:
             details=advice.details,
             why=advice.why,
             context=(
-                f"{slug}#{number} by {(issue.get('user') or {}).get('login')}"
+                (f"{lead}\n" if lead else "")
+                + f"{slug}#{number} by {(issue.get('user') or {}).get('login')}"
                 f"\n{evidence['title']}\n\n{evidence['body']}"
             ),
             options=[
@@ -399,7 +583,7 @@ class TriageRunner:
                 }
                 for o in advice.options
             ],
-            advice="triage",
+            advice=advice_kind,
             block_key=f"triage:{slug}#{number}:{version}",
             proposal={"triage": f"{slug}#{number}", "version": version},
         )
@@ -407,6 +591,67 @@ class TriageRunner:
             slug, number, state="awaiting_human", decision_id=decision["id"]
         )
         return decision
+
+    def _failed(self, slug, number, version, issue, trusted):
+        """Model triage failed: one meaningful option set, with the reason."""
+        failure = getattr(self.triager, "last_failure", None)
+        reason = (
+            failure_reason(failure)
+            if failure
+            else "Triage failed: reason unrecorded"
+        )
+        options = [
+            {
+                "label": RETRY,
+                "effect": "Run triage again on this issue.",
+                "tradeoff": "May fail the same way.",
+                "recommended": True,
+            }
+        ]
+        if trusted:
+            options.append(
+                {
+                    "label": ACCEPT_AS_WRITTEN,
+                    "effect": "Label ready; work follows the issue text.",
+                    "tradeoff": "No triage review of scope.",
+                }
+            )
+            evidence = bounded(issue)
+            self._set(
+                slug,
+                number,
+                spec=json.dumps(
+                    {
+                        "title": terse(evidence["title"], 15),
+                        "scope": terse(
+                            evidence["body"] or evidence["title"], 150
+                        ),
+                        "acceptance": ["Resolve the issue as described."],
+                        "depends": [],
+                        "locus": "app",
+                    }
+                ),
+            )
+        details = []
+        if failure:
+            details = [
+                _tail(f"{k}: {v}", 140)
+                for k, v in failure.items()
+                if k in {"kind", "exit_code", "stderr_tail", "cause"}
+            ][:4]
+        # One option is legal here (the advisor schema needs two).
+        advice = SimpleNamespace(
+            problem=reason,
+            details=details,
+            why="Triage failed; retrying is cheapest.",
+            options=[
+                SimpleNamespace(
+                    locus="app", fix="", **{"recommended": False, **option}
+                )
+                for option in options
+            ],
+        )
+        self._decision(slug, number, version, issue, advice, lead=reason)
 
     def _needs_human(self, slug, number, version, issue, advice):
         self._decision(slug, number, version, issue, advice)
@@ -574,7 +819,9 @@ class TriageRunner:
         if row is None or row["version"] != decision["proposal"]["version"]:
             return  # the issue was edited; the new version is triaged anew
         answer = decision["answer"]
-        if answer == APPROVE and row["spec"]:
+        if answer == RETRY:
+            self._set(slug, number, state="retriage", guidance="")
+        elif answer in {APPROVE, ACCEPT_AS_WRITTEN} and row["spec"]:
             self._begin_accept(
                 slug, number, row["version"], json.loads(row["spec"])
             )
