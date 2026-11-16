@@ -903,7 +903,7 @@ def test_concurrent_mutations_of_different_keys_lose_nothing(tmp_path):
                     work_id,
                     mutate=lambda data, i=index: data.__setitem__(name, i),
                 )
-        except Exception as error:  # pragma: no cover
+        except (RuntimeError, ValueError, OSError) as error:  # pragma: no cover
             errors.append(error)
 
     threads = [threading.Thread(target=writer, args=(n,)) for n in "abcd"]
